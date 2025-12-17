@@ -1,0 +1,10 @@
+[package]
+name = "electronics-sim"
+version = "0.1.0"
+edition = "2024"
+publish = ["gitea"]
+
+[dependencies]
+half-bridge = { path = "../hw-half-bridge/firmware", default-features = false }
+pid = "4.0.0"
+rerun = "0.24.0"
