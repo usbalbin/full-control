@@ -1,3 +1,4 @@
+
 use electronics_sim::{
     BuckCurrentModeControl, Capacitance, Current, Inductance, Resistance, Time, Voltage, plot,
 };
@@ -7,7 +8,8 @@ fn main() {
         .spawn()
         .unwrap();
     let t_period = Time(1.0e-6);
-    let mut sim = BuckCurrentModeControl::new(t_period, Capacitance(10.0e-6), Inductance(2e-6));
+    let slope_amp_per_sec = 0.0;
+    let mut sim = BuckCurrentModeControl::new(t_period, Capacitance(10.0e-6), Inductance(2e-6), slope_amp_per_sec);
 
     let mut time = Time(0.0);
     for i in 0..1000 {
@@ -23,12 +25,12 @@ fn main() {
         };
         let trip_current = Current(2.0);
         let mut i_out = Current(0.0);
-        let (p1, _p2) = sim.tick(v_in, trip_current, |v| {
+        let (t_on, i_l_max) = sim.tick(v_in, trip_current, |v| {
             i_out = Current(v.0 / r.0);
             i_out
         });
 
-        plot(&rec, &sim, p1, v_in, i_out, &mut time);
+        plot(&rec, &sim, t_on, i_l_max, v_in, i_out, &mut time);
         //rec.log("iter", &rerun::Scalars::new([i])).unwrap();
     }
 }
