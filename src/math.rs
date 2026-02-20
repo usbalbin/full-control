@@ -56,6 +56,76 @@ impl fmt::Debug for WonkyF {
     }
 }
 
+/// f(t) = e^(-a*t) * (amp_cos*cos(wd*t) + amp_sin*sin(wd*t)) + c0
+///
+/// Models the underdamped RLC step response where `a = R/(2L)` is the
+/// damping coefficient and `wd = sqrt(1/(LC) - a²)` is the damped natural
+/// frequency.  `c0` is only non-zero in the antiderivative returned by
+/// `integral()`; the primary current function always has c0 = 0.
+pub struct DampedSineF {
+    a: T,
+    wd: T,
+    amp_cos: T,
+    amp_sin: T,
+    c0: T,
+}
+
+impl fmt::Debug for DampedSineF {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "f(t) = e^(-{:.4}*t) * ({:.4}*cos({:.4}*t) + {:.4}*sin({:.4}*t)) + {:.4}",
+            self.a, self.amp_cos, self.wd, self.amp_sin, self.wd, self.c0
+        )
+    }
+}
+
+impl Func for DampedSineF {
+    type Derivetive = Self;
+    type Integral = Self;
+
+    fn f(&self, x: T) -> T {
+        T::exp(-self.a * x)
+            * (self.amp_cos * T::cos(self.wd * x) + self.amp_sin * T::sin(self.wd * x))
+            + self.c0
+    }
+
+    /// d/dt [e^(-a*t)*(A*cos(wd*t) + B*sin(wd*t))]
+    ///   = e^(-a*t) * [(-a*A + wd*B)*cos(wd*t) + (-a*B - wd*A)*sin(wd*t)]
+    fn derivative(&self) -> Self {
+        Self {
+            a: self.a,
+            wd: self.wd,
+            amp_cos: -self.a * self.amp_cos + self.wd * self.amp_sin,
+            amp_sin: -self.a * self.amp_sin - self.wd * self.amp_cos,
+            c0: 0.0,
+        }
+    }
+
+    /// Returns the antiderivative F such that F(0) = a0.
+    ///
+    /// ∫ e^(-a*t)*(A*cos(wd*t) + B*sin(wd*t)) dt
+    ///   = e^(-a*t)/denom * [(-a*A - wd*B)*cos(wd*t) + (wd*A - a*B)*sin(wd*t)] + C
+    /// where denom = a²+wd².  C is chosen so that F(0) = a0.
+    fn integral(&self, a0: T) -> Self {
+        assert_eq!(
+            self.c0, 0.0,
+            "integral() only supported on the primary current function (c0 must be 0)"
+        );
+        let denom = self.a * self.a + self.wd * self.wd;
+        let new_amp_cos = (-self.a * self.amp_cos - self.wd * self.amp_sin) / denom;
+        let new_amp_sin = (self.wd * self.amp_cos - self.a * self.amp_sin) / denom;
+        // F(0) = new_amp_cos + c0 = a0  =>  c0 = a0 - new_amp_cos
+        Self {
+            a: self.a,
+            wd: self.wd,
+            amp_cos: new_amp_cos,
+            amp_sin: new_amp_sin,
+            c0: a0 - new_amp_cos,
+        }
+    }
+}
+
 // https://www.youtube.com/watch?v=m27OkXwBbuk
 pub fn rlc(
     v_in: Voltage,
@@ -64,82 +134,34 @@ pub fn rlc(
     l: Inductance,
     c: Capacitance,
     r: Resistance,
-) -> WonkyF {
-    let q0 = c.0 * v_cout_old.0;
-
-    // v_in = r * i + l * di/dt + q/c
-    // d_q/d_t = i
-    //
-    // Differentiating w.r.t. `t` where v_in is constant:
-    // r * d_i/d_t + l * d2_i / d2_t + i / c = 0
-    // <=> (divide by `l`)
-    // d2_i / d2_t + (r * di)/(l * dt) + i / (l * c) = 0
-    //
-    // Characteristic equation:
-    // s^2 + r/l*s + 1 / (l*c) = 0
-    //
-    // s1 and s2 are the roots
-    //
-    // sq_root = sqrt((r/2l)^2 - 1/(l*c))
-    // s1 = -r/(2*l) + sqrt((r/2l)^2 - 1/(l*c))
-    // s2 = -r/(2*l) - sqrt((r/2l)^2 - 1/(l*c))
-    //
-    // s1 = -a + sqrt(a^2-ohmega^2) = -a + sq_root
-    // s2 = -a - sqrt(a^2-ohmega^2) = -a - sq_root
-    //
+) -> DampedSineF {
+    // KVL: v_in = R*i + L*di/dt + v_c
+    // Differentiating w.r.t. t (v_in constant):
+    //   L*d²i/dt² + R*di/dt + i/C = 0
+    // Characteristic equation: s² + (R/L)*s + 1/(LC) = 0
+    //   s = -α ± sqrt(α² - ω₀²),  α = R/(2L),  ω₀ = 1/sqrt(LC)
     let a = r.0 / (2.0 * l.0);
     let ohmega = 1.0 / T::sqrt(l.0 * c.0);
-    let b = T::sqrt(a * a - ohmega * ohmega);
-    //
-    // i(t) = k1 * T::exp(s1*t) + k2 * T::exp(s2*t)
 
     match a.partial_cmp(&ohmega).unwrap() {
         std::cmp::Ordering::Less => {
-            // Underdamped response
-            // t > 0
-            let s1 = -a + T::sqrt(a * a + ohmega * ohmega);
-            let s2 = -a - T::sqrt(a * a + ohmega * ohmega);
-            //panic!("Underdamped response: {s1} {s2}");
-            //let i = k1 * T::exp(s1 * t.0) + k2 * T::exp(s2 * t.0);
-            //k1 + k2 = old_i;
+            // Underdamped: roots are complex  s = -α ± j·ωd
+            // where ωd = sqrt(ω₀² - α²)
+            let wd = T::sqrt(ohmega * ohmega - a * a);
 
-            // u = r*i + l * di_dt + q0; // Adderar man initial spänning av cappen här?
-            let di_dt0 = (v_in.0 - r.0 * i_old.0 - q0) / l.0; // Adderar man initial spänning av cappen här?
-            //r*di_dt + l * d2i_d2t + i / c;
+            // KVL at t=0: di/dt(0) = (v_in - R*i(0) - v_c(0)) / L
+            let di_dt0 = (v_in.0 - r.0 * i_old.0 - v_cout_old.0) / l.0;
 
-            //-----
+            // i(t) = e^(-α*t) * (A*cos(ωd*t) + B*sin(ωd*t))
+            // i(0)  = A             = i_old
+            // i'(0) = -α*A + ωd*B  = di_dt0  =>  B = (di_dt0 + α*i_old) / ωd
+            let amp_cos = i_old.0;
+            let amp_sin = (di_dt0 + a * i_old.0) / wd;
 
-            //let di_dt = s1*k1 * T::exp(s1 * t) + s2*k2 * T::exp(s2 * t);
-            //k1 + k2 = i_old;
-            //k1 = i_old - k2;
-
-            //let di_dt0 = s1*(i_old - k2) * T::exp(s1 * t) + s2*k2 * T::exp(s2 * t);
-            //let di_dt0 = s1*i_old - s1*k2 + s2 * k2;
-            //let di_dt0 = s1*i_old + (s2 - s1) * k2;
-            //let di_dt0 - s1*i_old =  (s2 - s1) * k2;
-            let k2 = (di_dt0 - s1 * i_old.0) / (s2 - s1);
-            let k1 = i_old.0 - k2;
-
-            // k1 * T::exp(s1 * t) + k2 * T::exp(s2 * t) = k*t + m;
-
-            // this seem to be the one we have...
-            //let ohmega_d = T::sqrt(ohmega * ohmega - a * a);
-            //let i = T::exp(-a * t) * ((k1 + k2) * T::cos(ohmega_d * t) + j(k1 - k2) * sin(ohmega_d * t));
-
-            WonkyF { k1, k2, s1, s2 }
+            DampedSineF { a, wd, amp_cos, amp_sin, c0: 0.0 }
         }
-        std::cmp::Ordering::Equal => {
-            todo!("Critically damped")
-            // Critically damped
-            // t > 0
-            // let i =  T::exp(-a * t) * (k1 + k2 * t);
-        }
-        std::cmp::Ordering::Greater => {
-            todo!("Overdamped response")
-            // Overdamped
-            // t > 0
-            // let i = k1 * T::exp(s1 * t) + k2 * T::exp(s2 * t);
-        }
+        std::cmp::Ordering::Equal => todo!("Critically damped response"),
+        std::cmp::Ordering::Greater => todo!("Overdamped response"),
     }
 }
 

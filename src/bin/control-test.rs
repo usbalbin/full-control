@@ -9,7 +9,7 @@ use half_bridge::{
 use pid::Pid;
 
 const T_PERIOD: Time = Time(1.0e-6);
-const C_OUT: Capacitance = Capacitance(47.0e-6);
+const C_OUT: Capacitance = Capacitance(470.0e-6);
 const L_INDUCTOR: Inductance = Inductance(2e-6);
 
 const MAX_LSB: f64 = 4095.0;
@@ -106,9 +106,26 @@ fn foo(
 
     let mut comp = COMP_WEIGHTS.to_controller();
 
-    let loads = [3.0, 1.0, 10000.0, 1.0, 100.0];
+    let loads = [3.0, 1.0, f64::MAX, 1.0, 100.0];
 
     let mut time = Time(0.0);
+
+    // Soft start: ramp the voltage reference from 0 to target over this many cycles.
+    let soft_start_cycles = 200_usize;
+    for i in 0..soft_start_cycles {
+        let soft_target = Voltage(target.0 * (i + 1) as f64 / soft_start_cycles as f64);
+        let mut i_out = Current(0.0);
+        let output = comp.update((soft_target - sim.v_out).0 as f32);
+        let trip_current = Current((output as T / PARAMS.current_sense_gain).clamp(0.0, MAX_CURRENT.0));
+        let (t_on, i_l_max) = sim.tick(Voltage(12.0), trip_current, |v| {
+            i_out = Current(v.0 / loads[0]);
+            i_out
+        });
+        if let Some(rec) = rec {
+            plot(&rec, &sim, t_on, i_l_max, Voltage(12.0), i_out, &mut time);
+        }
+    }
+
     let iter = 1000;
     let mut v_out_max = 0.0f64;
     for i in 0..iter {
@@ -125,8 +142,8 @@ fn foo(
 
         //dbg!(output);
         let output = comp.update((target - sim.v_out).0 as f32);
-        // Pin voltage to DAC code
-        let trip_current = Current(output as T /* * MAX_CURRENT.0*/); //(output / AMP_PER_LSB as f32 - LSB_AT_ZERO_AMP as f32).clamp(LSB_AT_ZERO_AMP as f32, MAX_LSB as f32);
+        // Controller output is a current-reference voltage (V); divide by current_sense_gain (V/A) to get Amps.
+        let trip_current = Current((output as T / PARAMS.current_sense_gain).clamp(0.0, MAX_CURRENT.0));
         //panic!("Boopi: {trip_current}");
         let (t_on, i_l_max) = sim.tick(v_in, trip_current /*as u16*/, |v| {
             i_out = Current(v.0 / r);
