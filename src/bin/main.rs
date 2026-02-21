@@ -1,6 +1,6 @@
 
 use electronics_sim::{
-    BuckCurrentModeControl, Capacitance, Current, Inductance, Resistance, Time, Voltage, plot,
+    CurrentModeConverter, Topology, Capacitance, Current, Inductance, Resistance, Time, Voltage, plot,
 };
 
 fn main() {
@@ -9,7 +9,7 @@ fn main() {
         .unwrap();
     let t_period = Time(1.0e-6);
     let slope_amp_per_sec = 0.0;
-    let mut sim = BuckCurrentModeControl::new(t_period, Capacitance(10.0e-6), Inductance(2e-6), slope_amp_per_sec);
+    let mut sim = CurrentModeConverter::new(t_period, Capacitance(10.0e-6), Inductance(2e-6), slope_amp_per_sec, Topology::Buck);
 
     let mut time = Time(0.0);
     for i in 0..1000 {

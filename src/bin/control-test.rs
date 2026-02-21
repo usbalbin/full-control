@@ -1,9 +1,9 @@
 use electronics_sim::{
-    BuckCurrentModeControl, Capacitance, Current, Inductance, MyThing, Resistance, T, Time,
+    CurrentModeConverter, Topology, Capacitance, Current, Inductance, MyThing, Resistance, T, Time,
     Voltage, plot,
 };
 use half_bridge::{
-    control_2p2z::{DacSettings, ParametersBuck, TransferFunction, TwoPoleTwoZeroParams},
+    control_2p2z::{DacSettings, ParametersBuck, Topology as ControlTopology, TransferFunction, TwoPoleTwoZeroParams},
     types,
 };
 use pid::Pid;
@@ -13,7 +13,7 @@ const C_OUT: Capacitance = Capacitance(470.0e-6);
 const L_INDUCTOR: Inductance = Inductance(2e-6);
 
 const MAX_LSB: f64 = 4095.0;
-const MAX_CURRENT: Current = Current(22.0);
+const MAX_CURRENT: Current = Current(8.0);
 const PARAMS: ParametersBuck = ParametersBuck {
     v_in: 12.0,
     v_out: 8.0,
@@ -25,6 +25,7 @@ const PARAMS: ParametersBuck = ParametersBuck {
     current_sense_gain: 0.066, // 66mV/A
     i_load: 2.0,
     v_diode: 0.0,
+    topology: ControlTopology::Buck,
     phase_margin: half_bridge::control_2p2z::PhaseMargin::Manual {
         phase_margin: 75.0f64.to_radians(),
     },
@@ -68,7 +69,7 @@ fn main() {
     //i(Voltage(12.0), todo!(), todo!(), L_INDUCTOR, C_OUT, Resistance(10e-3), T_PERIOD);
 
     //let sim = MyThing::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC, AMP_PER_LSB, AMP_AT_0LSB);
-    let sim = BuckCurrentModeControl::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC);
+    let sim = CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC, Topology::Buck);
 
     let target = Voltage(5.0);
 
@@ -97,7 +98,7 @@ fn foo(
     kp: f32,
     ki: f32,
     target: Voltage,
-    mut sim: BuckCurrentModeControl,
+    mut sim: CurrentModeConverter,
     rec: Option<&rerun::RecordingStream>,
 ) -> f64 {
     let mut comp = Pid::new(target.0, 1.0);
@@ -111,7 +112,7 @@ fn foo(
     let mut time = Time(0.0);
 
     // Soft start: ramp the voltage reference from 0 to target over this many cycles.
-    let soft_start_cycles = 200_usize;
+    let soft_start_cycles = 2000_usize;
     for i in 0..soft_start_cycles {
         let soft_target = Voltage(target.0 * (i + 1) as f64 / soft_start_cycles as f64);
         let mut i_out = Current(0.0);

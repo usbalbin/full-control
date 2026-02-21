@@ -6,9 +6,16 @@ use std::ops::{Add, AddAssign, Neg, Sub};
 use crate::math::Line;
 use math::Func;
 
+#[derive(Clone, Copy, Debug)]
+pub enum Topology {
+    Buck,
+    Boost,
+    BuckBoost,
+}
+
 pub fn plot(
     rec: &RecordingStream,
-    sim: &BuckCurrentModeControl,
+    sim: &CurrentModeConverter,
     t_on: Time,
     i_max: Current,
     v_in: Voltage,
@@ -44,7 +51,7 @@ pub type T = f64;
 
 #[derive(Clone, Copy)]
 pub struct MyThing {
-    pub buck: BuckCurrentModeControl,
+    pub buck: CurrentModeConverter,
     amp_per_lsb: T,
     i_at_0lsb: Current,
 }
@@ -59,7 +66,7 @@ impl MyThing {
         i_at_0lsb: Current,
     ) -> Self {
         Self {
-            buck: BuckCurrentModeControl::new(period, c_out, l_inductor, slope_amp_per_sec),
+            buck: CurrentModeConverter::new(period, c_out, l_inductor, slope_amp_per_sec, Topology::Buck),
             amp_per_lsb,
             i_at_0lsb,
         }
@@ -79,7 +86,7 @@ impl MyThing {
 }
 
 #[derive(Clone, Copy)]
-pub struct BuckCurrentModeControl {
+pub struct CurrentModeConverter {
     period: Time,
 
     c_out: Capacitance,
@@ -90,6 +97,8 @@ pub struct BuckCurrentModeControl {
 
     // This should normally be negative
     slope_amp_per_sec: T,
+
+    topology: Topology,
 }
 
 #[derive(Copy, Clone)]
@@ -104,12 +113,13 @@ impl Vec2 {
     }
 }
 
-impl BuckCurrentModeControl {
+impl CurrentModeConverter {
     pub fn new(
         period: Time,
         c_out: Capacitance,
         l_inductor: Inductance,
         slope_amp_per_sec: T,
+        topology: Topology,
     ) -> Self {
         Self {
             period,
@@ -118,6 +128,7 @@ impl BuckCurrentModeControl {
             i_inductor: Current(0.0),
             l_inductor,
             slope_amp_per_sec,
+            topology,
         }
     }
 
@@ -139,126 +150,131 @@ impl BuckCurrentModeControl {
         trip_current: Current,
         i_out: impl FnOnce(Voltage) -> Current,
     ) -> (Time, Current) {
-        let v_ind_on = v_in - self.v_out;
-        let v_ind_off = -self.v_out;
+        match self.topology {
+            Topology::Buck => {
+                let v_ind_on = v_in - self.v_out;
 
-        // V = L di/dt
-        // di/dt = V/L
+                // V = L di/dt
+                // di/dt = V/L
+                let di_dt_on = v_ind_on.0 / self.l_inductor.0;
 
-        let di_dt_on = v_ind_on.0 / self.l_inductor.0;
-        let di_dt_off = v_ind_off.0 / self.l_inductor.0;
-        // y = kx + m
-        // y - m = kx
-        // x = (y - m) / k
+                // TODO: Add r_l_esr + r_dson_switch and figure out how to do with r_c_esr
+                let r_in_lcr = Resistance(0.0);
+                let i_on_func = math::rlc(
+                    v_in,
+                    self.v_out,
+                    self.i_inductor,
+                    self.l_inductor,
+                    self.c_out,
+                    r_in_lcr,
+                );
 
-        // i = di_dt*t + old_i = i_trip + slope * t
-        // di_dt*t = i_trip + slope * t - old_i
-        // di_dt*t - slope * t = i_trip - old_i
-        // (di_dt - slope) * t = i_trip - old_i
-        // t = (i_trip - old_i) / (di_dt - slope)
+                let t_on_guess =
+                    Time((trip_current - self.i_inductor).0 / (di_dt_on - self.slope_amp_per_sec));
+                let t_on = Time(
+                    i_on_func
+                        .intersects_at(
+                            Line {
+                                k: self.slope_amp_per_sec,
+                                m: trip_current.0,
+                            },
+                            t_on_guess.0,
+                        )
+                        .unwrap(),
+                );
 
-        // TODO: Add r_l_esr + r_dson_switch and figure out how to do with r_c_esr
-        //    vin
-        //     |
-        //     ⎴
-        //   Q's Rds(on)
-        //     ⎵
-        //     |
-        //     *
-        //  \
-        //   \   Q
-        //    \
-        //     |           L
-        //     *--------𜰋𜰌𜰌𜰌𜰌𜰌𜰍--[ L's esr ]-------*
-        //                                         |
-        //                                         ⎴
-        //                                       C's Rds(on)
-        //                                         ⎵
-        //                                         |
-        //                                      -------
-        //                                  C   -------
-        //                                         |
-        //                                       -----
-        //                                        ---
-        //                                         -
-        //
-        let r_in_lcr = Resistance(0.0);
-        let i_on_func = math::rlc(
-            v_in,
-            self.v_out,
-            self.i_inductor,
-            self.l_inductor,
-            self.c_out,
-            r_in_lcr,
-        );
+                let q_old = 0.0;
 
-        let t_on_guess =
-            Time((trip_current - self.i_inductor).0 / (di_dt_on - self.slope_amp_per_sec));
-        let t_on = Time(
-            i_on_func
-                .intersects_at(
-                    Line {
-                        k: self.slope_amp_per_sec,
-                        m: trip_current.0,
-                    },
+                // Total charge in capacitor at end of ON-phase
+                let q_on;
+
+                // current at end of the ON-phase
+                let i_max;
+                if t_on.0 < 0.0 {
+                    i_max = self.i_inductor;
+                    q_on = q_old;
+                } else if t_on.0 > self.period.0 {
+                    // Clamp to 100%
+                    i_max = Current(i_on_func.f(self.period.0));
+                    q_on = i_on_func.integral(0.0).f(self.period.0) + q_old;
+                } else {
+                    i_max = Current(i_on_func.f(t_on.0));
+                    q_on = i_on_func.integral(0.0).f(t_on.0) + q_old;
+                }
+
+                // Vout at end of the ON-phase
+                let v_out_max = self.v_out + Voltage(q_on / self.c_out.0);
+
+                let t_on = Time(t_on.0.clamp(0.0, self.period.0));
+                let t_off = self.period - t_on;
+
+                let i_off_func = math::rlc(
+                    Voltage(0.0),
+                    v_out_max,
+                    i_max,
+                    self.l_inductor,
+                    self.c_out,
+                    r_in_lcr,
+                );
+                let i_final = Current(i_off_func.f(t_off.0));
+
+                // Total charge in the capacitor at the end of the period
+                let q_off = i_off_func.integral(0.0).f(t_off.0);
+                let q_in = q_on + q_off;
+                let q_out = i_out(self.v_out).0 * self.period.0;
+
+                println!("t_on: {:.1}, t_off: {:.1}, q_in: {q_in}, q_on: {q_on}, q_off: {q_off}, i_max: {}, i_fin: {}", 100.0 * (t_on.0 / self.period.0), 100.0 * (t_off.0 / self.period.0), i_max.0, (i_off_func.f(t_off.0)));
+
+                self.v_out += Voltage((q_in - q_out) / self.c_out.0);
+                self.i_inductor = i_final;
+
+                (t_on, i_max)
+            }
+
+            Topology::Boost | Topology::BuckBoost => {
+                // ON phase: inductor charges linearly from V_in; C is decoupled (diode reverse-biased)
+                let di_dt_on = v_in.0 / self.l_inductor.0;
+                let i_on_line = Line { k: di_dt_on, m: self.i_inductor.0 };
+
+                let t_on_guess = Time(
+                    (trip_current - self.i_inductor).0 / (di_dt_on - self.slope_amp_per_sec)
+                );
+                // intersects_at with two Lines converges in exactly 1 Newton step (guess is analytic)
+                let t_on = Time(i_on_line.intersects_at(
+                    Line { k: self.slope_amp_per_sec, m: trip_current.0 },
                     t_on_guess.0,
-                )
-                .unwrap(),
-        );
+                ).unwrap());
 
-        let q_old = 0.0;//self.c_out.0 * self.v_out.0;
+                let i_max;
+                let t_on = if t_on.0 < 0.0 {
+                    i_max = self.i_inductor; Time(0.0)
+                } else if t_on.0 > self.period.0 {
+                    i_max = Current(i_on_line.f(self.period.0)); self.period
+                } else {
+                    i_max = Current(i_on_line.f(t_on.0)); t_on
+                };
+                let t_off = self.period - t_on;
 
-        // Total charge in capacitor at end of ON-phase
-        let q_on;
+                // OFF phase: L and C coupled.
+                // Boost:     V_in drives L+C in series (energy transferred from L+source to C).
+                // BuckBoost: no source, L discharges into cap.
+                let v_off_source = match self.topology {
+                    Topology::Boost => v_in,
+                    Topology::BuckBoost | Topology::Buck => Voltage(0.0),
+                };
+                let i_off_func = math::rlc(v_off_source, self.v_out, i_max,
+                                            self.l_inductor, self.c_out, Resistance(0.0));
+                let i_final = Current(i_off_func.f(t_off.0));
 
-        // current at end of the ON-phase
-        let i_max;
-        if t_on.0 < 0.0 {
-            i_max = self.i_inductor;
-            q_on = q_old;
-        } else if t_on.0 > self.period.0 {
-            // Clamp t0 100%
-            i_max = Current(i_on_func.f(self.period.0));
-            q_on = i_on_func.integral(0.0).f(self.period.0) + q_old;
-        } else {
-            i_max = Current(i_on_func.f(t_on.0));
-            q_on = i_on_func.integral(0.0).f(t_on.0) + q_old;
+                // Charge balance: only OFF phase inductor current charges the cap
+                let q_in = i_off_func.integral(0.0).f(t_off.0);
+                let q_out = i_out(self.v_out).0 * self.period.0;
+                self.v_out += Voltage((q_in - q_out) / self.c_out.0);
+                self.i_inductor = i_final;
+
+                (t_on, i_max)
+            }
         }
-
-        // Vout at end of the ON-phase
-        let v_out_max = self.v_out + Voltage(q_on / self.c_out.0);
-
-        let t_on = Time(t_on.0.clamp(0.0, self.period.0));
-
-        let t_off = self.period - t_on;
-
-        let i_off_func = math::rlc(
-            Voltage(0.0),
-            v_out_max,
-            i_max,
-            self.l_inductor,
-            self.c_out,
-            r_in_lcr,
-        );
-        dbg!(&i_off_func);
-        let i_final = Current(i_off_func.f(t_off.0));
-
-        // Total charge in the capacitor at the end of the period
-        let q_off = i_off_func.integral(0.0).f(t_off.0);
-        let q_end = q_on + q_off;
-        let q_in = q_end;
-
-        let q_out = i_out(self.v_out).0 * self.period.0;
-
-        // i = c * dv/dt;
-        // i = c * dv/dt;
-
-        println!("t_on: {:.1}, t_off: {:.1}, q_in: {q_in}, q_on: {q_on}, q_off: {q_off}, i_max: {}, i_fin: {}", 100.0 * (t_on.0 / self.period.0), 100.0 * (t_off.0 / self.period.0), i_max.0, (i_off_func.f(t_off.0)));
-
-        self.v_out += Voltage((q_in - q_out) / self.c_out.0);
-        self.i_inductor = i_final;
-
-        (t_on, i_max)
     }
 }
 
