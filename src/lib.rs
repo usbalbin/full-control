@@ -66,7 +66,7 @@ impl MyThing {
         i_at_0lsb: Current,
     ) -> Self {
         Self {
-            buck: CurrentModeConverter::new(period, c_out, l_inductor, slope_amp_per_sec, Topology::Buck, Resistance(0.0)),
+            buck: CurrentModeConverter::new(period, c_out, l_inductor, slope_amp_per_sec, Topology::Buck, Resistance(0.0), 0.0),
             amp_per_lsb,
             i_at_0lsb,
         }
@@ -103,6 +103,10 @@ pub struct CurrentModeConverter {
     /// Lumped series resistance (inductor DCR + conducting switch R_dson).
     /// Models conduction losses in both ON and OFF phases.
     r_series: Resistance,
+
+    /// Equivalent series resistance of the output capacitor.
+    /// Used by `v_sensed()` to reproduce the ESR voltage seen by the ADC.
+    r_esr: f64,
 }
 
 #[derive(Copy, Clone)]
@@ -118,6 +122,18 @@ impl Vec2 {
 }
 
 impl CurrentModeConverter {
+    /// Output voltage as seen by the ADC at the start of the switching cycle
+    /// (valley of the inductor current ripple), including the ESR contribution.
+    ///
+    /// At the sample instant the cap current is `i_valley − i_load`, so:
+    ///
+    ///   V_sense = V_cap + R_esr × (i_valley − i_load)
+    ///
+    /// Pass the load current from the previous cycle's tick closure as `i_load`.
+    pub fn v_sensed(&self, i_load: Current) -> Voltage {
+        Voltage(self.v_out.0 + self.r_esr * (self.i_inductor.0 - i_load.0))
+    }
+
     pub fn new(
         period: Time,
         c_out: Capacitance,
@@ -125,6 +141,7 @@ impl CurrentModeConverter {
         slope_amp_per_sec: T,
         topology: Topology,
         r_series: Resistance,
+        r_esr: f64,
     ) -> Self {
         Self {
             period,
@@ -135,6 +152,7 @@ impl CurrentModeConverter {
             slope_amp_per_sec,
             topology,
             r_series,
+            r_esr,
         }
     }
 
@@ -209,8 +227,12 @@ impl CurrentModeConverter {
                 let t_on = Time(t_on.0.clamp(0.0, self.period.0));
                 let t_off = self.period - t_on;
 
-                // Load draws from cap during ON at the initial output voltage.
-                let q_out_on = i_out(self.v_out).0 * t_on.0;
+                // Sample load current once at the initial output voltage.  The ON/OFF
+                // voltages differ by at most a few mV of ripple, so two samples would give
+                // negligibly different results while causing stateful loads (e.g. Battery) to
+                // advance their internal state twice per cycle.
+                let load_current = i_out(self.v_out);
+                let q_out_on = load_current.0 * t_on.0;
                 // Net cap voltage at start of OFF phase: inductor charge in minus load drain.
                 let v_out_at_off = self.v_out + Voltage((q_on - q_out_on) / self.c_out.0);
 
@@ -225,7 +247,7 @@ impl CurrentModeConverter {
                 let i_final = Current(i_off_func.f(t_off.0));
 
                 let q_off = i_off_func.integral(0.0).f(t_off.0);
-                let q_out_off = i_out(v_out_at_off).0 * t_off.0;
+                let q_out_off = load_current.0 * t_off.0;
                 self.v_out = v_out_at_off + Voltage((q_off - q_out_off) / self.c_out.0);
                 self.i_inductor = i_final;
 
@@ -263,7 +285,9 @@ impl CurrentModeConverter {
 
                 // During ON: cap is decoupled from the inductor but still drives the load,
                 // so it droops by q_out_on / C before the OFF phase begins.
-                let q_out_on = i_out(self.v_out).0 * t_on.0;
+                // Sample load current once — see Buck branch for rationale.
+                let load_current = i_out(self.v_out);
+                let q_out_on = load_current.0 * t_on.0;
                 let v_out_at_off = self.v_out - Voltage(q_out_on / self.c_out.0);
 
                 // OFF phase: L and C coupled, starting from the drooped cap voltage.
@@ -278,7 +302,7 @@ impl CurrentModeConverter {
                 let i_final = Current(i_off_func.f(t_off.0));
 
                 let q_in = i_off_func.integral(0.0).f(t_off.0);
-                let q_out_off = i_out(v_out_at_off).0 * t_off.0;
+                let q_out_off = load_current.0 * t_off.0;
                 self.v_out = v_out_at_off + Voltage((q_in - q_out_off) / self.c_out.0);
                 self.i_inductor = i_final;
 

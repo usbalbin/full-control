@@ -1,9 +1,9 @@
 use electronics_sim::{
-    CurrentModeConverter, Topology, Capacitance, Current, Inductance, MyThing, Resistance, T, Time,
+    BuckCurrentModeControl, Capacitance, Current, Inductance, MyThing, Resistance, T, Time,
     Voltage, plot,
 };
 use half_bridge::{
-    control_2p2z::{DacSettings, ParametersBuck, Topology as ControlTopology, TransferFunction, TwoPoleTwoZeroParams},
+    control_2p2z::{DacSettings, ParametersBuck, TransferFunction, TwoPoleTwoZeroParams},
     types,
 };
 use pid::Pid;
@@ -25,12 +25,9 @@ const PARAMS: ParametersBuck = ParametersBuck {
     current_sense_gain: 0.066, // 66mV/A
     i_load: 2.0,
     v_diode: 0.0,
-    topology: ControlTopology::Buck,
     phase_margin: half_bridge::control_2p2z::PhaseMargin::Manual {
         phase_margin: 75.0f64.to_radians(),
     },
-    f_x_divisor: 13.333333333333333,
-    cycles_per_tick: 1,
 }; /*
 const MAX_LSB: f64 = 1023.0;
 const PARAMS: ParametersBuck = ParametersBuck {
@@ -71,7 +68,7 @@ fn main() {
     //i(Voltage(12.0), todo!(), todo!(), L_INDUCTOR, C_OUT, Resistance(10e-3), T_PERIOD);
 
     //let sim = MyThing::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC, AMP_PER_LSB, AMP_AT_0LSB);
-    let sim = CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC, Topology::Buck, Resistance(0.0), 0.0);
+    let sim = BuckCurrentModeControl::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC);
 
     let target = Voltage(5.0);
 
@@ -100,7 +97,7 @@ fn foo(
     kp: f32,
     ki: f32,
     target: Voltage,
-    mut sim: CurrentModeConverter,
+    mut sim: BuckCurrentModeControl,
     rec: Option<&rerun::RecordingStream>,
 ) -> f64 {
     let mut comp = Pid::new(target.0, 1.0);

@@ -404,7 +404,7 @@ impl Logger {
 fn main() {
     // Start the sim in BuckBoost topology; sync_sim() will update it each cycle.
     let mut sim =
-        CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_BB, Topology::BuckBoost, R_SERIES);
+        CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_BB, Topology::BuckBoost, R_SERIES, R_ESR);
 
     let mut ctrl = BuckBoostController::new(MAX_CURRENT.0 as f32 * CS_GAIN as f32);
     let mut logger = Logger::new();
@@ -419,16 +419,16 @@ fn main() {
     let vins = [24.0, 12.0, 8.0];
 
     let mut ctrl_out = (0.0f32, Mode::BuckBoost, SLOPE_BB, false);
+    let mut i_out = Current(0.0);
     for i in 0..soft_cycles {
         let soft_target = V_TARGET.0 * (i + 1) as f64 / soft_cycles as f64;
         if i % CYCLES_PER_TICK == 0 {
-            ctrl_out = ctrl.update(v_in_startup.0, sim.v_out.0, soft_target);
+            ctrl_out = ctrl.update(v_in_startup.0, sim.v_sensed(i_out).0, soft_target);
         }
         let (cmd_v, mode, slope, clamped) = ctrl_out;
         sync_sim(&mut sim, slope, mode);
 
         let trip = Current((cmd_v as f64 / CS_GAIN).clamp(0.0, MAX_CURRENT.0));
-        let mut i_out = Current(0.0);
         let (t_on, i_max) = sim.tick(v_in_startup, trip, |v| {
             i_out = Current(v.0 / R_LOAD);
             i_out
@@ -461,15 +461,15 @@ fn main() {
     for v_in in vins {
         let v_in = Voltage(v_in);
         let mut ctrl_out = (0.0f32, Mode::BuckBoost, SLOPE_BB, false);
+        let mut i_out = Current(0.0);
         for i in 0..bat_test_cycles {
             if i % CYCLES_PER_TICK == 0 {
-                ctrl_out = ctrl.update(v_in.0, sim.v_out.0, V_TARGET.0);
+                ctrl_out = ctrl.update(v_in.0, sim.v_sensed(i_out).0, V_TARGET.0);
             }
             let (cmd_v, mode, slope, clamped) = ctrl_out;
             sync_sim(&mut sim, slope, mode);
 
             let trip = Current((cmd_v as f64 / CS_GAIN).clamp(0.0, MAX_CURRENT.0));
-            let mut i_out = Current(0.0);
             let (t_on, i_max) = sim.tick(v_in, trip, |v| {
                 i_out = bat.tick(v, T_PERIOD);
                 i_out
@@ -484,18 +484,18 @@ fn main() {
     let rs = [12.0, 6.0, f64::MAX];
 
     let mut ctrl_out = (0.0f32, Mode::BuckBoost, SLOPE_BB, false);
+    let mut i_out = Current(0.0);
     for i in 0..total_cycles {
         let v_in = Voltage(v_in_sweep(i % sweep_cycles, sweep_cycles));
         let r = rs[i * rs.len() / total_cycles];
 
         if i % CYCLES_PER_TICK == 0 {
-            ctrl_out = ctrl.update(v_in.0, sim.v_out.0, V_TARGET.0);
+            ctrl_out = ctrl.update(v_in.0, sim.v_sensed(i_out).0, V_TARGET.0);
         }
         let (cmd_v, mode, slope, clamped) = ctrl_out;
         sync_sim(&mut sim, slope, mode);
 
         let trip = Current((cmd_v as f64 / CS_GAIN).clamp(0.0, MAX_CURRENT.0));
-        let mut i_out = Current(0.0);
         let (t_on, i_max) = sim.tick(v_in, trip, |v| {
             i_out = Current(v.0 / r);
             i_out
@@ -509,17 +509,17 @@ fn main() {
     for v_in in vins {
         let v_in = Voltage(v_in);
         let mut ctrl_out = (0.0f32, Mode::BuckBoost, SLOPE_BB, false);
+        let mut i_out = Current(0.0);
         for i in 0..sweep_cycles {
             let r = rs[i * rs.len() / sweep_cycles];
 
             if i % CYCLES_PER_TICK == 0 {
-                ctrl_out = ctrl.update(v_in.0, sim.v_out.0, V_TARGET.0);
+                ctrl_out = ctrl.update(v_in.0, sim.v_sensed(i_out).0, V_TARGET.0);
             }
             let (cmd_v, mode, slope, clamped) = ctrl_out;
             sync_sim(&mut sim, slope, mode);
 
             let trip = Current((cmd_v as f64 / CS_GAIN).clamp(0.0, MAX_CURRENT.0));
-            let mut i_out = Current(0.0);
             let (t_on, i_max) = sim.tick(v_in, trip, |v| {
                 i_out = Current(v.0 / r);
                 i_out
