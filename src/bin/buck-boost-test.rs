@@ -31,11 +31,9 @@ const PM: PhaseMargin = PhaseMargin::Manual {
 // ── Compile-time 2P2Z weights per operating mode ──────────────────────────────
 //
 // Each set is linearised at a representative V_in for that mode.  The
-// *physics* in the simulator always uses BuckBoost topology (see sync_sim),
-// so there is no abrupt plant-model discontinuity at mode boundaries.  The
-// only thing that changes on a mode switch is the controller gains and the
-// slope-compensation ramp — both of which the bumpless-transfer mechanism
-// handles gracefully.
+// physics topology in the simulator tracks the current mode (Buck/BuckBoost/Boost)
+// via sync_sim().  On a mode switch the controller gains and slope-compensation
+// ramp also change, both handled gracefully by the bumpless-transfer mechanism.
 
 // Buck region: design point V_in = 24 V → V_out = 12 V
 const PARAMS_BUCK: ParametersBuck = ParametersBuck {
@@ -247,18 +245,18 @@ impl BuckBoostController {
 
 /// Update the simulator before each tick().
 ///
-/// The physics topology is kept at BuckBoost for ALL operating modes.
-/// Switching from Buck to BuckBoost (or Boost to BuckBoost) in the sim would
-/// cause an abrupt change in the plant model:
-///   - Buck ON phase:     V_L = V_in − V_out  (RLC),  D ≈ 87% near boundary
-///   - BuckBoost ON phase: V_L = V_in (linear), D ≈ 47% near boundary
-/// The inductor on-ramp rate and duty cycle would jump discontinuously,
-/// producing large transients that overwhelm the bumpless controller transfer.
-/// A real 4-switch converter changes its gating pattern smoothly; keeping
-/// the sim in BuckBoost mode reproduces that continuous behaviour.
-fn sync_sim(sim: &mut CurrentModeConverter, slope: f64) {
-    // Topology stays BuckBoost — only slope compensation changes.
-    sim.topology = Topology::BuckBoost;
+/// Synchronise the simulator's topology and slope to match the current control mode.
+///
+/// The physics model in `lib.rs` correctly implements all three topologies:
+///   - Buck ON:       V_L = V_in − V_out  (RLC)
+///   - BuckBoost ON:  V_L = V_in          (linear, capacitor decoupled)
+///   - Boost ON:      V_L = V_in          (linear, capacitor decoupled)
+fn sync_sim(sim: &mut CurrentModeConverter, slope: f64, mode: Mode) {
+    sim.topology = match mode {
+        Mode::Buck => Topology::Buck,
+        Mode::BuckBoost => Topology::BuckBoost,
+        Mode::Boost => Topology::Boost,
+    };
     sim.slope_amp_per_sec = slope;
 }
 
@@ -401,7 +399,7 @@ impl Logger {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
-    // Start the sim in BuckBoost topology (stays there forever — see sync_sim).
+    // Start the sim in BuckBoost topology; sync_sim() will update it each cycle.
     let mut sim =
         CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_BB, Topology::BuckBoost);
 
@@ -424,7 +422,7 @@ fn main() {
             ctrl_out = ctrl.update(v_in_startup.0, sim.v_out.0, soft_target);
         }
         let (cmd_v, mode, slope, clamped) = ctrl_out;
-        sync_sim(&mut sim, slope);
+        sync_sim(&mut sim, slope, mode);
 
         let trip = Current((cmd_v as f64 / CS_GAIN).clamp(0.0, MAX_CURRENT.0));
         let mut i_out = Current(0.0);
@@ -465,7 +463,7 @@ fn main() {
                 ctrl_out = ctrl.update(v_in.0, sim.v_out.0, V_TARGET.0);
             }
             let (cmd_v, mode, slope, clamped) = ctrl_out;
-            sync_sim(&mut sim, slope);
+            sync_sim(&mut sim, slope, mode);
 
             let trip = Current((cmd_v as f64 / CS_GAIN).clamp(0.0, MAX_CURRENT.0));
             let mut i_out = Current(0.0);
@@ -491,7 +489,7 @@ fn main() {
             ctrl_out = ctrl.update(v_in.0, sim.v_out.0, V_TARGET.0);
         }
         let (cmd_v, mode, slope, clamped) = ctrl_out;
-        sync_sim(&mut sim, slope);
+        sync_sim(&mut sim, slope, mode);
 
         let trip = Current((cmd_v as f64 / CS_GAIN).clamp(0.0, MAX_CURRENT.0));
         let mut i_out = Current(0.0);
@@ -515,7 +513,7 @@ fn main() {
                 ctrl_out = ctrl.update(v_in.0, sim.v_out.0, V_TARGET.0);
             }
             let (cmd_v, mode, slope, clamped) = ctrl_out;
-            sync_sim(&mut sim, slope);
+            sync_sim(&mut sim, slope, mode);
 
             let trip = Current((cmd_v as f64 / CS_GAIN).clamp(0.0, MAX_CURRENT.0));
             let mut i_out = Current(0.0);

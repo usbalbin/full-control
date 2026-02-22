@@ -30,6 +30,7 @@ const PARAMS: ParametersBuck = ParametersBuck {
         phase_margin: 75.0f64.to_radians(),
     },
     f_x_divisor: 13.333333333333333,
+    cycles_per_tick: 1,
 }; /*
 const MAX_LSB: f64 = 1023.0;
 const PARAMS: ParametersBuck = ParametersBuck {
