@@ -96,9 +96,9 @@ pub struct CurrentModeConverter {
     l_inductor: Inductance,
 
     // This should normally be negative
-    slope_amp_per_sec: T,
+    pub slope_amp_per_sec: T,
 
-    topology: Topology,
+    pub topology: Topology,
 }
 
 #[derive(Copy, Clone)]
@@ -223,7 +223,6 @@ impl CurrentModeConverter {
                 let q_in = q_on + q_off;
                 let q_out = i_out(self.v_out).0 * self.period.0;
 
-                println!("t_on: {:.1}, t_off: {:.1}, q_in: {q_in}, q_on: {q_on}, q_off: {q_off}, i_max: {}, i_fin: {}", 100.0 * (t_on.0 / self.period.0), 100.0 * (t_off.0 / self.period.0), i_max.0, (i_off_func.f(t_off.0)));
 
                 self.v_out += Voltage((q_in - q_out) / self.c_out.0);
                 self.i_inductor = i_final;

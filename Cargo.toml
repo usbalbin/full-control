@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 publish = ["gitea"]
 
+[features]
+# Print tabular per-cycle data to stdout instead of launching rerun.
+# Run with: cargo run --bin buck-boost-test --features text-log
+text-log = []
+
 [dependencies]
 half-bridge = { path = "../hw-half-bridge/firmware", default-features = false }
 pid = "4.0.0"

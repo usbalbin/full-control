@@ -29,6 +29,7 @@ const PARAMS: ParametersBuck = ParametersBuck {
     phase_margin: half_bridge::control_2p2z::PhaseMargin::Manual {
         phase_margin: 75.0f64.to_radians(),
     },
+    f_x_divisor: 13.333333333333333,
 }; /*
 const MAX_LSB: f64 = 1023.0;
 const PARAMS: ParametersBuck = ParametersBuck {

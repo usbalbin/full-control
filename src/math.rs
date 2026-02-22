@@ -37,21 +37,21 @@ pub trait Func: fmt::Debug {
     }
 }
 
-/// f(x) = k1*e^(s1*x) + k2*e^(s2*x)
+/// f(x) = k1*e^(s1*x) + k2*e^(s2*x) + c0
 pub struct WonkyF {
     k1: T,
     k2: T,
-
     s1: T,
     s2: T,
+    c0: T,
 }
 
 impl fmt::Debug for WonkyF {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "f(x) = {:?}*e^({:?}*x) + {:?}*e^({:?}*x)",
-            self.k1, self.s1, self.k2, self.s2
+            "f(x) = {:?}*e^({:?}*x) + {:?}*e^({:?}*x) + {:?}",
+            self.k1, self.s1, self.k2, self.s2, self.c0
         )
     }
 }
@@ -126,6 +126,39 @@ impl Func for DampedSineF {
     }
 }
 
+/// The current waveform returned by [`rlc`].
+#[derive(Debug)]
+pub enum RlcResponse {
+    Underdamped(DampedSineF),
+    Overdamped(WonkyF),
+}
+
+impl Func for RlcResponse {
+    type Derivetive = Self;
+    type Integral = Self;
+
+    fn f(&self, x: T) -> T {
+        match self {
+            Self::Underdamped(s) => s.f(x),
+            Self::Overdamped(s) => s.f(x),
+        }
+    }
+
+    fn derivative(&self) -> Self {
+        match self {
+            Self::Underdamped(s) => Self::Underdamped(s.derivative()),
+            Self::Overdamped(s) => Self::Overdamped(s.derivative()),
+        }
+    }
+
+    fn integral(&self, a0: T) -> Self {
+        match self {
+            Self::Underdamped(s) => Self::Underdamped(s.integral(a0)),
+            Self::Overdamped(s) => Self::Overdamped(s.integral(a0)),
+        }
+    }
+}
+
 // https://www.youtube.com/watch?v=m27OkXwBbuk
 pub fn rlc(
     v_in: Voltage,
@@ -134,7 +167,7 @@ pub fn rlc(
     l: Inductance,
     c: Capacitance,
     r: Resistance,
-) -> DampedSineF {
+) -> RlcResponse {
     // KVL: v_in = R*i + L*di/dt + v_c
     // Differentiating w.r.t. t (v_in constant):
     //   L*d²i/dt² + R*di/dt + i/C = 0
@@ -143,14 +176,14 @@ pub fn rlc(
     let a = r.0 / (2.0 * l.0);
     let ohmega = 1.0 / T::sqrt(l.0 * c.0);
 
+    // KVL at t=0: di/dt(0) = (v_in - R*i(0) - v_c(0)) / L
+    let di_dt0 = (v_in.0 - r.0 * i_old.0 - v_cout_old.0) / l.0;
+
     match a.partial_cmp(&ohmega).unwrap() {
         std::cmp::Ordering::Less => {
             // Underdamped: roots are complex  s = -α ± j·ωd
             // where ωd = sqrt(ω₀² - α²)
             let wd = T::sqrt(ohmega * ohmega - a * a);
-
-            // KVL at t=0: di/dt(0) = (v_in - R*i(0) - v_c(0)) / L
-            let di_dt0 = (v_in.0 - r.0 * i_old.0 - v_cout_old.0) / l.0;
 
             // i(t) = e^(-α*t) * (A*cos(ωd*t) + B*sin(ωd*t))
             // i(0)  = A             = i_old
@@ -158,10 +191,26 @@ pub fn rlc(
             let amp_cos = i_old.0;
             let amp_sin = (di_dt0 + a * i_old.0) / wd;
 
-            DampedSineF { a, wd, amp_cos, amp_sin, c0: 0.0 }
+            RlcResponse::Underdamped(DampedSineF { a, wd, amp_cos, amp_sin, c0: 0.0 })
         }
-        std::cmp::Ordering::Equal => todo!("Critically damped response"),
-        std::cmp::Ordering::Greater => todo!("Overdamped response"),
+        std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => {
+            // Overdamped (or critically damped): roots are real
+            //   s₁,₂ = -α ± sqrt(α² - ω₀²)
+            // At exact critical damping s₁ = 0, causing division by zero in
+            // WonkyF::integral.  Nudge α up by ε to stay well-conditioned;
+            // the error is negligible (< 1 ppm).
+            let a_eff = if a == ohmega { a * (1.0 + 1e-6) } else { a };
+            let gamma = T::sqrt(a_eff * a_eff - ohmega * ohmega);
+            let s1 = -a_eff + gamma; // less negative root
+            let s2 = -a_eff - gamma; // more negative root
+
+            // i(t) = k1*e^(s1*t) + k2*e^(s2*t)
+            // i(0)  = k1 + k2        = i_old
+            // i'(0) = s1*k1 + s2*k2  = di_dt0
+            let k1 = (di_dt0 - s2 * i_old.0) / (s1 - s2);
+            let k2 = i_old.0 - k1;
+            RlcResponse::Overdamped(WonkyF { k1, k2, s1, s2, c0: 0.0 })
+        }
     }
 }
 
@@ -170,27 +219,33 @@ impl Func for WonkyF {
     type Integral = Self;
 
     fn f(&self, x: T) -> T {
-        self.k1 * T::exp(self.s1 * x) + self.k2 * T::exp(self.s2 * x)
+        self.k1 * T::exp(self.s1 * x) + self.k2 * T::exp(self.s2 * x) + self.c0
     }
 
     fn derivative(&self) -> WonkyF {
+        // d/dx [k1*e^(s1*x) + k2*e^(s2*x) + c0] = s1*k1*e^(s1*x) + s2*k2*e^(s2*x)
         WonkyF {
             k1: self.s1 * self.k1,
             k2: self.s2 * self.k2,
-
             s1: self.s1,
             s2: self.s2,
+            c0: 0.0,
         }
     }
 
     fn integral(&self, a0: T) -> Self::Integral {
-        assert_eq!(a0, 0.0, "Not implemented");
+        // ∫ k1*e^(s1*x) + k2*e^(s2*x) dx = k1/s1*e^(s1*x) + k2/s2*e^(s2*x) + C
+        // Shift C so that F(0) = a0:  C = a0 - k1/s1 - k2/s2
+        // (Only valid when c0 == 0; a non-zero c0 would add a linear term c0*x.)
+        assert_eq!(self.c0, 0.0, "integral of WonkyF with c0 != 0 requires a polynomial term (not implemented)");
+        let new_k1 = self.k1 / self.s1;
+        let new_k2 = self.k2 / self.s2;
         WonkyF {
-            k1: self.k1 / self.s1,
-            k2: self.k2 / self.s2,
-
+            k1: new_k1,
+            k2: new_k2,
             s1: self.s1,
             s2: self.s2,
+            c0: a0 - new_k1 - new_k2,
         }
     }
 }
