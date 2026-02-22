@@ -66,7 +66,7 @@ impl MyThing {
         i_at_0lsb: Current,
     ) -> Self {
         Self {
-            buck: CurrentModeConverter::new(period, c_out, l_inductor, slope_amp_per_sec, Topology::Buck),
+            buck: CurrentModeConverter::new(period, c_out, l_inductor, slope_amp_per_sec, Topology::Buck, Resistance(0.0)),
             amp_per_lsb,
             i_at_0lsb,
         }
@@ -99,6 +99,10 @@ pub struct CurrentModeConverter {
     pub slope_amp_per_sec: T,
 
     pub topology: Topology,
+
+    /// Lumped series resistance (inductor DCR + conducting switch R_dson).
+    /// Models conduction losses in both ON and OFF phases.
+    r_series: Resistance,
 }
 
 #[derive(Copy, Clone)]
@@ -120,6 +124,7 @@ impl CurrentModeConverter {
         l_inductor: Inductance,
         slope_amp_per_sec: T,
         topology: Topology,
+        r_series: Resistance,
     ) -> Self {
         Self {
             period,
@@ -129,6 +134,7 @@ impl CurrentModeConverter {
             l_inductor,
             slope_amp_per_sec,
             topology,
+            r_series,
         }
     }
 
@@ -158,15 +164,13 @@ impl CurrentModeConverter {
                 // di/dt = V/L
                 let di_dt_on = v_ind_on.0 / self.l_inductor.0;
 
-                // TODO: Add r_l_esr + r_dson_switch and figure out how to do with r_c_esr
-                let r_in_lcr = Resistance(0.0);
                 let i_on_func = math::rlc(
                     v_in,
                     self.v_out,
                     self.i_inductor,
                     self.l_inductor,
                     self.c_out,
-                    r_in_lcr,
+                    self.r_series,
                 );
 
                 let t_on_guess =
@@ -214,7 +218,7 @@ impl CurrentModeConverter {
                     i_max,
                     self.l_inductor,
                     self.c_out,
-                    r_in_lcr,
+                    self.r_series,
                 );
                 let i_final = Current(i_off_func.f(t_off.0));
 
@@ -231,8 +235,13 @@ impl CurrentModeConverter {
             }
 
             Topology::Boost | Topology::BuckBoost => {
-                // ON phase: inductor charges linearly from V_in; C is decoupled (diode reverse-biased)
-                let di_dt_on = v_in.0 / self.l_inductor.0;
+                // ON phase: C is decoupled (diode reverse-biased), so this is an RL circuit.
+                // Exact solution is exponential; approximate as linear with effective V_in
+                // computed at the midpoint of the ON-phase current swing.  Error is
+                // O((R·ΔI/V_in)²) — negligible for typical R << L·f_sw.
+                let v_on_eff = v_in.0
+                    - self.r_series.0 * (self.i_inductor.0 + trip_current.0) / 2.0;
+                let di_dt_on = v_on_eff / self.l_inductor.0;
                 let i_on_line = Line { k: di_dt_on, m: self.i_inductor.0 };
 
                 let t_on_guess = Time(
@@ -262,7 +271,7 @@ impl CurrentModeConverter {
                     Topology::BuckBoost | Topology::Buck => Voltage(0.0),
                 };
                 let i_off_func = math::rlc(v_off_source, self.v_out, i_max,
-                                            self.l_inductor, self.c_out, Resistance(0.0));
+                                            self.l_inductor, self.c_out, self.r_series);
                 let i_final = Current(i_off_func.f(t_off.0));
 
                 // Charge balance: only OFF phase inductor current charges the cap

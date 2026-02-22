@@ -17,6 +17,9 @@ const C_OUT: Capacitance = Capacitance(47e-6);
 const L_INDUCTOR: Inductance = Inductance(4e-6);
 const CS_GAIN: f64 = 0.066; // 66 mV/A
 const R_ESR: f64 = 10e-3; // 10 mΩ
+/// Lumped series resistance: inductor DCR (~15 mΩ) + two conducting switch R_dson (~10 mΩ each).
+/// Adjust to match measured inductor / FET specs.
+const R_SERIES: Resistance = Resistance(35e-3); // 35 mΩ
 const V_TARGET: Voltage = Voltage(13.5);
 const R_LOAD: f64 = 6.0; // 6 Ω → 2 A at 12 V
 const MAX_CURRENT: Current = Current(6.0);
@@ -401,7 +404,7 @@ impl Logger {
 fn main() {
     // Start the sim in BuckBoost topology; sync_sim() will update it each cycle.
     let mut sim =
-        CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_BB, Topology::BuckBoost);
+        CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_BB, Topology::BuckBoost, R_SERIES);
 
     let mut ctrl = BuckBoostController::new(MAX_CURRENT.0 as f32 * CS_GAIN as f32);
     let mut logger = Logger::new();
