@@ -53,6 +53,9 @@ const R_ESR: f64 = 10e-3; // 10 mΩ
 const R_SERIES: Resistance = Resistance(35e-3); // 35 mΩ
 /// Input bulk capacitance (ceramic + electrolytic on the converter input rail).
 const C_IN: Capacitance = Capacitance(10e-6); // 10 µF
+/// Equivalent series resistance of the input capacitor.
+/// Typical ceramic MLCC: 1–10 mΩ.  Only affects the EMI ripple estimate.
+const R_ESR_CIN: f64 = 5e-3; // 5 mΩ
 /// Thevenin source resistance (cable + connector + supply output impedance).
 /// Set to 0.0 for an ideal stiff supply (cap still droops and recharges instantly).
 const R_IN: f64 = 0.1; // 100 mΩ
@@ -391,6 +394,10 @@ impl Logger {
             self.rec
                 .log("mode", &rerun::Scalars::new([mode_val]))
                 .unwrap();
+            // Input-side / EMI channels
+            self.rec.log("v_in_cap", &rerun::Scalars::new([sim.v_in_cap.0])).unwrap();
+            self.rec.log("i_in_cap", &rerun::Scalars::new([sim.i_in_cap.0])).unwrap();
+            self.rec.log("v_in_ripple_est", &rerun::Scalars::new([sim.v_in_ripple_est.0])).unwrap();
         }
 
         #[cfg(feature = "text-log")]
@@ -443,7 +450,7 @@ impl Logger {
 fn main() {
     // Start the sim in BuckBoost topology; sync_sim() will update it each cycle.
     let mut sim =
-        CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_BB, Topology::BuckBoost, R_SERIES, R_ESR, C_IN, R_IN, L_IN);
+        CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_BB, Topology::BuckBoost, R_SERIES, R_ESR, C_IN, R_ESR_CIN, R_IN, L_IN);
 
     let mut ctrl = BuckBoostController::new(MAX_CURRENT.0 as f32 * CS_GAIN as f32);
     let mut logger = Logger::new();

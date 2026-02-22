@@ -66,7 +66,7 @@ impl MyThing {
         i_at_0lsb: Current,
     ) -> Self {
         Self {
-            buck: CurrentModeConverter::new(period, c_out, l_inductor, slope_amp_per_sec, Topology::Buck, Resistance(0.0), 0.0, Capacitance(0.0), 0.0, Inductance(0.0)),
+            buck: CurrentModeConverter::new(period, c_out, l_inductor, slope_amp_per_sec, Topology::Buck, Resistance(0.0), 0.0, Capacitance(0.0), 0.0, 0.0, Inductance(0.0)),
             amp_per_lsb,
             i_at_0lsb,
         }
@@ -110,6 +110,11 @@ pub struct CurrentModeConverter {
 
     /// Input capacitance.  Zero disables V_in ripple modelling (ideal stiff source).
     c_in: Capacitance,
+    /// Equivalent series resistance of the input capacitor.
+    /// Does not affect the charge-balance physics (second-order), but is used by
+    /// `compute_v_in_ripple()` to estimate the resistive voltage spike at the
+    /// converter input terminals at the switching frequency.
+    r_esr_cin: f64,
     /// Thevenin source resistance seen by the input capacitor.
     /// Zero means the cap is instantly recharged to the source voltage each OFF phase.
     r_in: f64,
@@ -122,6 +127,11 @@ pub struct CurrentModeConverter {
     l_in: Inductance,
     /// Current flowing through `l_in` at the end of the previous cycle.
     pub i_in_cap: Current,
+
+    /// Estimated peak-to-peak voltage ripple at the converter input terminals at
+    /// the switching frequency, computed inside `tick()` and valid to read after it
+    /// returns.  Useful as a per-cycle conducted-emissions indicator.
+    pub v_in_ripple_est: Voltage,
 }
 
 #[derive(Copy, Clone)]
@@ -158,6 +168,7 @@ impl CurrentModeConverter {
         r_series: Resistance,
         r_esr: f64,
         c_in: Capacitance,
+        r_esr_cin: f64,
         r_in: f64,
         l_in: Inductance,
     ) -> Self {
@@ -174,8 +185,10 @@ impl CurrentModeConverter {
             c_in,
             r_in,
             v_in_cap: Voltage(0.0),
+            r_esr_cin,
             l_in,
             i_in_cap: Current(0.0),
+            v_in_ripple_est: Voltage(0.0),
         }
     }
 
@@ -257,6 +270,9 @@ impl CurrentModeConverter {
                 let t_on = Time(t_on.0.clamp(0.0, self.period.0));
                 let t_off = self.period - t_on;
 
+                // EMI estimate: computed while i_inductor / i_in_cap are still start-of-cycle.
+                self.v_in_ripple_est = self.compute_v_in_ripple(i_max, t_on);
+
                 // Sample load current once at the initial output voltage.  The ON/OFF
                 // voltages differ by at most a few mV of ripple, so two samples would give
                 // negligibly different results while causing stateful loads (e.g. Battery) to
@@ -316,6 +332,9 @@ impl CurrentModeConverter {
                 };
                 let t_off = self.period - t_on;
 
+                // EMI estimate: computed while i_inductor / i_in_cap are still start-of-cycle.
+                self.v_in_ripple_est = self.compute_v_in_ripple(i_max, t_on);
+
                 // During ON: cap is decoupled from the inductor but still drives the load,
                 // so it droops by q_out_on / C before the OFF phase begins.
                 // Sample load current once — see Buck branch for rationale.
@@ -354,6 +373,30 @@ impl CurrentModeConverter {
                 (t_on, i_max)
             }
         }
+    }
+
+    /// Estimate the peak-to-peak voltage ripple at the converter input terminals
+    /// at the switching frequency.
+    ///
+    /// Must be called inside `tick()` **before** state is updated, so that
+    /// `self.i_inductor` and `self.i_in_cap` still hold start-of-cycle values.
+    ///
+    /// Two components:
+    /// - **Capacitive**: net charge drawn from C_in during the ON phase divided by C_in.
+    /// - **ESR spike**: peak net current through C_in × r_esr_cin (the resistive
+    ///   voltage that is NOT filtered by C_in and appears directly at the terminals).
+    fn compute_v_in_ripple(&self, i_max: Current, t_on: Time) -> Voltage {
+        if self.c_in.0 == 0.0 {
+            return Voltage(0.0);
+        }
+        // Capacitive: net charge drawn from C_in (converter minus cable supply)
+        let i_avg_on = (self.i_inductor.0 + i_max.0) / 2.0;
+        let net_charge = (i_avg_on - self.i_in_cap.0).max(0.0) * t_on.0;
+        let v_cap = net_charge / self.c_in.0;
+        // ESR: peak current through C_in at the end of the ON phase
+        let i_peak_cap = (i_max.0 - self.i_in_cap.0).max(0.0);
+        let v_esr = self.r_esr_cin * i_peak_cap;
+        Voltage(v_cap + v_esr)
     }
 
     /// Droop `v_in_cap` by the net charge drawn from it this cycle, then evolve

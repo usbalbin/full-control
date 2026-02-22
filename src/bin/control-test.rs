@@ -71,7 +71,7 @@ fn main() {
     //i(Voltage(12.0), todo!(), todo!(), L_INDUCTOR, C_OUT, Resistance(10e-3), T_PERIOD);
 
     //let sim = MyThing::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC, AMP_PER_LSB, AMP_AT_0LSB);
-    let sim = CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC, Topology::Buck, Resistance(0.0), 0.0, Capacitance(0.0), 0.0, Inductance(0.0));
+    let sim = CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC, Topology::Buck, Resistance(0.0), 0.0, Capacitance(0.0), 0.0, 0.0, Inductance(0.0));
 
     let target = Voltage(5.0);
 
