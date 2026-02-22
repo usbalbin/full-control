@@ -10,6 +10,37 @@ use half_bridge::control_2p2z::{
 #[cfg(not(feature = "text-log"))]
 use electronics_sim::plot;
 
+// ── Circuit schematic ─────────────────────────────────────────────────────────
+//
+// 4-Switch Non-Inverting Buck-Boost Converter — Modelled Parameters
+//
+//        r_in ①    l_in ①
+// V_src──/\/\/──UUUUUU──┬──[Q1]──r_series③──L_ind④──[Q3]──┬── V_out
+//                       │    │                        │    │       │
+//                     C_in② [Q2]                   [Q4] r_esr⑤ C_out⑥ Load
+//                       │    │                        │    │       │       │
+//                      GND  GND                      GND  GND    GND     GND
+//
+// Topology modes:
+//   Buck:      Q1/Q2 switching; Q3 always ON,  Q4 always OFF
+//   Boost:     Q3/Q4 switching; Q1 always ON,  Q2 always OFF
+//   BuckBoost: Q1+Q4 switch together; Q2+Q3 complementary
+//
+// Parameter legend:
+//   ① r_in      — cable / source resistance  }
+//      l_in      — cable inductance           } model the cable from supply to converter
+//   ② C_in      — input bulk / decoupling capacitor
+//   ③ r_series  — lumped conduction loss: inductor DCR + 2× switch R_dson
+//   ④ L_ind     — main switching inductor
+//   ⑤ r_esr     — output cap ESR  (shapes v_sensed at ADC sample point)
+//   ⑥ C_out     — output filter capacitor
+//
+// State variables tracked across cycles:
+//   v_in_cap   — voltage across C_in
+//   i_in_cap   — current through l_in
+//   i_inductor — inductor current (valley, sampled at start of each cycle)
+//   v_out      — output capacitor voltage
+
 // ── Physical circuit constants ────────────────────────────────────────────────
 const F_SW: f64 = 500e3; // 500 kHz
 const T_PERIOD: Time = Time(1.0 / F_SW);
@@ -20,6 +51,14 @@ const R_ESR: f64 = 10e-3; // 10 mΩ
 /// Lumped series resistance: inductor DCR (~15 mΩ) + two conducting switch R_dson (~10 mΩ each).
 /// Adjust to match measured inductor / FET specs.
 const R_SERIES: Resistance = Resistance(35e-3); // 35 mΩ
+/// Input bulk capacitance (ceramic + electrolytic on the converter input rail).
+const C_IN: Capacitance = Capacitance(10e-6); // 10 µF
+/// Thevenin source resistance (cable + connector + supply output impedance).
+/// Set to 0.0 for an ideal stiff supply (cap still droops and recharges instantly).
+const R_IN: f64 = 0.1; // 100 mΩ
+/// Input cable inductance.  Typical: ~2 nH/cm, so 50 cm ≈ 100 nH, 1 m ≈ 200 nH.
+/// Set to 0.0 to disable (falls back to the RC recharge approximation).
+const L_IN: Inductance = Inductance(500e-9); // 500 nH ≈ 25 cm cable
 const V_TARGET: Voltage = Voltage(13.5);
 const R_LOAD: f64 = 6.0; // 6 Ω → 2 A at 12 V
 const MAX_CURRENT: Current = Current(6.0);
@@ -404,7 +443,7 @@ impl Logger {
 fn main() {
     // Start the sim in BuckBoost topology; sync_sim() will update it each cycle.
     let mut sim =
-        CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_BB, Topology::BuckBoost, R_SERIES, R_ESR);
+        CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_BB, Topology::BuckBoost, R_SERIES, R_ESR, C_IN, R_IN, L_IN);
 
     let mut ctrl = BuckBoostController::new(MAX_CURRENT.0 as f32 * CS_GAIN as f32);
     let mut logger = Logger::new();

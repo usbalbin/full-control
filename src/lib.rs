@@ -66,7 +66,7 @@ impl MyThing {
         i_at_0lsb: Current,
     ) -> Self {
         Self {
-            buck: CurrentModeConverter::new(period, c_out, l_inductor, slope_amp_per_sec, Topology::Buck, Resistance(0.0), 0.0),
+            buck: CurrentModeConverter::new(period, c_out, l_inductor, slope_amp_per_sec, Topology::Buck, Resistance(0.0), 0.0, Capacitance(0.0), 0.0, Inductance(0.0)),
             amp_per_lsb,
             i_at_0lsb,
         }
@@ -107,6 +107,21 @@ pub struct CurrentModeConverter {
     /// Equivalent series resistance of the output capacitor.
     /// Used by `v_sensed()` to reproduce the ESR voltage seen by the ADC.
     r_esr: f64,
+
+    /// Input capacitance.  Zero disables V_in ripple modelling (ideal stiff source).
+    c_in: Capacitance,
+    /// Thevenin source resistance seen by the input capacitor.
+    /// Zero means the cap is instantly recharged to the source voltage each OFF phase.
+    r_in: f64,
+    /// Actual voltage at the converter input terminal.
+    /// Lazy-initialised to the source voltage on the first `tick()` call.
+    pub v_in_cap: Voltage,
+
+    /// Input cable / trace inductance.  Zero disables LC input-filter modelling
+    /// (falls back to the simpler RC recharge approximation).
+    l_in: Inductance,
+    /// Current flowing through `l_in` at the end of the previous cycle.
+    pub i_in_cap: Current,
 }
 
 #[derive(Copy, Clone)]
@@ -142,6 +157,9 @@ impl CurrentModeConverter {
         topology: Topology,
         r_series: Resistance,
         r_esr: f64,
+        c_in: Capacitance,
+        r_in: f64,
+        l_in: Inductance,
     ) -> Self {
         Self {
             period,
@@ -153,6 +171,11 @@ impl CurrentModeConverter {
             topology,
             r_series,
             r_esr,
+            c_in,
+            r_in,
+            v_in_cap: Voltage(0.0),
+            l_in,
+            i_in_cap: Current(0.0),
         }
     }
 
@@ -174,16 +197,23 @@ impl CurrentModeConverter {
         trip_current: Current,
         mut i_out: impl FnMut(Voltage) -> Current,
     ) -> (Time, Current) {
+        // Lazy-initialise the input cap to the source voltage on the first call.
+        if self.c_in.0 > 0.0 && self.v_in_cap.0 == 0.0 {
+            self.v_in_cap = v_in;
+        }
+        // When C_in = 0 the source is ideal (no droop); otherwise use the tracked cap voltage.
+        let v_eff = if self.c_in.0 > 0.0 { self.v_in_cap } else { v_in };
+
         match self.topology {
             Topology::Buck => {
-                let v_ind_on = v_in - self.v_out;
+                let v_ind_on = v_eff - self.v_out;
 
                 // V = L di/dt
                 // di/dt = V/L
                 let di_dt_on = v_ind_on.0 / self.l_inductor.0;
 
                 let i_on_func = math::rlc(
-                    v_in,
+                    v_eff,
                     self.v_out,
                     self.i_inductor,
                     self.l_inductor,
@@ -251,6 +281,9 @@ impl CurrentModeConverter {
                 self.v_out = v_out_at_off + Voltage((q_off - q_out_off) / self.c_out.0);
                 self.i_inductor = i_final;
 
+                // Buck: input draws q_on during ON; cap recovers from source during OFF.
+                self.update_v_in_cap(v_in, q_on, t_on, t_off);
+
                 (t_on, i_max)
             }
 
@@ -259,7 +292,7 @@ impl CurrentModeConverter {
                 // Exact solution is exponential; approximate as linear with effective V_in
                 // computed at the midpoint of the ON-phase current swing.  Error is
                 // O((R·ΔI/V_in)²) — negligible for typical R << L·f_sw.
-                let v_on_eff = v_in.0
+                let v_on_eff = v_eff.0
                     - self.r_series.0 * (self.i_inductor.0 + trip_current.0) / 2.0;
                 let di_dt_on = v_on_eff / self.l_inductor.0;
                 let i_on_line = Line { k: di_dt_on, m: self.i_inductor.0 };
@@ -294,7 +327,7 @@ impl CurrentModeConverter {
                 // Boost:     V_in drives L+C in series (energy transferred from L+source to C).
                 // BuckBoost: no source, L discharges into cap.
                 let v_off_source = match self.topology {
-                    Topology::Boost => v_in,
+                    Topology::Boost => v_eff,
                     Topology::BuckBoost | Topology::Buck => Voltage(0.0),
                 };
                 let i_off_func = math::rlc(v_off_source, v_out_at_off, i_max,
@@ -306,8 +339,56 @@ impl CurrentModeConverter {
                 self.v_out = v_out_at_off + Voltage((q_in - q_out_off) / self.c_out.0);
                 self.i_inductor = i_final;
 
+                // BuckBoost: only ON phase draws from input; cap recovers during OFF.
+                // Boost:     input is in-circuit during OFF too, so add q_in as extra draw;
+                //            recharge time approximated as the full switching period.
+                let q_input = i_on_line.integral(0.0).f(t_on.0)
+                    + if matches!(self.topology, Topology::Boost) { q_in } else { 0.0 };
+                let t_recharge = if matches!(self.topology, Topology::Boost) {
+                    self.period
+                } else {
+                    t_off
+                };
+                self.update_v_in_cap(v_in, q_input, t_on, t_recharge);
+
                 (t_on, i_max)
             }
+        }
+    }
+
+    /// Droop `v_in_cap` by the net charge drawn from it this cycle, then evolve
+    /// the input LC filter over `t_recharge`.
+    ///
+    /// During the ON phase the cable current `i_in_cap` partially compensates the
+    /// droop; the net charge removed from C_in is `q_drawn − i_in_cap × t_on`.
+    ///
+    /// During the recovery phase (OFF or full period depending on topology):
+    ///  - `l_in > 0`: full RLC dynamics via `math::rlc()` — tracks cable current.
+    ///  - `l_in = 0, r_in = 0`: ideal source, cap instantly restored.
+    ///  - `l_in = 0, r_in > 0`: first-order RC exponential recharge.
+    fn update_v_in_cap(&mut self, v_source: Voltage, q_drawn: f64, t_on: Time, t_recharge: Time) {
+        if self.c_in.0 == 0.0 {
+            return;
+        }
+        // Cable current partially supplies C_in during the ON phase.
+        let q_cable_on = self.i_in_cap.0 * t_on.0;
+        self.v_in_cap = self.v_in_cap - Voltage((q_drawn - q_cable_on) / self.c_in.0);
+
+        if self.l_in.0 > 0.0 {
+            // Full LC input filter: evolve RLC from current (v_in_cap, i_in_cap).
+            let resp = math::rlc(
+                v_source, self.v_in_cap, self.i_in_cap,
+                self.l_in, self.c_in, Resistance(self.r_in),
+            );
+            self.v_in_cap = self.v_in_cap
+                + Voltage(resp.integral(0.0).f(t_recharge.0) / self.c_in.0);
+            self.i_in_cap = Current(resp.f(t_recharge.0));
+        } else if self.r_in == 0.0 {
+            self.v_in_cap = v_source;
+        } else {
+            let tau = self.r_in * self.c_in.0;
+            self.v_in_cap +=
+                Voltage((1.0 - f64::exp(-t_recharge.0 / tau)) * (v_source.0 - self.v_in_cap.0));
         }
     }
 }
