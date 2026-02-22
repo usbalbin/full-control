@@ -76,7 +76,7 @@ impl MyThing {
         &mut self,
         v_in: Voltage,
         trip_current: u16,
-        i_out: impl FnOnce(Voltage) -> Current,
+        mut i_out: impl FnMut(Voltage) -> Current,
     ) -> (Time, Current) {
         // 4095 -> 20
         // 0 -> -20
@@ -154,7 +154,7 @@ impl CurrentModeConverter {
         &mut self,
         v_in: Voltage,
         trip_current: Current,
-        i_out: impl FnOnce(Voltage) -> Current,
+        mut i_out: impl FnMut(Voltage) -> Current,
     ) -> (Time, Current) {
         match self.topology {
             Topology::Buck => {
@@ -206,15 +206,17 @@ impl CurrentModeConverter {
                     q_on = i_on_func.integral(0.0).f(t_on.0) + q_old;
                 }
 
-                // Vout at end of the ON-phase
-                let v_out_max = self.v_out + Voltage(q_on / self.c_out.0);
-
                 let t_on = Time(t_on.0.clamp(0.0, self.period.0));
                 let t_off = self.period - t_on;
 
+                // Load draws from cap during ON at the initial output voltage.
+                let q_out_on = i_out(self.v_out).0 * t_on.0;
+                // Net cap voltage at start of OFF phase: inductor charge in minus load drain.
+                let v_out_at_off = self.v_out + Voltage((q_on - q_out_on) / self.c_out.0);
+
                 let i_off_func = math::rlc(
                     Voltage(0.0),
-                    v_out_max,
+                    v_out_at_off,
                     i_max,
                     self.l_inductor,
                     self.c_out,
@@ -222,13 +224,9 @@ impl CurrentModeConverter {
                 );
                 let i_final = Current(i_off_func.f(t_off.0));
 
-                // Total charge in the capacitor at the end of the period
                 let q_off = i_off_func.integral(0.0).f(t_off.0);
-                let q_in = q_on + q_off;
-                let q_out = i_out(self.v_out).0 * self.period.0;
-
-
-                self.v_out += Voltage((q_in - q_out) / self.c_out.0);
+                let q_out_off = i_out(v_out_at_off).0 * t_off.0;
+                self.v_out = v_out_at_off + Voltage((q_off - q_out_off) / self.c_out.0);
                 self.i_inductor = i_final;
 
                 (t_on, i_max)
@@ -263,21 +261,25 @@ impl CurrentModeConverter {
                 };
                 let t_off = self.period - t_on;
 
-                // OFF phase: L and C coupled.
+                // During ON: cap is decoupled from the inductor but still drives the load,
+                // so it droops by q_out_on / C before the OFF phase begins.
+                let q_out_on = i_out(self.v_out).0 * t_on.0;
+                let v_out_at_off = self.v_out - Voltage(q_out_on / self.c_out.0);
+
+                // OFF phase: L and C coupled, starting from the drooped cap voltage.
                 // Boost:     V_in drives L+C in series (energy transferred from L+source to C).
                 // BuckBoost: no source, L discharges into cap.
                 let v_off_source = match self.topology {
                     Topology::Boost => v_in,
                     Topology::BuckBoost | Topology::Buck => Voltage(0.0),
                 };
-                let i_off_func = math::rlc(v_off_source, self.v_out, i_max,
+                let i_off_func = math::rlc(v_off_source, v_out_at_off, i_max,
                                             self.l_inductor, self.c_out, self.r_series);
                 let i_final = Current(i_off_func.f(t_off.0));
 
-                // Charge balance: only OFF phase inductor current charges the cap
                 let q_in = i_off_func.integral(0.0).f(t_off.0);
-                let q_out = i_out(self.v_out).0 * self.period.0;
-                self.v_out += Voltage((q_in - q_out) / self.c_out.0);
+                let q_out_off = i_out(v_out_at_off).0 * t_off.0;
+                self.v_out = v_out_at_off + Voltage((q_in - q_out_off) / self.c_out.0);
                 self.i_inductor = i_final;
 
                 (t_on, i_max)
