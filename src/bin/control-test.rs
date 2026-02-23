@@ -1,10 +1,13 @@
 use electronics_sim::{
-    CurrentModeConverter, Topology, Capacitance, Current, Inductance, MyThing, Resistance, T, Time,
-    Voltage, plot,
+    Capacitance, Current, CurrentModeConverter, Inductance, MyThing, Resistance, T, Time, Topology,
+    Voltage,
 };
-use half_bridge::{
-    control_2p2z::{DacSettings, ParametersBuck, Topology as ControlTopology, TransferFunction, TwoPoleTwoZeroParams},
-    types,
+use full_control::{
+    control_2p2z::{
+        self,
+        DacSettings, ParametersBuck, Topology as ControlTopology, TransferFunction,
+        TwoPoleTwoZeroParams,
+    },
 };
 use pid::Pid;
 
@@ -26,10 +29,10 @@ const PARAMS: ParametersBuck = ParametersBuck {
     i_load: 2.0,
     v_diode: 0.0,
     topology: ControlTopology::Buck,
-    phase_margin: half_bridge::control_2p2z::PhaseMargin::Manual {
+    phase_margin: control_2p2z::PhaseMargin::Manual {
         phase_margin: 75.0f64.to_radians(),
     },
-    f_x_divisor: 13.333333333333333,
+    safety_factor: 2.0,
     cycles_per_tick: 1,
 }; /*
 const MAX_LSB: f64 = 1023.0;
@@ -64,6 +67,7 @@ const DAC_SETTINGS: DacSettings = TF_AND_DAC.1;
 const COMP_WEIGHTS: TwoPoleTwoZeroParams<f32> = TRANSFER_FUNC.to_2p2z();
 
 fn main() {
+    #[cfg(feature = "rerun")]
     let rec = rerun::RecordingStreamBuilder::new("rerun_example_box3d_batch")
         .spawn()
         .unwrap();
@@ -71,7 +75,19 @@ fn main() {
     //i(Voltage(12.0), todo!(), todo!(), L_INDUCTOR, C_OUT, Resistance(10e-3), T_PERIOD);
 
     //let sim = MyThing::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC, AMP_PER_LSB, AMP_AT_0LSB);
-    let sim = CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC, Topology::Buck, Resistance(0.0), 0.0, Capacitance(0.0), 0.0, 0.0, Inductance(0.0));
+    let sim = CurrentModeConverter::new(
+        T_PERIOD,
+        C_OUT,
+        L_INDUCTOR,
+        SLOPE_AMP_PER_SEC,
+        Topology::Buck,
+        Resistance(0.0),
+        0.0,
+        Capacitance(0.0),
+        0.0,
+        0.0,
+        Inductance(0.0),
+    );
 
     let target = Voltage(5.0);
 
@@ -81,6 +97,10 @@ fn main() {
     let kp = 0.433;
     let ki = 0.025;
 
+    #[cfg(not(feature = "rerun"))]
+    let v_out_max = foo(kp, ki, target, sim);
+
+    #[cfg(feature = "rerun")]
     let v_out_max = foo(kp, ki, target, sim, None);
 
     if v_out_max < v_out_max_min {
@@ -93,7 +113,11 @@ fn main() {
 
     //let kp = 0.999;
     //let ki = 0.025;
+    #[cfg(feature = "rerun")]
     foo(kp, ki, target, sim, Some(&rec));
+
+    #[cfg(not(feature = "rerun"))]
+    foo(kp, ki, target, sim);
 }
 
 fn foo(
@@ -101,7 +125,7 @@ fn foo(
     ki: f32,
     target: Voltage,
     mut sim: CurrentModeConverter,
-    rec: Option<&rerun::RecordingStream>,
+    #[cfg(feature = "rerun")] rec: Option<&rerun::RecordingStream>,
 ) -> f64 {
     let mut comp = Pid::new(target.0, 1.0);
     comp.p(kp, 1e18).i(ki, 1e9).d(0.0, 1e9);
@@ -119,12 +143,17 @@ fn foo(
         let soft_target = Voltage(target.0 * (i + 1) as f64 / soft_start_cycles as f64);
         let mut i_out = Current(0.0);
         let output = comp.update((soft_target - sim.v_out).0 as f32);
-        let trip_current = Current((output as T / PARAMS.current_sense_gain).clamp(0.0, MAX_CURRENT.0));
+        let trip_current =
+            Current((output as T / PARAMS.current_sense_gain).clamp(0.0, MAX_CURRENT.0));
         let (t_on, i_l_max) = sim.tick(Voltage(12.0), trip_current, |v| {
             i_out = Current(v.0 / loads[0]);
             i_out
         });
+
+        #[cfg(feature = "rerun")]
         if let Some(rec) = rec {
+            use electronics_sim::plot;
+
             plot(&rec, &sim, t_on, i_l_max, Voltage(12.0), i_out, &mut time);
         }
     }
@@ -146,14 +175,18 @@ fn foo(
         //dbg!(output);
         let output = comp.update((target - sim.v_out).0 as f32);
         // Controller output is a current-reference voltage (V); divide by current_sense_gain (V/A) to get Amps.
-        let trip_current = Current((output as T / PARAMS.current_sense_gain).clamp(0.0, MAX_CURRENT.0));
+        let trip_current =
+            Current((output as T / PARAMS.current_sense_gain).clamp(0.0, MAX_CURRENT.0));
         //panic!("Boopi: {trip_current}");
         let (t_on, i_l_max) = sim.tick(v_in, trip_current /*as u16*/, |v| {
             i_out = Current(v.0 / r);
             i_out
         });
 
+        #[cfg(feature = "rerun")]
         if let Some(rec) = rec {
+            use electronics_sim::plot;
+
             plot(&rec, &sim, t_on, i_l_max, v_in, i_out, &mut time);
         }
         v_out_max = v_out_max.max(sim.v_out.0);

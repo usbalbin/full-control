@@ -2,12 +2,12 @@ use electronics_sim::{
     Capacitance, Current, CurrentModeConverter, Inductance, Resistance, Time, Topology, Voltage,
     math::Func,
 };
-use half_bridge::control_2p2z::{
+use full_control::control_2p2z::{
     DacSettings, ParametersBuck, PhaseMargin, Topology as ControlTopology, TransferFunction,
     TwoPoleTwoZero, TwoPoleTwoZeroParams,
 };
 
-#[cfg(not(feature = "text-log"))]
+#[cfg(feature = "rerun")]
 use electronics_sim::plot;
 
 // ── Circuit schematic ─────────────────────────────────────────────────────────
@@ -80,7 +80,14 @@ const PM: PhaseMargin = PhaseMargin::Manual {
 // via sync_sim().  On a mode switch the controller gains and slope-compensation
 // ramp also change, both handled gracefully by the bumpless-transfer mechanism.
 
-// Buck region: design point V_in = 24 V → V_out = 12 V
+// ── Crossover safety factor ────────────────────────────────────────────────────
+// The crossover frequency is selected automatically for each design point via
+// optimal_f_x_divisor(): the highest bandwidth where the limit-cycle criterion
+// b0 × ΔV_out_ripple ≤ vpp / safety_factor is satisfied.
+// Higher safety_factor → lower bandwidth → more headroom for transient excursions.
+const SAFETY: f64 = 2.0;
+
+// Buck region: design point V_in = 24 V → V_out = 13.5 V
 const PARAMS_BUCK: ParametersBuck = ParametersBuck {
     v_in: 24.0,
     v_out: V_TARGET.0,
@@ -93,16 +100,11 @@ const PARAMS_BUCK: ParametersBuck = ParametersBuck {
     v_diode: 0.0,
     topology: ControlTopology::BuckBoost, // gains computed for BuckBoost plant at 24 V
     phase_margin: PM,
-    // Large C_out (470 µF) gives a very low plant pole (ω_p1 ≈ D'^2/(R·C) ≈ 370 rad/s
-    // at 24V design point).  Without a reduced crossover frequency the b-coefficients
-    // become so large (b0 ≈ 18) that steady-state output ripple drives the controller
-    // into limit cycling between the saturation rails.  f_sw/100 = 5 kHz keeps
-    // b0 ≈ 2–3 so the linear range covers the normal per-cycle voltage ripple.
-    f_x_divisor: 20.0,
+    safety_factor: SAFETY,
     cycles_per_tick: CYCLES_PER_TICK,
 };
 
-// Transition region: design point V_in = V_out = 12 V (unity gain, worst case)
+// Transition region: design point V_in = V_out = 13.5 V (unity gain, worst case)
 const PARAMS_BB: ParametersBuck = ParametersBuck {
     v_in: V_TARGET.0,
     v_out: V_TARGET.0,
@@ -115,11 +117,11 @@ const PARAMS_BB: ParametersBuck = ParametersBuck {
     v_diode: 0.0,
     topology: ControlTopology::BuckBoost,
     phase_margin: PM,
-    f_x_divisor: 50.0,
+    safety_factor: SAFETY,
     cycles_per_tick: CYCLES_PER_TICK,
 };
 
-// Boost region: design point V_in = 8 V → V_out = 12 V
+// Boost region: design point V_in = 8 V → V_out = 13.5 V
 const PARAMS_BOOST: ParametersBuck = ParametersBuck {
     v_in: 8.0,
     v_out: V_TARGET.0,
@@ -132,15 +134,7 @@ const PARAMS_BOOST: ParametersBuck = ParametersBuck {
     v_diode: 0.0,
     topology: ControlTopology::BuckBoost, // still BuckBoost plant model
     phase_margin: PM,
-    // At 8V→12V in BuckBoost topology (always used in sim), D'=0.4, I_L_avg=7.5A.
-    // The steady-state trip ≈ 8A leaves only 2A headroom below MAX_CURRENT=10A.
-    // With f_x_divisor=100: b0≈10.5, linear range = 0.132/10.5 = 12.6mV — too small
-    // vs the 30-50mV per-cycle V_out ripple from the RLC dynamics.  Each ripple cycle
-    // saturates the controller, causing an 8-cycle bang-bang limit cycle.
-    // f_x_divisor=300 reduces b0 to ≈3.5, giving 38mV linear range which comfortably
-    // contains the normal per-cycle ripple.  Bandwidth trades off (f_x = 500kHz/300 =
-    // 1.67kHz), but the Boost region is only a small part of the sweep.
-    f_x_divisor: 300.0,
+    safety_factor: SAFETY,
     cycles_per_tick: CYCLES_PER_TICK,
 };
 
@@ -326,7 +320,7 @@ fn v_in_sweep(step: usize, total: usize) -> f64 {
 // ── Logger ────────────────────────────────────────────────────────────────────
 
 struct Logger {
-    #[cfg(not(feature = "text-log"))]
+    #[cfg(feature = "rerun")]
     rec: rerun::RecordingStream,
     prev_mode: Option<Mode>,
     /// Count cycles since the last mode change; used to print at high density
@@ -341,7 +335,7 @@ impl Logger {
         Self::print_header();
 
         Self {
-            #[cfg(not(feature = "text-log"))]
+            #[cfg(feature = "rerun")]
             rec: rerun::RecordingStreamBuilder::new("buck_boost_test")
                 .spawn()
                 .unwrap(),
@@ -381,7 +375,7 @@ impl Logger {
         }
         self.prev_mode = Some(mode);
 
-        #[cfg(not(feature = "text-log"))]
+        #[cfg(feature = "rerun")]
         {
             plot(&self.rec, sim, t_on, i_max, v_in, i_out, time);
             // Log mode as a scalar: 0=Buck, 1=BuckBoost, 2=Boost
@@ -448,6 +442,14 @@ impl Logger {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // ── Controller design summary ──────────────────────────────────────────────
+    // crossover_divisor() is const fn, evaluated at compile time inside to_transfer_function().
+    // Print here for informational purposes.
+    println!("Controller design (safety_factor={SAFETY}):");
+    println!("  Buck:      f_x = {:.0} Hz (divisor={:.1})", F_SW / PARAMS_BUCK.crossover_divisor(), PARAMS_BUCK.crossover_divisor());
+    println!("  BuckBoost: f_x = {:.0} Hz (divisor={:.1})", F_SW / PARAMS_BB.crossover_divisor(), PARAMS_BB.crossover_divisor());
+    println!("  Boost:     f_x = {:.0} Hz (divisor={:.1})", F_SW / PARAMS_BOOST.crossover_divisor(), PARAMS_BOOST.crossover_divisor());
+
     // Start the sim in BuckBoost topology; sync_sim() will update it each cycle.
     let mut sim =
         CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_BB, Topology::BuckBoost, R_SERIES, R_ESR, C_IN, R_ESR_CIN, R_IN, L_IN);
@@ -592,7 +594,7 @@ impl Battery {
             v_int: v_init,
             r_esr: Resistance(50e-3),
             l_cable: Inductance(1e-6),
-            c: Capacitance(1e-1),
+            c: Capacitance(0.25),
         }
     }
 

@@ -1,5 +1,6 @@
 pub mod math;
 
+#[cfg(feature = "rerun")]
 use rerun::RecordingStream;
 use std::ops::{Add, AddAssign, Neg, Sub};
 
@@ -13,6 +14,7 @@ pub enum Topology {
     BuckBoost,
 }
 
+#[cfg(feature = "rerun")]
 pub fn plot(
     rec: &RecordingStream,
     sim: &CurrentModeConverter,

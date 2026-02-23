@@ -1,9 +1,10 @@
 
 use electronics_sim::{
-    CurrentModeConverter, Topology, Capacitance, Current, Inductance, Resistance, Time, Voltage, plot,
+    CurrentModeConverter, Topology, Capacitance, Current, Inductance, Resistance, Time, Voltage,
 };
 
 fn main() {
+    #[cfg(feature = "rerun")]
     let rec = rerun::RecordingStreamBuilder::new("rerun_example_box3d_batch")
         .spawn()
         .unwrap();
@@ -30,7 +31,8 @@ fn main() {
             i_out
         });
 
-        plot(&rec, &sim, t_on, i_l_max, v_in, i_out, &mut time);
+        #[cfg(feature = "rerun")]
+        electronics_sim::plot(&rec, &sim, t_on, i_l_max, v_in, i_out, &mut time);
         //rec.log("iter", &rerun::Scalars::new([i])).unwrap();
     }
 }
