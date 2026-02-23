@@ -1,13 +1,9 @@
 use electronics_sim::{
-    Capacitance, Current, CurrentModeConverter, Inductance, MyThing, Resistance, T, Time, Topology,
-    Voltage,
+    Capacitance, Current, CurrentModeConverter, Inductance, MyThing, Parameters, Resistance, T, Time, Topology, Voltage
 };
-use full_control::{
-    control_2p2z::{
-        self,
-        DacSettings, ParametersBuck, Topology as ControlTopology, TransferFunction,
-        TwoPoleTwoZeroParams,
-    },
+use full_control::control_2p2z::{
+    self, DacSettings, ParametersBuck, Topology as ControlTopology, TransferFunction,
+    TwoPoleTwoZeroParams,
 };
 use pid::Pid;
 
@@ -75,18 +71,26 @@ fn main() {
     //i(Voltage(12.0), todo!(), todo!(), L_INDUCTOR, C_OUT, Resistance(10e-3), T_PERIOD);
 
     //let sim = MyThing::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC, AMP_PER_LSB, AMP_AT_0LSB);
+
+    let parameters = Parameters {
+        period: T_PERIOD,
+        slope_amp_per_sec: SLOPE_AMP_PER_SEC,
+        r_series: Resistance(0.0),
+        r_esr: Resistance(0.0),
+        c_out: C_OUT,
+        l_inductor: L_INDUCTOR,
+        c_in: Capacitance(0.0),
+        r_esr_cin: Resistance(0.0),
+        r_in: Resistance(0.0),
+        l_in: Inductance(0.0),
+        tau_current_sense: Time(0.0), // tau_current_sense
+        tau_dac: Time(0.0), // tau_dac
+        t_prop_delay: Time(0.0), // t_prop_delay
+        t_dac_sample: Time(0.0),
+    };
     let sim = CurrentModeConverter::new(
-        T_PERIOD,
-        C_OUT,
-        L_INDUCTOR,
-        SLOPE_AMP_PER_SEC,
+        parameters,
         Topology::Buck,
-        Resistance(0.0),
-        0.0,
-        Capacitance(0.0),
-        0.0,
-        0.0,
-        Inductance(0.0),
     );
 
     let target = Voltage(5.0);

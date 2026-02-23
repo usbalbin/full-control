@@ -1,6 +1,6 @@
 
 use electronics_sim::{
-    CurrentModeConverter, Topology, Capacitance, Current, Inductance, Resistance, Time, Voltage,
+    Capacitance, Current, CurrentModeConverter, Inductance, Parameters, Resistance, Time, Topology, Voltage
 };
 
 fn main() {
@@ -10,7 +10,24 @@ fn main() {
         .unwrap();
     let t_period = Time(1.0e-6);
     let slope_amp_per_sec = 0.0;
-    let mut sim = CurrentModeConverter::new(t_period, Capacitance(10.0e-6), Inductance(2e-6), slope_amp_per_sec, Topology::Buck, Resistance(0.0), 0.0, Capacitance(0.0), 0.0, 0.0, Inductance(0.0));
+
+    let params = Parameters{
+        period: t_period,
+        slope_amp_per_sec,
+        r_series: Resistance(0.0),
+        r_esr: Resistance(0.0),
+        c_out: Capacitance(10.0e-6),
+        l_inductor: Inductance(2e-6),
+        c_in: Capacitance(0.0),
+        r_esr_cin: Resistance(0.0),
+        r_in: Resistance(0.0),
+        l_in: Inductance(0.0),
+        tau_current_sense: Time(0.0),
+        tau_dac: Time(0.0),
+        t_prop_delay: Time(0.0),
+        t_dac_sample: Time(0.0),
+    };
+    let mut sim = CurrentModeConverter::new(params, Topology::Buck);
 
     let mut time = Time(0.0);
     for i in 0..1000 {

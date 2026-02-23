@@ -47,7 +47,7 @@ const T_PERIOD: Time = Time(1.0 / F_SW);
 const C_OUT: Capacitance = Capacitance(47e-6);
 const L_INDUCTOR: Inductance = Inductance(4e-6);
 const CS_GAIN: f64 = 0.066; // 66 mV/A
-const R_ESR: f64 = 10e-3; // 10 mΩ
+const R_ESR: Resistance = Resistance(10e-3); // 10 mΩ
 /// Lumped series resistance: inductor DCR (~15 mΩ) + two conducting switch R_dson (~10 mΩ each).
 /// Adjust to match measured inductor / FET specs.
 const R_SERIES: Resistance = Resistance(35e-3); // 35 mΩ
@@ -65,6 +65,16 @@ const L_IN: Inductance = Inductance(500e-9); // 500 nH ≈ 25 cm cable
 const V_TARGET: Voltage = Voltage(13.5);
 const R_LOAD: f64 = 6.0; // 6 Ω → 2 A at 12 V
 const MAX_CURRENT: Current = Current(6.0);
+/// −3 dB bandwidth of the current-sense RC filter before the comparator (Hz).
+/// ACS37030LLZATR-020B3 datasheet: small-signal −3 dB bandwidth = 5 MHz (C_L = 100 pF).
+const BW_CURRENT_SENSE: f64 = 5e6; // 5 MHz
+/// −3 dB bandwidth of the slope-compensation DAC output filter (Hz).
+/// STM32G474 fast (15 MSPS unbuffered) DAC: 10%–90% settling time = 16 ns typical.
+/// Equivalent first-order τ = 16 ns / ln(9) ≈ 7.3 ns → f_−3dB ≈ 22 MHz.
+const BW_DAC: f64 = 22e6; // ~22 MHz
+/// Comparator propagation delay (s).
+/// STM32G474 COMP: t_D = 16.7 ns typical (V_DDA ≥ 2.7 V, 50 pF load, 100 mV overdrive).
+const T_COMPARATOR_DELAY: f64 = 16.7e-9; // 16.7 ns
 /// Number of switching cycles between consecutive 2P2Z controller updates.
 /// Set to 1 for full-rate (maximum bandwidth), or higher to simulate a slower MCU.
 const CYCLES_PER_TICK: usize = 1;
@@ -94,7 +104,7 @@ const PARAMS_BUCK: ParametersBuck = ParametersBuck {
     c_out: C_OUT.0,
     f_sw: F_SW,
     l_inductor: L_INDUCTOR.0,
-    r_esr_out_cap: R_ESR,
+    r_esr_out_cap: R_ESR.0,
     current_sense_gain: CS_GAIN,
     i_load: V_TARGET.0 / R_LOAD,
     v_diode: 0.0,
@@ -111,7 +121,7 @@ const PARAMS_BB: ParametersBuck = ParametersBuck {
     c_out: C_OUT.0,
     f_sw: F_SW,
     l_inductor: L_INDUCTOR.0,
-    r_esr_out_cap: R_ESR,
+    r_esr_out_cap: R_ESR.0,
     current_sense_gain: CS_GAIN,
     i_load: V_TARGET.0 / R_LOAD,
     v_diode: 0.0,
@@ -128,7 +138,7 @@ const PARAMS_BOOST: ParametersBuck = ParametersBuck {
     c_out: C_OUT.0,
     f_sw: F_SW,
     l_inductor: L_INDUCTOR.0,
-    r_esr_out_cap: R_ESR,
+    r_esr_out_cap: R_ESR.0,
     current_sense_gain: CS_GAIN,
     i_load: V_TARGET.0 / R_LOAD,
     v_diode: 0.0,
@@ -296,7 +306,7 @@ fn sync_sim(sim: &mut CurrentModeConverter, slope: f64, mode: Mode) {
         Mode::BuckBoost => Topology::BuckBoost,
         Mode::Boost => Topology::Boost,
     };
-    sim.slope_amp_per_sec = slope;
+    sim.parameters.slope_amp_per_sec = slope;
 }
 
 // ── V_in sweep profile ────────────────────────────────────────────────────────
@@ -451,8 +461,25 @@ fn main() {
     println!("  Boost:     f_x = {:.0} Hz (divisor={:.1})", F_SW / PARAMS_BOOST.crossover_divisor(), PARAMS_BOOST.crossover_divisor());
 
     // Start the sim in BuckBoost topology; sync_sim() will update it each cycle.
+
+    let parameters = electronics_sim::Parameters {
+        period: T_PERIOD,
+        slope_amp_per_sec: SLOPE_BB,
+        r_series:R_SERIES,
+        r_esr: R_ESR,
+        c_out: C_OUT,
+        l_inductor: L_INDUCTOR,
+        c_in: C_IN,
+        r_esr_cin: Resistance(R_ESR_CIN),
+        r_in: Resistance(R_IN),
+        l_in: L_IN,
+        tau_current_sense: electronics_sim::Parameters::bw_to_tau(BW_CURRENT_SENSE),
+        tau_dac: electronics_sim::Parameters::bw_to_tau(BW_DAC),
+        t_prop_delay: Time(T_COMPARATOR_DELAY),
+        t_dac_sample: Time(15e-6),
+    };
     let mut sim =
-        CurrentModeConverter::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_BB, Topology::BuckBoost, R_SERIES, R_ESR, C_IN, R_ESR_CIN, R_IN, L_IN);
+        CurrentModeConverter::new(parameters, Topology::BuckBoost,);
 
     let mut ctrl = BuckBoostController::new(MAX_CURRENT.0 as f32 * CS_GAIN as f32);
     let mut logger = Logger::new();

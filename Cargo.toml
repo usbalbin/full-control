@@ -7,9 +7,11 @@ publish = ["gitea"]
 [features]
 # Print tabular per-cycle data to stdout instead of launching rerun.
 # Run with: cargo run --bin buck-boost-test --features text-log
+default = ["rerun"]
 text-log = []
+rerun = ["dep:rerun"]
 
 [dependencies]
-half-bridge = { path = "../hw-half-bridge/firmware", default-features = false }
+full-control = { path = "../full-control", default-features = false }
 pid = "4.0.0"
-rerun = "0.24.0"
+rerun = { version = "0.24.0", optional = true}
