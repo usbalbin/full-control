@@ -3,16 +3,10 @@ pub mod math;
 #[cfg(feature = "rerun")]
 use rerun::RecordingStream;
 use std::ops::{Add, AddAssign, Div, Mul, Neg, Sub};
+use full_control::buck_boost::Mode as Topology;
 
 use crate::math::Line;
 use math::Func;
-
-#[derive(Clone, Copy, Debug)]
-pub enum Topology {
-    Buck,
-    Boost,
-    BuckBoost,
-}
 
 #[cfg(feature = "rerun")]
 pub fn plot(
@@ -601,6 +595,14 @@ fn filtered_trip_time(
     tau_dac: Time,   // DAC output filter time constant (s); 0 = ideal
     guess: Time,     // initial guess for t_on (s)
 ) -> f64 {
+    // If the filter state is already at or above the threshold at t=0 (e.g.
+    // during soft-start overshoot where trip_current → 0 but i_valley > 0),
+    // the comparator fires immediately.  Return 0 rather than letting N-R
+    // step into negative time where exp(-t/τ) blows up.
+    if i_cs0.0 >= trip.0 {
+        return 0.0;
+    }
+
     let err_cs = if tau_cs.0 > 0.0 {
         i_cs0.0 - i0.0 + m * tau_cs.0
     } else {
@@ -645,6 +647,7 @@ fn filtered_trip_time(
         }
         let dt = f / f_prime;
         t -= dt;
+        t = t.max(0.0); // trip can't fire before cycle start
         if dt.abs() < 1e-15 {
             break;
         }

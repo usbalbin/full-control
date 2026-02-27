@@ -1,10 +1,9 @@
 use electronics_sim::{
-    Capacitance, Current, CurrentModeConverter, Inductance, Resistance, Time, Topology, Voltage,
-    math::Func,
+    Capacitance, Current, CurrentModeConverter, Inductance, Resistance, Time, Voltage, math::Func,
 };
-use full_control::control_2p2z::{
-    DacSettings, ParametersBuck, PhaseMargin, Topology as ControlTopology, TransferFunction,
-    TwoPoleTwoZero, TwoPoleTwoZeroParams,
+use full_control::{
+    buck_boost::{BuckBoostTransferFunction, BuckBoostWeights, Mode},
+    control_2p2z::{Parameters, PhaseMargin, Topology as ControlTopology},
 };
 
 #[cfg(feature = "rerun")]
@@ -63,6 +62,8 @@ const R_IN: f64 = 0.1; // 100 mΩ
 /// Set to 0.0 to disable (falls back to the RC recharge approximation).
 const L_IN: Inductance = Inductance(500e-9); // 500 nH ≈ 25 cm cable
 const V_TARGET: Voltage = Voltage(13.5);
+const V_IN_BUCK: Voltage = Voltage(24.0);
+const V_IN_BOOST: Voltage = Voltage(8.0);
 const R_LOAD: f64 = 6.0; // 6 Ω → 2 A at 12 V
 const MAX_CURRENT: Current = Current(6.0);
 /// −3 dB bandwidth of the current-sense RC filter before the comparator (Hz).
@@ -98,8 +99,7 @@ const PM: PhaseMargin = PhaseMargin::Manual {
 const SAFETY: f64 = 2.0;
 
 // Buck region: design point V_in = 24 V → V_out = 13.5 V
-const PARAMS_BUCK: ParametersBuck = ParametersBuck {
-    v_in: 24.0,
+const PARAMS: Parameters = Parameters {
     v_out: V_TARGET.0,
     c_out: C_OUT.0,
     f_sw: F_SW,
@@ -108,187 +108,21 @@ const PARAMS_BUCK: ParametersBuck = ParametersBuck {
     current_sense_gain: CS_GAIN,
     i_load: V_TARGET.0 / R_LOAD,
     v_diode: 0.0,
-    topology: ControlTopology::BuckBoost, // gains computed for BuckBoost plant at 24 V
     phase_margin: PM,
     safety_factor: SAFETY,
     cycles_per_tick: CYCLES_PER_TICK,
 };
 
-// Transition region: design point V_in = V_out = 13.5 V (unity gain, worst case)
-const PARAMS_BB: ParametersBuck = ParametersBuck {
-    v_in: V_TARGET.0,
-    v_out: V_TARGET.0,
-    c_out: C_OUT.0,
-    f_sw: F_SW,
-    l_inductor: L_INDUCTOR.0,
-    r_esr_out_cap: R_ESR.0,
-    current_sense_gain: CS_GAIN,
-    i_load: V_TARGET.0 / R_LOAD,
-    v_diode: 0.0,
-    topology: ControlTopology::BuckBoost,
-    phase_margin: PM,
-    safety_factor: SAFETY,
-    cycles_per_tick: CYCLES_PER_TICK,
-};
-
-// Boost region: design point V_in = 8 V → V_out = 13.5 V
-const PARAMS_BOOST: ParametersBuck = ParametersBuck {
-    v_in: 8.0,
-    v_out: V_TARGET.0,
-    c_out: C_OUT.0,
-    f_sw: F_SW,
-    l_inductor: L_INDUCTOR.0,
-    r_esr_out_cap: R_ESR.0,
-    current_sense_gain: CS_GAIN,
-    i_load: V_TARGET.0 / R_LOAD,
-    v_diode: 0.0,
-    topology: ControlTopology::BuckBoost, // still BuckBoost plant model
-    phase_margin: PM,
-    safety_factor: SAFETY,
-    cycles_per_tick: CYCLES_PER_TICK,
-};
-
-const TF_BUCK: (TransferFunction, DacSettings) = PARAMS_BUCK.to_transfer_function();
-const TF_BB: (TransferFunction, DacSettings) = PARAMS_BB.to_transfer_function();
-const TF_BOOST: (TransferFunction, DacSettings) = PARAMS_BOOST.to_transfer_function();
-
-const WEIGHTS_BUCK: TwoPoleTwoZeroParams<f32> = TF_BUCK.0.to_2p2z();
-const WEIGHTS_BB: TwoPoleTwoZeroParams<f32> = TF_BB.0.to_2p2z();
-const WEIGHTS_BOOST: TwoPoleTwoZeroParams<f32> = TF_BOOST.0.to_2p2z();
-
-const DAC_BUCK: DacSettings = TF_BUCK.1;
-const DAC_BB: DacSettings = TF_BB.1;
-const DAC_BOOST: DacSettings = TF_BOOST.1;
+const CONTROLLER_DAC_SETTINGS: BuckBoostTransferFunction =
+    BuckBoostTransferFunction::new(PARAMS, 24.0, 8.0, V_TARGET.0);
+const WEIGHTS: BuckBoostWeights<f32> = CONTROLLER_DAC_SETTINGS.to_weights();
 
 // Slope compensation in A/s for each gain-schedule region (negative = downward).
 // The BuckBoost plant always has S_n = V_in/L, so each slope is computed from
 // the BuckBoost DAC setting at the corresponding design-point V_in.
-const SLOPE_BUCK: f64 = DAC_BUCK.dac_slope / CS_GAIN;
-const SLOPE_BB: f64 = DAC_BB.dac_slope / CS_GAIN;
-const SLOPE_BOOST: f64 = DAC_BOOST.dac_slope / CS_GAIN;
-
-// ── Mode ──────────────────────────────────────────────────────────────────────
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Mode {
-    /// V_in significantly above V_out — gain-scheduled for high step-down.
-    Buck,
-    /// V_in near V_out — gains designed for unity-gain operating point.
-    BuckBoost,
-    /// V_in significantly below V_out — gain-scheduled for step-up.
-    Boost,
-}
-
-impl Mode {
-    fn name(self) -> &'static str {
-        match self {
-            Mode::Buck => "Buck     ",
-            Mode::BuckBoost => "BuckBoost",
-            Mode::Boost => "Boost    ",
-        }
-    }
-}
-
-/// Mode selector with hysteresis.
-///
-/// The BuckBoost gain region spans ±DELTA around the V_in/V_out unity-ratio
-/// point.  A second boundary at ±2×DELTA provides the hysteresis: once in a
-/// pure-Buck or pure-Boost gain region, the mode does not switch back until
-/// the ratio crosses the inner BuckBoost boundary.
-fn select_mode(v_in: f64, v_out: f64, current: Mode) -> Mode {
-    if v_out < 0.5 {
-        return Mode::BuckBoost; // startup guard
-    }
-    let ratio = v_in / v_out;
-    const DELTA: f64 = 0.20;
-
-    // Hard outer boundaries — switch regardless of current mode
-    if ratio > 1.0 + 2.0 * DELTA {
-        return Mode::Buck;
-    }
-    if ratio < 1.0 - 2.0 * DELTA {
-        return Mode::Boost;
-    }
-    // Inner BuckBoost band — always use BuckBoost gains here
-    if ratio >= 1.0 - DELTA && ratio <= 1.0 + DELTA {
-        return Mode::BuckBoost;
-    }
-    // Soft hysteresis zone between the two boundaries — keep current mode
-    current
-}
-
-// ── Controller ────────────────────────────────────────────────────────────────
-
-struct BuckBoostController {
-    buck: TwoPoleTwoZero<f32>,
-    boost: TwoPoleTwoZero<f32>,
-    buck_boost: TwoPoleTwoZero<f32>,
-    mode: Mode,
-    out_max: f32,
-}
-
-impl BuckBoostController {
-    fn new(out_max: f32) -> Self {
-        Self {
-            buck: WEIGHTS_BUCK.to_controller(),
-            boost: WEIGHTS_BOOST.to_controller(),
-            buck_boost: WEIGHTS_BB.to_controller(),
-            mode: Mode::BuckBoost,
-            out_max,
-        }
-    }
-
-    /// Returns `(output_volts, mode, slope_a_per_s, clamped)`.
-    fn update(&mut self, v_in: f64, v_out: f64, target: f64) -> (f32, Mode, f64, bool) {
-        let error = (target - v_out) as f32;
-
-        let desired = select_mode(v_in, v_out, self.mode);
-        if desired != self.mode {
-            self.switch_to(desired, error);
-        }
-
-        let raw: f32 = match self.mode {
-            Mode::Buck => self.buck.update(error),
-            Mode::Boost => self.boost.update(error),
-            Mode::BuckBoost => self.buck_boost.update(error),
-        };
-
-        let clamped_val = raw.clamp(0.0, self.out_max);
-        let was_clamped = clamped_val != raw;
-
-        // Clamped-feedback anti-windup: replace the stored raw output with the
-        // saturated value so the embedded integrator cannot wind beyond the limits.
-        if was_clamped {
-            match self.mode {
-                Mode::Buck => self.buck.set_last_output(clamped_val),
-                Mode::Boost => self.boost.set_last_output(clamped_val),
-                Mode::BuckBoost => self.buck_boost.set_last_output(clamped_val),
-            }
-        }
-
-        let slope = match self.mode {
-            Mode::Buck => SLOPE_BUCK,
-            Mode::Boost => SLOPE_BOOST,
-            Mode::BuckBoost => SLOPE_BB,
-        };
-
-        (clamped_val, self.mode, slope, was_clamped)
-    }
-
-    fn switch_to(&mut self, new_mode: Mode, current_error: f32) {
-        let last_u = match self.mode {
-            Mode::Buck => self.buck.last_output(),
-            Mode::Boost => self.boost.last_output(),
-            Mode::BuckBoost => self.buck_boost.last_output(),
-        };
-        match new_mode {
-            Mode::Buck => self.buck.prime(last_u, current_error),
-            Mode::Boost => self.boost.prime(last_u, current_error),
-            Mode::BuckBoost => self.buck_boost.prime(last_u, current_error),
-        }
-        self.mode = new_mode;
-    }
-}
+const SLOPE_BUCK: f64 = CONTROLLER_DAC_SETTINGS.dac_buck.dac_slope / CS_GAIN;
+const SLOPE_BOOST: f64 = CONTROLLER_DAC_SETTINGS.dac_boost.dac_slope / CS_GAIN;
+const SLOPE_BB: f64 = CONTROLLER_DAC_SETTINGS.dac_buck_boost.dac_slope / CS_GAIN;
 
 // ── Simulation sync ───────────────────────────────────────────────────────────
 
@@ -300,13 +134,14 @@ impl BuckBoostController {
 ///   - Buck ON:       V_L = V_in − V_out  (RLC)
 ///   - BuckBoost ON:  V_L = V_in          (linear, capacitor decoupled)
 ///   - Boost ON:      V_L = V_in          (linear, capacitor decoupled)
-fn sync_sim(sim: &mut CurrentModeConverter, slope: f64, mode: Mode) {
-    sim.topology = match mode {
-        Mode::Buck => Topology::Buck,
-        Mode::BuckBoost => Topology::BuckBoost,
-        Mode::Boost => Topology::Boost,
+fn sync_sim(sim: &mut CurrentModeConverter, mode: Mode) {
+    sim.topology = mode;
+    let dac_settings = match mode {
+        Mode::Buck => CONTROLLER_DAC_SETTINGS.dac_buck,
+        Mode::Boost => CONTROLLER_DAC_SETTINGS.dac_boost,
+        Mode::BuckBoost => CONTROLLER_DAC_SETTINGS.dac_buck_boost,
     };
-    sim.parameters.slope_amp_per_sec = slope;
+    sim.parameters.slope_amp_per_sec = dac_settings.dac_slope / CS_GAIN;
 }
 
 // ── V_in sweep profile ────────────────────────────────────────────────────────
@@ -316,14 +151,15 @@ fn sync_sim(sim: &mut CurrentModeConverter, slope: f64, mode: Mode) {
 /// 75..100% : 24 V  (steady, Buck region)
 ///
 /// Cosine chosen so V_in is continuous and differentiable at the endpoints.
-fn v_in_sweep(step: usize, total: usize) -> f64 {
+fn v_in_sweep(step: usize, total: usize) -> Voltage {
     let frac = step as f64 / total as f64;
     if frac < 0.25 || frac > 0.75 {
-        24.0
+        V_IN_BUCK
     } else {
         let t = (frac - 0.25) / 0.5; // 0..1 over the active sweep portion
         // t=0 → 24V,  t=0.5 → 8V,  t=1 → 24V
-        16.0 + 8.0 * f64::cos(2.0 * std::f64::consts::PI * t)
+        let delta = V_IN_BUCK - V_IN_BOOST;
+        (V_IN_BOOST + delta * 0.5) + delta * 0.5 * f64::cos(2.0 * std::f64::consts::PI * t)
     }
 }
 
@@ -358,8 +194,8 @@ impl Logger {
     #[cfg(feature = "text-log")]
     fn print_header() {
         println!(
-            "{:>9} {:>6} {:>7} {:>7} {:>9} {:>7} {:>5} {:>7} {}",
-            "t[ms]", "Vin[V]", "Vout[V]", "err[V]", "mode", "IL[A]", "d[%]", "trip[A]", "clamp"
+            "{:>9} {:>6} {:>7} {:>7} {:>9} {:>7} {:>5}",
+            "t[ms]", "Vin[V]", "Vout[V]", "err[V]", "mode", "IL[A]", "d[%]",
         );
         println!("{}", "-".repeat(72));
     }
@@ -371,9 +207,7 @@ impl Logger {
         i_max: Current,
         v_in: Voltage,
         i_out: Current,
-        trip_a: f64,
         mode: Mode,
-        was_clamped: bool,
         time: &mut Time,
     ) {
         let mode_changed = self.prev_mode.map_or(true, |m| m != mode);
@@ -399,9 +233,18 @@ impl Logger {
                 .log("mode", &rerun::Scalars::new([mode_val]))
                 .unwrap();
             // Input-side / EMI channels
-            self.rec.log("v_in_cap", &rerun::Scalars::new([sim.v_in_cap.0])).unwrap();
-            self.rec.log("i_in_cap", &rerun::Scalars::new([sim.i_in_cap.0])).unwrap();
-            self.rec.log("v_in_ripple_est", &rerun::Scalars::new([sim.v_in_ripple_est.0])).unwrap();
+            self.rec
+                .log("v_in_cap", &rerun::Scalars::new([sim.v_in_cap.0]))
+                .unwrap();
+            self.rec
+                .log("i_in_cap", &rerun::Scalars::new([sim.i_in_cap.0]))
+                .unwrap();
+            self.rec
+                .log(
+                    "v_in_ripple_est",
+                    &rerun::Scalars::new([sim.v_in_ripple_est.0]),
+                )
+                .unwrap();
         }
 
         #[cfg(feature = "text-log")]
@@ -418,7 +261,7 @@ impl Logger {
                 let d_pct = t_on.0 * F_SW * 100.0;
                 let err = V_TARGET.0 - sim.v_out.0;
                 println!(
-                    "{:9.4} {:6.3} {:7.4} {:+7.4} {:9} {:7.4} {:5.1} {:7.4} {}",
+                    "{:9.4} {:6.3} {:7.4} {:+7.4} {:9} {:7.4} {:5.1}",
                     time.0 * 1e3,
                     v_in.0,
                     sim.v_out.0,
@@ -426,8 +269,6 @@ impl Logger {
                     mode.name(),
                     sim.i_inductor.0,
                     d_pct,
-                    trip_a,
-                    if was_clamped { "CLAMP" } else { "" },
                 );
             }
         }
@@ -456,16 +297,28 @@ fn main() {
     // crossover_divisor() is const fn, evaluated at compile time inside to_transfer_function().
     // Print here for informational purposes.
     println!("Controller design (safety_factor={SAFETY}):");
-    println!("  Buck:      f_x = {:.0} Hz (divisor={:.1})", F_SW / PARAMS_BUCK.crossover_divisor(), PARAMS_BUCK.crossover_divisor());
-    println!("  BuckBoost: f_x = {:.0} Hz (divisor={:.1})", F_SW / PARAMS_BB.crossover_divisor(), PARAMS_BB.crossover_divisor());
-    println!("  Boost:     f_x = {:.0} Hz (divisor={:.1})", F_SW / PARAMS_BOOST.crossover_divisor(), PARAMS_BOOST.crossover_divisor());
+    println!(
+        "  Buck:      f_x = {:.0} Hz (divisor={:.1})",
+        F_SW / PARAMS.crossover_divisor(ControlTopology::Buck, V_IN_BUCK.0),
+        PARAMS.crossover_divisor(ControlTopology::Buck, V_IN_BUCK.0)
+    );
+    println!(
+        "  Boost:     f_x = {:.0} Hz (divisor={:.1})",
+        F_SW / PARAMS.crossover_divisor(ControlTopology::Boost, V_IN_BOOST.0),
+        PARAMS.crossover_divisor(ControlTopology::Boost, V_IN_BOOST.0)
+    );
+    println!(
+        "  BuckBoost: f_x = {:.0} Hz (divisor={:.1})",
+        F_SW / PARAMS.crossover_divisor(ControlTopology::BuckBoost, V_TARGET.0),
+        PARAMS.crossover_divisor(ControlTopology::BuckBoost, V_TARGET.0)
+    );
 
     // Start the sim in BuckBoost topology; sync_sim() will update it each cycle.
 
     let parameters = electronics_sim::Parameters {
         period: T_PERIOD,
         slope_amp_per_sec: SLOPE_BB,
-        r_series:R_SERIES,
+        r_series: R_SERIES,
         r_esr: R_ESR,
         c_out: C_OUT,
         l_inductor: L_INDUCTOR,
@@ -476,12 +329,11 @@ fn main() {
         tau_current_sense: electronics_sim::Parameters::bw_to_tau(BW_CURRENT_SENSE),
         tau_dac: electronics_sim::Parameters::bw_to_tau(BW_DAC),
         t_prop_delay: Time(T_COMPARATOR_DELAY),
-        t_dac_sample: Time(15e-6),
+        t_dac_sample: Time(1.0 / 15e6),
     };
-    let mut sim =
-        CurrentModeConverter::new(parameters, Topology::BuckBoost,);
+    let mut sim = CurrentModeConverter::new(parameters, Mode::BuckBoost);
 
-    let mut ctrl = BuckBoostController::new(MAX_CURRENT.0 as f32 * CS_GAIN as f32);
+    let mut ctrl = WEIGHTS.to_controller(0.0, MAX_CURRENT.0 as f32 * CS_GAIN as f32);
     let mut logger = Logger::new();
     let mut time = Time(0.0);
 
@@ -493,15 +345,15 @@ fn main() {
 
     let vins = [24.0, 12.0, 8.0];
 
-    let mut ctrl_out = (0.0f32, Mode::BuckBoost, SLOPE_BB, false);
+    let mut ctrl_out = (0.0f32, Mode::BuckBoost);
     let mut i_out = Current(0.0);
     for i in 0..soft_cycles {
         let soft_target = V_TARGET.0 * (i + 1) as f64 / soft_cycles as f64;
         if i % CYCLES_PER_TICK == 0 {
             ctrl_out = ctrl.update(v_in_startup.0, sim.v_sensed(i_out).0, soft_target);
         }
-        let (cmd_v, mode, slope, clamped) = ctrl_out;
-        sync_sim(&mut sim, slope, mode);
+        let (cmd_v, mode) = ctrl_out;
+        sync_sim(&mut sim, mode);
 
         let trip = Current((cmd_v as f64 / CS_GAIN).clamp(0.0, MAX_CURRENT.0));
         let (t_on, i_max) = sim.tick(v_in_startup, trip, |v| {
@@ -509,17 +361,7 @@ fn main() {
             i_out
         });
 
-        logger.log(
-            &sim,
-            t_on,
-            i_max,
-            v_in_startup,
-            i_out,
-            trip.0,
-            mode,
-            clamped,
-            &mut time,
-        );
+        logger.log(&sim, t_on, i_max, v_in_startup, i_out, mode, &mut time);
     }
 
     // ── V_in sweep ────────────────────────────────────────────────────────────
@@ -535,14 +377,14 @@ fn main() {
     let mut bat = Battery::new(Voltage(11.0));
     for v_in in vins {
         let v_in = Voltage(v_in);
-        let mut ctrl_out = (0.0f32, Mode::BuckBoost, SLOPE_BB, false);
+        let mut ctrl_out = (0.0f32, Mode::BuckBoost);
         let mut i_out = Current(0.0);
         for i in 0..bat_test_cycles {
             if i % CYCLES_PER_TICK == 0 {
                 ctrl_out = ctrl.update(v_in.0, sim.v_sensed(i_out).0, V_TARGET.0);
             }
-            let (cmd_v, mode, slope, clamped) = ctrl_out;
-            sync_sim(&mut sim, slope, mode);
+            let (cmd_v, mode) = ctrl_out;
+            sync_sim(&mut sim, mode);
 
             let trip = Current((cmd_v as f64 / CS_GAIN).clamp(0.0, MAX_CURRENT.0));
             let (t_on, i_max) = sim.tick(v_in, trip, |v| {
@@ -550,25 +392,23 @@ fn main() {
                 i_out
             });
 
-            logger.log(
-                &sim, t_on, i_max, v_in, i_out, trip.0, mode, clamped, &mut time,
-            );
+            logger.log(&sim, t_on, i_max, v_in, i_out, mode, &mut time);
         }
     }
 
     let rs = [12.0, 6.0, f64::MAX];
 
-    let mut ctrl_out = (0.0f32, Mode::BuckBoost, SLOPE_BB, false);
+    let mut ctrl_out = (0.0f32, Mode::BuckBoost);
     let mut i_out = Current(0.0);
     for i in 0..total_cycles {
-        let v_in = Voltage(v_in_sweep(i % sweep_cycles, sweep_cycles));
+        let v_in = v_in_sweep(i % sweep_cycles, sweep_cycles);
         let r = rs[i * rs.len() / total_cycles];
 
         if i % CYCLES_PER_TICK == 0 {
             ctrl_out = ctrl.update(v_in.0, sim.v_sensed(i_out).0, V_TARGET.0);
         }
-        let (cmd_v, mode, slope, clamped) = ctrl_out;
-        sync_sim(&mut sim, slope, mode);
+        let (cmd_v, mode) = ctrl_out;
+        sync_sim(&mut sim, mode);
 
         let trip = Current((cmd_v as f64 / CS_GAIN).clamp(0.0, MAX_CURRENT.0));
         let (t_on, i_max) = sim.tick(v_in, trip, |v| {
@@ -576,14 +416,12 @@ fn main() {
             i_out
         });
 
-        logger.log(
-            &sim, t_on, i_max, v_in, i_out, trip.0, mode, clamped, &mut time,
-        );
+        logger.log(&sim, t_on, i_max, v_in, i_out, mode, &mut time);
     }
 
     for v_in in vins {
         let v_in = Voltage(v_in);
-        let mut ctrl_out = (0.0f32, Mode::BuckBoost, SLOPE_BB, false);
+        let mut ctrl_out = (0.0f32, Mode::BuckBoost);
         let mut i_out = Current(0.0);
         for i in 0..sweep_cycles {
             let r = rs[i * rs.len() / sweep_cycles];
@@ -591,8 +429,8 @@ fn main() {
             if i % CYCLES_PER_TICK == 0 {
                 ctrl_out = ctrl.update(v_in.0, sim.v_sensed(i_out).0, V_TARGET.0);
             }
-            let (cmd_v, mode, slope, clamped) = ctrl_out;
-            sync_sim(&mut sim, slope, mode);
+            let (cmd_v, mode) = ctrl_out;
+            sync_sim(&mut sim, mode);
 
             let trip = Current((cmd_v as f64 / CS_GAIN).clamp(0.0, MAX_CURRENT.0));
             let (t_on, i_max) = sim.tick(v_in, trip, |v| {
@@ -600,9 +438,7 @@ fn main() {
                 i_out
             });
 
-            logger.log(
-                &sim, t_on, i_max, v_in, i_out, trip.0, mode, clamped, &mut time,
-            );
+            logger.log(&sim, t_on, i_max, v_in, i_out, mode, &mut time);
         }
     }
 }
@@ -627,10 +463,9 @@ impl Battery {
 
     pub fn tick(&mut self, v_in: Voltage, dt: Time) -> Current {
         let q_out = 0.0;
-        let f = electronics_sim::math::rlc(v_in, self.v_int, self.i, self.l_cable, self.c, self.r_esr);
-        let q_in = f
-            .integral(0.0)
-            .f(dt.0);
+        let f =
+            electronics_sim::math::rlc(v_in, self.v_int, self.i, self.l_cable, self.c, self.r_esr);
+        let q_in = f.integral(0.0).f(dt.0);
         self.v_int += Voltage((q_in - q_out) / self.c.0);
         self.i = Current(f.f(dt.0));
 
