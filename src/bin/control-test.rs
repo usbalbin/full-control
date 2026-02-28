@@ -1,235 +1,231 @@
 use electronics_sim::{
-    Capacitance, Current, CurrentModeConverter, Inductance, MyThing, Parameters, Resistance, T, Time, Topology, Voltage
+    Capacitance, Current, CurrentModeConverter, Inductance, Parameters as SimParameters, Resistance,
+    Time, Voltage,
 };
-use full_control::control_2p2z::{
-    self, DacSettings, ParametersBuck, Topology as ControlTopology, TransferFunction,
-    TwoPoleTwoZeroParams,
+use full_control::{
+    buck_boost::Mode,
+    control_2p2z::{
+        DacSettings, Parameters, PhaseMargin, Topology as ControlTopology, TransferFunction,
+        TwoPoleTwoZeroParams,
+    },
 };
-use pid::Pid;
 
-const T_PERIOD: Time = Time(1.0e-6);
-const C_OUT: Capacitance = Capacitance(470.0e-6);
-const L_INDUCTOR: Inductance = Inductance(2e-6);
+// ── Physical circuit constants (same as buck-boost-test.rs) ─────────────────
+const F_SW: f64 = 500e3; // 500 kHz
+const T_PERIOD: Time = Time(1.0 / F_SW);
+const V_IN: Voltage = Voltage(24.0);
+const V_TARGET: Voltage = Voltage(13.5);
+const C_OUT: Capacitance = Capacitance(47e-6); // 47 µF
+const L_INDUCTOR: Inductance = Inductance(4e-6); // 4 µH
+const R_ESR: Resistance = Resistance(10e-3); // 10 mΩ
+const R_SERIES: Resistance = Resistance(35e-3); // 35 mΩ
+const CS_GAIN: f64 = 0.066; // ACS37030: 66 mV/A
+const R_LOAD: f64 = 6.0; // 6 Ω → ~2.25 A at 13.5 V
+/// Maximum trip-current the controller can command (A).
+/// Must exceed the peak inductor current PLUS the slope-compensation offset
+/// at the trip point (≈ |slope| × t_on ≈ 2.6 A at D = 0.56).  Set higher than
+/// the physical inductor-current limit to provide DAC headroom.
+const MAX_CURRENT: Current = Current(10.0);
 
-const MAX_LSB: f64 = 4095.0;
-const MAX_CURRENT: Current = Current(8.0);
-const PARAMS: ParametersBuck = ParametersBuck {
-    v_in: 12.0,
-    v_out: 8.0,
+// ── STM32G474 ADC / DAC ────────────────────────────────────────────────────
+const V_REF: f64 = 3.3;
+const ADC_MAX: f64 = 4095.0; // 12-bit
+const LSB: f64 = V_REF / ADC_MAX; // ~0.806 mV per code
+
+// ── Feedback resistor divider ───────────────────────────────────────────────
+const R_FB_HI: f64 = 47_000.0; // 47 kΩ
+const R_FB_LO: f64 = 10_000.0; // 10 kΩ
+const DIVIDER_RATIO: f64 = R_FB_LO / (R_FB_HI + R_FB_LO); // ≈ 0.1754
+// 13.5 V × 0.1754 ≈ 2.37 V → ADC code ≈ 2939
+
+// ── Controller target and DAC limits in codes ───────────────────────────────
+const TARGET_CODE: f64 = V_TARGET.0 * DIVIDER_RATIO / LSB;
+const DAC_MAX_CODE: f64 = MAX_CURRENT.0 * CS_GAIN / LSB; // ≈ 819
+
+// ── 2P2Z compensator design ────────────────────────────────────────────────
+const CTRL_PARAMS: Parameters = Parameters {
+    v_out: V_TARGET.0,
     c_out: C_OUT.0,
-    f_sw: 1e6,
+    f_sw: F_SW,
     l_inductor: L_INDUCTOR.0,
-    //r_esr_inductor: 4.08e-3,   // 4.08mOhm typical
-    r_esr_out_cap: 1e-3,       // todo
-    current_sense_gain: 0.066, // 66mV/A
-    i_load: 2.0,
+    r_esr_out_cap: R_ESR.0,
+    current_sense_gain: CS_GAIN,
+    i_load: V_TARGET.0 / R_LOAD,
     v_diode: 0.0,
-    topology: ControlTopology::Buck,
-    phase_margin: control_2p2z::PhaseMargin::Manual {
+    phase_margin: PhaseMargin::Manual {
         phase_margin: 75.0f64.to_radians(),
     },
     safety_factor: 2.0,
     cycles_per_tick: 1,
-}; /*
-const MAX_LSB: f64 = 1023.0;
-const PARAMS: ParametersBuck = ParametersBuck {
-v_in: 16.0,
-v_out: 8.0,
-c_out: 440e-6,
-f_sw: 200e3,
-l_inductor: 22e-6,
-//r_esr_inductor: 4.08e-3,   // 4.08mOhm typical
-r_esr_out_cap: 31e-3,      // todo
-current_sense_gain: 0.48, // 66mV/A
-i_load: 2.0,
-v_diode: 0.6,
-phase_margin: half_bridge::control_2p2z::PhaseMargin::Manual { phase_margin: 75.0f64.to_radians() }
-//t_adc_sample_to_dac_out: 0.0,
-};*/
+};
 
-// 0:    0.00V  <-20A
-// 2047: 1.65V  0A
-// 4095: 3.30V  >+20A
+// Transfer function and DAC settings at the Buck operating point
+const TF_DAC: (TransferFunction, DacSettings) =
+    CTRL_PARAMS.to_transfer_function(V_IN.0, ControlTopology::Buck);
 
-const DAC_LSB_TO_V: T = 3.3 / MAX_LSB;
-const AMP_PER_LSB: T = DAC_LSB_TO_V / PARAMS.current_sense_gain;
-const ASD: T = AMP_PER_LSB * MAX_LSB;
-const SLOPE_AMP_PER_SEC: T = DAC_SETTINGS.dac_slope / PARAMS.current_sense_gain;
-const C: T = SLOPE_AMP_PER_SEC / PARAMS.f_sw;
+// Physical-domain weights (error in Volts, output in current-sense Volts)
+const WEIGHTS_PHYS: TwoPoleTwoZeroParams<f32> = TF_DAC.0.to_2p2z();
 
-const TF_AND_DAC: (TransferFunction, DacSettings) = PARAMS.to_transfer_function();
-const TRANSFER_FUNC: TransferFunction = TF_AND_DAC.0;
-const DAC_SETTINGS: DacSettings = TF_AND_DAC.1;
-const COMP_WEIGHTS: TwoPoleTwoZeroParams<f32> = TRANSFER_FUNC.to_2p2z();
+// Code-domain weights: b-coefficients scaled by 1/divider_ratio.
+// The a-coefficients are unchanged (they multiply past outputs already in codes).
+const WEIGHTS_CODE: TwoPoleTwoZeroParams<f32> = TwoPoleTwoZeroParams {
+    a1: WEIGHTS_PHYS.a1,
+    a2: WEIGHTS_PHYS.a2,
+    b0: (WEIGHTS_PHYS.b0 as f64 / DIVIDER_RATIO) as f32,
+    b1: (WEIGHTS_PHYS.b1 as f64 / DIVIDER_RATIO) as f32,
+    b2: (WEIGHTS_PHYS.b2 as f64 / DIVIDER_RATIO) as f32,
+};
 
+// Slope compensation in A/s for the simulator
+const SLOPE_AMP_PER_SEC: f64 = TF_DAC.1.dac_slope / CS_GAIN;
+
+#[cfg_attr(not(feature = "text-log"), allow(unused_variables))]
 fn main() {
-    #[cfg(feature = "rerun")]
-    let rec = rerun::RecordingStreamBuilder::new("rerun_example_box3d_batch")
-        .spawn()
-        .unwrap();
+    // ── Controller design summary ──────────────────────────────────────────
+    let divisor = CTRL_PARAMS.crossover_divisor(ControlTopology::Buck, V_IN.0);
+    println!("Control-test: Pure Buck, V_in={:.0}V → V_out={:.1}V", V_IN.0, V_TARGET.0);
+    println!("  f_x        = {:.0} Hz (divisor={:.1})", F_SW / divisor, divisor);
+    println!(
+        "  Physical   : b0={:.4}  b1={:.4}  b2={:.4}  a1={:.4}  a2={:.4}",
+        WEIGHTS_PHYS.b0, WEIGHTS_PHYS.b1, WEIGHTS_PHYS.b2, WEIGHTS_PHYS.a1, WEIGHTS_PHYS.a2,
+    );
+    println!(
+        "  Code-domain: b0={:.4}  b1={:.4}  b2={:.4}",
+        WEIGHTS_CODE.b0, WEIGHTS_CODE.b1, WEIGHTS_CODE.b2,
+    );
+    println!("  Divider    : {:.4} (R_hi={:.0}Ω  R_lo={:.0}Ω)", DIVIDER_RATIO, R_FB_HI, R_FB_LO);
+    println!("  Target code: {:.0}  (1 LSB ≈ {:.1} mV at output)", TARGET_CODE, LSB / DIVIDER_RATIO * 1e3);
+    println!("  DAC max    : {:.0}  (= {:.1} A)", DAC_MAX_CODE, MAX_CURRENT.0);
+    println!("  Slope      : {:.0} A/s", SLOPE_AMP_PER_SEC);
+    println!();
 
-    //i(Voltage(12.0), todo!(), todo!(), L_INDUCTOR, C_OUT, Resistance(10e-3), T_PERIOD);
-
-    //let sim = MyThing::new(T_PERIOD, C_OUT, L_INDUCTOR, SLOPE_AMP_PER_SEC, AMP_PER_LSB, AMP_AT_0LSB);
-
-    let parameters = Parameters {
+    // ── Simulator ──────────────────────────────────────────────────────────
+    let sim_params = SimParameters {
         period: T_PERIOD,
         slope_amp_per_sec: SLOPE_AMP_PER_SEC,
-        r_series: Resistance(0.0),
-        r_esr: Resistance(0.0),
+        r_series: R_SERIES,
+        r_esr: R_ESR,
         c_out: C_OUT,
         l_inductor: L_INDUCTOR,
         c_in: Capacitance(0.0),
         r_esr_cin: Resistance(0.0),
         r_in: Resistance(0.0),
         l_in: Inductance(0.0),
-        tau_current_sense: Time(0.0), // tau_current_sense
-        tau_dac: Time(0.0), // tau_dac
-        t_prop_delay: Time(0.0), // t_prop_delay
+        tau_current_sense: Time(0.0),
+        tau_dac: Time(0.0),
+        t_prop_delay: Time(0.0),
         t_dac_sample: Time(0.0),
     };
-    let sim = CurrentModeConverter::new(
-        parameters,
-        Topology::Buck,
-    );
+    let mut sim = CurrentModeConverter::new(sim_params, Mode::Buck);
 
-    let target = Voltage(5.0);
-
-    let mut best = (0.0, 0.0);
-    let mut v_out_max_min = f64::MAX;
-    //for x in 0..1000 {
-    let kp = 0.433;
-    let ki = 0.025;
-
-    #[cfg(not(feature = "rerun"))]
-    let v_out_max = foo(kp, ki, target, sim);
-
-    #[cfg(feature = "rerun")]
-    let v_out_max = foo(kp, ki, target, sim, None);
-
-    if v_out_max < v_out_max_min {
-        best = (ki, kp);
-        v_out_max_min = v_out_max;
-    }
-    //}
-    let (ki, kp) = best;
-    dbg!(kp, ki, v_out_max_min);
-
-    //let kp = 0.999;
-    //let ki = 0.025;
-    #[cfg(feature = "rerun")]
-    foo(kp, ki, target, sim, Some(&rec));
-
-    #[cfg(not(feature = "rerun"))]
-    foo(kp, ki, target, sim);
-}
-
-fn foo(
-    kp: f32,
-    ki: f32,
-    target: Voltage,
-    mut sim: CurrentModeConverter,
-    #[cfg(feature = "rerun")] rec: Option<&rerun::RecordingStream>,
-) -> f64 {
-    let mut comp = Pid::new(target.0, 1.0);
-    comp.p(kp, 1e18).i(ki, 1e9).d(0.0, 1e9);
-    comp.output_limit = 0.75;
-
-    let mut comp = COMP_WEIGHTS.to_controller();
-
-    let loads = [3.0, 1.0, f64::MAX, 1.0, 100.0];
+    // Controller operating on ADC/DAC codes
+    let mut ctrl = WEIGHTS_CODE.to_controller(0.0_f32, DAC_MAX_CODE as f32);
 
     let mut time = Time(0.0);
 
-    // Soft start: ramp the voltage reference from 0 to target over this many cycles.
-    let soft_start_cycles = 2000_usize;
-    for i in 0..soft_start_cycles {
-        let soft_target = Voltage(target.0 * (i + 1) as f64 / soft_start_cycles as f64);
-        let mut i_out = Current(0.0);
-        let output = comp.update((soft_target - sim.v_out).0 as f32);
-        let trip_current =
-            Current((output as T / PARAMS.current_sense_gain).clamp(0.0, MAX_CURRENT.0));
-        let (t_on, i_l_max) = sim.tick(Voltage(12.0), trip_current, |v| {
-            i_out = Current(v.0 / loads[0]);
-            i_out
-        });
+    #[cfg(feature = "text-log")]
+    {
+        println!(
+            "{:>9} {:>8} {:>7} {:>5} {:>5} {:>7} {:>5}",
+            "t[ms]", "Vout[V]", "err[V]", "adc", "dac", "IL[A]", "d[%]",
+        );
+        println!("{}", "-".repeat(62));
+    }
 
-        #[cfg(feature = "rerun")]
-        if let Some(rec) = rec {
-            use electronics_sim::plot;
+    // ── Soft-start ─────────────────────────────────────────────────────────
+    let soft_cycles = 3000_usize;
+    for i in 0..soft_cycles {
+        let soft_target = TARGET_CODE as f32 * (i + 1) as f32 / soft_cycles as f32;
 
-            plot(&rec, &sim, t_on, i_l_max, Voltage(12.0), i_out, &mut time);
+        let adc_code = adc_read(sim.v_out);
+        let error = soft_target - adc_code as f32;
+        let output = ctrl.update(error);
+
+        let dac_code = (output.round() as i32).clamp(0, DAC_MAX_CODE as i32) as u16;
+        let trip = dac_to_trip(dac_code);
+
+        let (t_on, _i_max) = sim.tick(V_IN, trip, |v| Current(v.0 / R_LOAD));
+
+        time += T_PERIOD;
+
+        #[cfg(feature = "text-log")]
+        if i % 100 == 0 || i >= soft_cycles - 5 {
+            log_line(time, &sim, t_on, adc_code, dac_code);
         }
     }
 
-    let iter = 1000;
-    let mut v_out_max = 0.0f64;
-    for i in 0..iter {
-        let r = loads[i * loads.len() / iter];
-        let v_in = if i < 500 {
-            Voltage(12.0)
-        } else {
-            Voltage(18.0)
-        };
+    // ── Steady-state ───────────────────────────────────────────────────────
+    #[cfg(feature = "text-log")]
+    println!(">>> STEADY STATE (R_load = {:.1} Ω)", R_LOAD);
 
-        let mut i_out = Current(0.0);
+    let steady_cycles = 5000_usize;
+    for i in 0..steady_cycles {
+        let adc_code = adc_read(sim.v_out);
+        let error = TARGET_CODE as f32 - adc_code as f32;
+        let output = ctrl.update(error);
 
-        //let output = comp.next_control_output(sim.buck.v_out.0).output;
+        let dac_code = (output.round() as i32).clamp(0, DAC_MAX_CODE as i32) as u16;
+        let trip = dac_to_trip(dac_code);
 
-        //dbg!(output);
-        let output = comp.update((target - sim.v_out).0 as f32);
-        // Controller output is a current-reference voltage (V); divide by current_sense_gain (V/A) to get Amps.
-        let trip_current =
-            Current((output as T / PARAMS.current_sense_gain).clamp(0.0, MAX_CURRENT.0));
-        //panic!("Boopi: {trip_current}");
-        let (t_on, i_l_max) = sim.tick(v_in, trip_current /*as u16*/, |v| {
-            i_out = Current(v.0 / r);
-            i_out
-        });
+        let (t_on, _i_max) = sim.tick(V_IN, trip, |v| Current(v.0 / R_LOAD));
 
-        #[cfg(feature = "rerun")]
-        if let Some(rec) = rec {
-            use electronics_sim::plot;
+        time += T_PERIOD;
 
-            plot(&rec, &sim, t_on, i_l_max, v_in, i_out, &mut time);
+        #[cfg(feature = "text-log")]
+        if i % 200 == 0 || i >= steady_cycles - 5 {
+            log_line(time, &sim, t_on, adc_code, dac_code);
         }
-        v_out_max = v_out_max.max(sim.v_out.0);
-        //rec.log("iter", &rerun::Scalars::new([i])).unwrap();
     }
 
-    v_out_max
+    // ── Load step: 6 Ω → 3 Ω ──────────────────────────────────────────────
+    let load_r = 3.0;
+    #[cfg(feature = "text-log")]
+    println!(">>> LOAD STEP: R_load {:.1} Ω → {:.1} Ω", R_LOAD, load_r);
+
+    let load_cycles = 5000_usize;
+    for i in 0..load_cycles {
+        let adc_code = adc_read(sim.v_out);
+        let error = TARGET_CODE as f32 - adc_code as f32;
+        let output = ctrl.update(error);
+
+        let dac_code = (output.round() as i32).clamp(0, DAC_MAX_CODE as i32) as u16;
+        let trip = dac_to_trip(dac_code);
+
+        let (t_on, _i_max) = sim.tick(V_IN, trip, |v| Current(v.0 / load_r));
+
+        time += T_PERIOD;
+
+        #[cfg(feature = "text-log")]
+        if i < 200 || i % 200 == 0 || i >= load_cycles - 5 {
+            log_line(time, &sim, t_on, adc_code, dac_code);
+        }
+    }
 }
-/*
-// TODO: Verify this
-fn bar(v_in: Voltage, l: Inductance, c: Capacitance, r: Resistance, t: Time) {
-    //let u_l = l * di_dt;
-    //let u_c = Q / c;
-    //let u_r = r * i;
-    //
-    //let q = (v_in / L) / s(s ^ 2 + (r / 2) * s + (inv_c / 2));
 
-    // ------- The math below this line was generated with the help of ChatGPT -------
+/// Model 12-bit ADC read: output voltage through resistor divider, quantized.
+fn adc_read(v_out: Voltage) -> u16 {
+    let v_adc = v_out.0 * DIVIDER_RATIO;
+    (v_adc / LSB).round().clamp(0.0, ADC_MAX) as u16
+}
 
-    // let k = v_in.0 / l.0;
-    let a = r.0 / 2.0;
-    let b = 1.0 / (2.0 * c.0);
-    let ohmega = T::sqrt(b - a * a / 4.0);
-    let t = t.0;
+/// Convert a 12-bit DAC code to a physical trip current for the simulator.
+fn dac_to_trip(dac_code: u16) -> Current {
+    let trip_v = dac_code as f64 * LSB;
+    Current((trip_v / CS_GAIN).clamp(0.0, MAX_CURRENT.0))
+}
 
-    // let q = k / b
-    //     - (k / b) * T::exp(-a * t / 2.0) * T::cos(ohmega * t)
-    //     - (k * a) / (2.0 * b * ohmega) * T::exp(-a * t / 2.0) * T::sin(ohmega * t)
-    //     - (k * a) / (b * ohmega) * T::exp(-a * t / 2.0) * T::sin(ohmega * t);
-
-    // i = dq_dt
-    // let i = (k / b)
-    //     * T::exp(-a * t / 2.0)
-    //     * (-a * T::cos(ohmega * t)
-    //         + (ohmega + (3.0 * a * a) / (4.0 * ohmega)) * T::sin(ohmega * t));
-
-    // Simplified
-    let i = (c.0 * v_in.0 / l.0)
-        * T::exp(-r.0 * t / 4.0)
-        * (-r.0 * T::cos(ohmega * t)
-            + (2.0 * ohmega + (3.0 * r.0 * r.0) / (8.0 * ohmega)) * T::sin(ohmega * t));
-}*/
+#[cfg(feature = "text-log")]
+fn log_line(time: Time, sim: &CurrentModeConverter, t_on: Time, adc_code: u16, dac_code: u16) {
+    let d_pct = t_on.0 * F_SW * 100.0;
+    let err_v = V_TARGET.0 - sim.v_out.0;
+    println!(
+        "{:9.4} {:8.4} {:+7.4} {:5} {:5} {:7.4} {:5.1}",
+        time.0 * 1e3,
+        sim.v_out.0,
+        err_v,
+        adc_code,
+        dac_code,
+        sim.i_inductor.0,
+        d_pct,
+    );
+}
