@@ -757,3 +757,174 @@ impl_math!(Current);
 impl_math!(Resistance);
 impl_math!(Voltage);
 impl_math!(Time);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Test that all math types compile and basic operations work
+    #[test]
+    fn test_voltage_operations() {
+        let v1 = Voltage(12.0);
+        let v2 = Voltage(5.0);
+        let sum = v1 + v2;
+        assert_eq!(sum.0, 17.0);
+        let diff = v1 - v2;
+        assert_eq!(diff.0, 7.0);
+        let scaled = v1 * 2.0;
+        assert_eq!(scaled.0, 24.0);
+    }
+
+    #[test]
+    fn test_current_operations() {
+        let c1 = Current(3.0);
+        let c2 = Current(1.5);
+        let sum = c1 + c2;
+        assert_eq!(sum.0, 4.5);
+        let diff = c1 - c2;
+        assert_eq!(diff.0, 1.5);
+    }
+
+    #[test]
+    fn test_resistance_operations() {
+        let r1 = Resistance(10.0);
+        let r2 = Resistance(5.0);
+        let sum = r1 + r2;
+        assert_eq!(sum.0, 15.0);
+        let scaled = r1 * 2.0;
+        assert_eq!(scaled.0, 20.0);
+    }
+
+    #[test]
+    fn test_inductance_operations() {
+        let l = Inductance(4e-6);
+        let scaled = l * 2.0;
+        assert_eq!(scaled.0, 8e-6);
+    }
+
+    #[test]
+    fn test_capacitance_operations() {
+        let c = Capacitance(100e-6);
+        let scaled = c * 0.5;
+        assert_eq!(scaled.0, 50e-6);
+    }
+
+    #[test]
+    fn test_time_operations() {
+        let t1 = Time(1e-6);
+        let t2 = Time(0.5e-6);
+        let sum = t1 + t2;
+        assert_eq!(sum.0, 1.5e-6);
+        let diff = t1 - t2;
+        assert_eq!(diff.0, 0.5e-6);
+    }
+
+    #[test]
+    fn test_buck_converter_basic() {
+        let params = Parameters {
+            period: Time(1e-6),
+            slope_amp_per_sec: 0.0,
+            r_series: Resistance(0.0),
+            r_esr: Resistance(0.0),
+            c_out: Capacitance(10e-6),
+            l_inductor: Inductance(4e-6),
+            c_in: Capacitance(0.0),
+            r_esr_cin: Resistance(0.0),
+            r_in: Resistance(0.0),
+            l_in: Inductance(0.0),
+            tau_current_sense: Time(0.0),
+            tau_dac: Time(0.0),
+            t_prop_delay: Time(0.0),
+            t_dac_sample: Time(0.0),
+        };
+        let mut sim = CurrentModeConverter::new(params, Topology::Buck);
+
+        // Initial state should be zeros
+        assert_eq!(sim.v_out.0, 0.0);
+        assert_eq!(sim.i_inductor.0, 0.0);
+    }
+
+    #[test]
+    fn test_buck_converter_steady() {
+        let params = Parameters {
+            period: Time(1e-6),
+            slope_amp_per_sec: 0.0,
+            r_series: Resistance(0.1),
+            r_esr: Resistance(0.0),
+            c_out: Capacitance(100e-6),
+            l_inductor: Inductance(4e-6),
+            c_in: Capacitance(0.0),
+            r_esr_cin: Resistance(0.0),
+            r_in: Resistance(0.0),
+            l_in: Inductance(0.0),
+            tau_current_sense: Time(0.0),
+            tau_dac: Time(0.0),
+            t_prop_delay: Time(0.0),
+            t_dac_sample: Time(0.0),
+        };
+        let mut sim = CurrentModeConverter::new(params, Topology::Buck);
+
+        let v_in = Voltage(24.0);
+        let trip_current = Current(5.0);
+
+        // Run for many cycles to reach steady state
+        for _ in 0..1000 {
+            sim.tick(v_in, trip_current, |_| Current(2.4));
+        }
+
+        // Should have non-zero output voltage
+        assert!(sim.v_out.0 > 0.0);
+        assert!(sim.i_inductor.0 > 0.0);
+    }
+
+    #[test]
+    fn test_parameters_bw_to_tau() {
+        let tau = Parameters::bw_to_tau(1000.0);
+        let expected = Time(1.0 / (2.0 * std::f64::consts::PI * 1000.0));
+        assert!((tau.0 - expected.0).abs() < 1e-12);
+
+        // Test zero bandwidth
+        let tau = Parameters::bw_to_tau(0.0);
+        assert_eq!(tau.0, 0.0);
+    }
+
+    #[test]
+    fn test_line_intersection() {
+        let line1 = math::Line { k: 1.0, m: 0.0 };
+        let line2 = math::Line { k: -1.0, m: 10.0 };
+
+        let x = line1.intersects_at(line2, 5.0).unwrap();
+        assert!((x - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_damped_sine() {
+        let f = math::DampedSineF {
+            a: 0.1,
+            wd: 2.0 * std::f64::consts::PI,
+            amp_cos: 1.0,
+            amp_sin: 0.0,
+            c0: 0.0,
+        };
+
+        // At t=0, f(0) should equal amp_cos
+        assert!((f.f(0.0) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_polynomial() {
+        let poly = math::Polynomial {
+            factors: vec![1.0, 2.0, 3.0],
+        };
+        // f(x) = 1 + 2x + 3x^2
+        assert!((poly.f(0.0) - 1.0).abs() < 1e-10);
+        assert!((poly.f(1.0) - 6.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_math_line() {
+        let line = math::Line { k: 2.0, m: 3.0 };
+        assert!((line.f(0.0) - 3.0).abs() < 1e-10);
+        assert!((line.f(1.0) - 5.0).abs() < 1e-10);
+    }
+}
