@@ -1,5 +1,6 @@
 use electronics_sim::{
-    Capacitance, Current, CurrentModeConverter, Inductance, Resistance, Time, Voltage, math::Func,
+    Capacitance, Current, CurrentConduction, CurrentModeConverter, Inductance, Resistance, Time,
+    Voltage, math::Func,
 };
 use full_control::{
     buck_boost::{BuckBoostTransferFunction, BuckBoostWeights, Mode},
@@ -330,6 +331,7 @@ fn main() {
         tau_dac: electronics_sim::Parameters::bw_to_tau(BW_DAC),
         t_prop_delay: Time(T_COMPARATOR_DELAY),
         t_dac_sample: Time(1.0 / 15e6),
+        current_conduction: CurrentConduction::Synchronous,
     };
     let mut sim = CurrentModeConverter::new(parameters, Mode::BuckBoost);
 

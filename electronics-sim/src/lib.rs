@@ -84,6 +84,35 @@ impl MyThing {
     }
 }
 
+/// Controls whether the inductor current is allowed to go negative during the OFF phase.
+///
+/// In a real converter this depends on the rectifier configuration:
+///
+/// - With **MOSFETs driven by the MCU** (synchronous rectification) there is nothing
+///   stopping reverse current: when the inductor current reaches zero it keeps
+///   ramping negative, flowing back through the low-side switch into the source.
+///
+/// - With a **diode** (or a synchronous converter whose firmware turns off the low-side
+///   switch the moment current hits zero) reverse current is blocked.  The circuit
+///   enters discontinuous conduction mode (DCM): the inductor current coasts at zero
+///   for the remainder of the switching period (the "dead time"), and only the
+///   output capacitor — draining at the load rate — determines the output voltage
+///   during that interval.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum CurrentConduction {
+    /// Both switches are driven by the MCU throughout the full switching period.
+    /// The inductor current **can go negative** — energy flows back into the source.
+    /// Use this for 4-switch non-inverting buck-boost and other fully-synchronous
+    /// topologies where the firmware does not implement a zero-current interlock.
+    Synchronous,
+
+    /// A diode (or dead-time-controlled synchronous switch) blocks reverse current.
+    /// When the inductor current reaches zero during the OFF phase the switch opens.
+    /// The remaining dead time passes with **zero inductor current**; the output cap
+    /// drains at the load rate only.  This gives physically accurate DCM behaviour.
+    Diode,
+}
+
 #[derive(Copy, Clone)]
 pub struct Parameters {
     pub period: Time,
@@ -148,6 +177,9 @@ pub struct Parameters {
     /// seconds and held constant between updates (zero-order hold).  The effective
     /// trip threshold advances in discrete steps rather than as a smooth ramp.
     pub t_dac_sample: Time,
+
+    /// Whether reverse inductor current is permitted.  See [`CurrentConduction`].
+    pub current_conduction: CurrentConduction,
 }
 
 impl Parameters {
@@ -352,8 +384,23 @@ impl CurrentModeConverter {
                     self.parameters.r_series,
                 );
                 let i_final = Current(i_off_func.f(t_off.0));
-
                 let q_off = i_off_func.integral(0.0).f(t_off.0);
+
+                // DCM: if a diode (or dead-time control) prevents reverse current,
+                // the inductor stops conducting at t_zero.  Only the charge delivered
+                // up to that point enters the cap; the rest of the period is dead time
+                // during which the cap drains at the load rate only.
+                // q_out_off spans the full t_off regardless — the load draws current
+                // throughout whether or not the inductor is conducting.
+                let (i_final, q_off) = match self.parameters.current_conduction {
+                    CurrentConduction::Synchronous => (i_final, q_off),
+                    CurrentConduction::Diode if i_final.0 < 0.0 && i_max.0 > 0.0 => {
+                        let t_zero = bisect_zero(|t| i_off_func.f(t), 0.0, t_off.0);
+                        (Current(0.0), i_off_func.integral(0.0).f(t_zero))
+                    }
+                    CurrentConduction::Diode => (i_final, q_off),
+                };
+
                 let q_out_off = load_current.0 * t_off.0;
                 self.v_out = v_out_at_off + Voltage((q_off - q_out_off) / self.parameters.c_out.0);
 
@@ -464,7 +511,23 @@ impl CurrentModeConverter {
                 );
                 let i_final = Current(i_off_func.f(t_off.0));
 
-                let q_in = i_off_func.integral(0.0).f(t_off.0);
+                // DCM: if a diode (or dead-time control) prevents reverse current,
+                // the inductor stops conducting at t_zero.  Only the charge delivered
+                // up to that point enters the cap; the rest of the period is dead time
+                // during which the cap drains at the load rate only.
+                // q_out_off spans the full t_off regardless — the load draws current
+                // throughout whether or not the inductor is conducting.
+                let (i_final, q_in) = {
+                    let q_in_full = i_off_func.integral(0.0).f(t_off.0);
+                    match self.parameters.current_conduction {
+                        CurrentConduction::Synchronous => (i_final, q_in_full),
+                        CurrentConduction::Diode if i_final.0 < 0.0 && i_max.0 > 0.0 => {
+                            let t_zero = bisect_zero(|t| i_off_func.f(t), 0.0, t_off.0);
+                            (Current(0.0), i_off_func.integral(0.0).f(t_zero))
+                        }
+                        CurrentConduction::Diode => (i_final, q_in_full),
+                    }
+                };
                 let q_out_off = load_current.0 * t_off.0;
                 self.v_out = v_out_at_off + Voltage((q_in - q_out_off) / self.parameters.c_out.0);
 
@@ -566,6 +629,22 @@ impl CurrentModeConverter {
                 Voltage((1.0 - f64::exp(-t_recharge.0 / tau.0)) * (v_source.0 - self.v_in_cap.0));
         }
     }
+}
+
+/// Find where `f` crosses zero from positive to negative in `[a, b]`.
+///
+/// Assumes `f(a) ≥ 0` and `f(b) ≤ 0`.  50 iterations give sub-femtosecond
+/// resolution on a nanosecond-scale switching period.
+fn bisect_zero(mut f: impl FnMut(f64) -> f64, mut a: f64, mut b: f64) -> f64 {
+    for _ in 0..50 {
+        let mid = (a + b) * 0.5;
+        if f(mid) > 0.0 {
+            a = mid;
+        } else {
+            b = mid;
+        }
+    }
+    (a + b) * 0.5
 }
 
 /// Find the ON-phase trip time when current-sense and/or slope-compensation
@@ -836,6 +915,7 @@ mod tests {
             tau_dac: Time(0.0),
             t_prop_delay: Time(0.0),
             t_dac_sample: Time(0.0),
+            current_conduction: CurrentConduction::Synchronous,
         };
         let mut sim = CurrentModeConverter::new(params, Topology::Buck);
 
@@ -861,6 +941,7 @@ mod tests {
             tau_dac: Time(0.0),
             t_prop_delay: Time(0.0),
             t_dac_sample: Time(0.0),
+            current_conduction: CurrentConduction::Synchronous,
         };
         let mut sim = CurrentModeConverter::new(params, Topology::Buck);
 

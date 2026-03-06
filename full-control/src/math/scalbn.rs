@@ -1,0 +1,87 @@
+use super::{from_parts, EXP_BIAS, SIG_BITS};
+
+/// Scale the exponent.
+///
+/// From N3220:
+///
+/// > The scalbn and scalbln functions compute `x * b^n`, where `b = FLT_RADIX` if the return type
+/// > of the function is a standard floating type, or `b = 10` if the return type of the function
+/// > is a decimal floating type. A range error occurs for some finite x, depending on n.
+/// >
+/// > [...]
+/// >
+/// > * `scalbn(±0, n)` returns `±0`.
+/// > * `scalbn(x, 0)` returns `x`.
+/// > * `scalbn(±∞, n)` returns `±∞`.
+/// >
+/// > If the calculation does not overflow or underflow, the returned value is exact and
+/// > independent of the current rounding direction mode.
+#[inline]
+pub const fn scalbn(mut x: f64, mut n: i32) -> f64 {
+    let zero = 0;
+
+    // Bits including the implicit bit
+    let sig_total_bits = SIG_BITS + 1;
+
+    // Maximum and minimum values when biased
+    let exp_max = f64::MAX_EXP;
+    let exp_min = f64::MIN_EXP;
+
+    // 2 ^ Emax, maximum positive with null significand (0x1p1023 for f64)
+    let f_exp_max = from_parts(false, EXP_BIAS << 1, zero);
+
+    // 2 ^ Emin, minimum positive normal with null significand (0x1p-1022 for f64)
+    let f_exp_min = from_parts(false, 1, zero);
+
+    // 2 ^ sig_total_bits, moltiplier to normalize subnormals (0x1p53 for f64)
+    let f_pow_subnorm = from_parts(false, sig_total_bits + EXP_BIAS, zero);
+
+    /*
+     * The goal is to multiply `x` by a scale factor that applies `n`. However, there are cases
+     * where `2^n` is not representable by `F` but the result should be, e.g. `x = 2^Emin` with
+     * `n = -EMin + 2` (one out of range of 2^Emax). To get around this, reduce the magnitude of
+     * the final scale operation by prescaling by the max/min power representable by `F`.
+     */
+
+    if n > exp_max {
+        // Worse case positive `n`: `x`  is the minimum subnormal value, the result is `F::MAX`.
+        // This can be reached by three scaling multiplications (two here and one final).
+        debug_assert!(-exp_min + SIG_BITS as i32 + exp_max <= exp_max * 3);
+
+        x *= f_exp_max;
+        n -= exp_max;
+        if n > exp_max {
+            x *= f_exp_max;
+            n -= exp_max;
+            if n > exp_max {
+                n = exp_max;
+            }
+        }
+    } else if n < exp_min {
+        // When scaling toward 0, the prescaling is limited to a value that does not allow `x` to
+        // go subnormal. This avoids double rounding.
+
+        // `mul` s.t. `!(x * mul).is_subnormal() ∀ x`
+        let mul = f_exp_min * f_pow_subnorm;
+        let add = -exp_min - sig_total_bits as i32;
+
+        // Worse case negative `n`: `x`  is the maximum positive value, the result is `F::MIN`.
+        // This must be reachable by three scaling multiplications (two here and one final).
+        debug_assert!(-exp_min + SIG_BITS as i32 + exp_max <= add * 2 + -exp_min);
+
+        x *= mul;
+        n += add;
+
+        if n < exp_min {
+            x *= mul;
+            n += add;
+
+            if n < exp_min {
+                n = exp_min;
+            }
+        }
+    }
+
+    let scale = from_parts(false, (EXP_BIAS as i32 + n) as u32, zero);
+    x * scale
+}

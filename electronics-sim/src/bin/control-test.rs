@@ -1,6 +1,6 @@
 use electronics_sim::{
-    Capacitance, Current, CurrentModeConverter, Inductance, Parameters as SimParameters, Resistance,
-    Time, Voltage,
+    Capacitance, Current, CurrentConduction, CurrentModeConverter, Inductance,
+    Parameters as SimParameters, Resistance, Time, Voltage,
 };
 use full_control::{
     buck_boost::Mode,
@@ -8,10 +8,9 @@ use full_control::{
         DacSettings, Parameters, PhaseMargin, Topology as ControlTopology, TransferFunction,
         TwoPoleTwoZeroParams,
     },
-    fmac::FmacIir,
 };
 
-// ── Physical circuit constants (same as control-test.rs) ────────────────────
+// ── Physical circuit constants (same as buck-boost-test.rs) ─────────────────
 const F_SW: f64 = 500e3; // 500 kHz
 const T_PERIOD: Time = Time(1.0 / F_SW);
 const V_IN: Voltage = Voltage(24.0);
@@ -37,6 +36,7 @@ const LSB: f64 = V_REF / ADC_MAX; // ~0.806 mV per code
 const R_FB_HI: f64 = 47_000.0; // 47 kΩ
 const R_FB_LO: f64 = 10_000.0; // 10 kΩ
 const DIVIDER_RATIO: f64 = R_FB_LO / (R_FB_HI + R_FB_LO); // ≈ 0.1754
+// 13.5 V × 0.1754 ≈ 2.37 V → ADC code ≈ 2939
 
 // ── Controller target and DAC limits in codes ───────────────────────────────
 const TARGET_CODE: f64 = V_TARGET.0 * DIVIDER_RATIO / LSB;
@@ -76,39 +76,26 @@ const WEIGHTS_CODE: TwoPoleTwoZeroParams<f32> = TwoPoleTwoZeroParams {
     b2: (WEIGHTS_PHYS.b2 as f64 / DIVIDER_RATIO) as f32,
 };
 
-// FMAC gain exponent: smallest R such that all |coeff| / 2^R < 1.0 (fits q1.15).
-// Derived automatically from WEIGHTS_CODE — updates if circuit constants change.
-const FMAC_R: u32 = WEIGHTS_CODE.min_fmac_r();
-
 // Slope compensation in A/s for the simulator
 const SLOPE_AMP_PER_SEC: f64 = TF_DAC.1.dac_slope / CS_GAIN;
 
 #[cfg_attr(not(feature = "text-log"), allow(unused_variables))]
 fn main() {
-    // ── FMAC coefficient setup ─────────────────────────────────────────────
-    // Convert WEIGHTS_CODE to q1.15 hardware register values.
-    // I/O normalization: codes × 2^R → q1.15;  q1.15 → codes by >> R.
-    let coeffs = WEIGHTS_CODE.fmac_coeffs(FMAC_R);
-    let b = [coeffs[0], coeffs[1], coeffs[2]];
-    let a = [coeffs[3], coeffs[4]];
-    let y_min: i16 = 0;
-    let y_max: i16 = (DAC_MAX_CODE as i32 * (1i32 << FMAC_R)) as i16;
-
     // ── Controller design summary ──────────────────────────────────────────
     let divisor = CTRL_PARAMS.crossover_divisor(ControlTopology::Buck, V_IN.0);
-    println!("Control-test-FMAC: Pure Buck, V_in={:.0}V → V_out={:.1}V", V_IN.0, V_TARGET.0);
+    println!("Control-test: Pure Buck, V_in={:.0}V → V_out={:.1}V", V_IN.0, V_TARGET.0);
     println!("  f_x        = {:.0} Hz (divisor={:.1})", F_SW / divisor, divisor);
     println!(
-        "  Code-domain: b0={:.4}  b1={:.4}  b2={:.4}  a1={:.4}  a2={:.4}",
-        WEIGHTS_CODE.b0, WEIGHTS_CODE.b1, WEIGHTS_CODE.b2, WEIGHTS_CODE.a1, WEIGHTS_CODE.a2,
+        "  Physical   : b0={:.4}  b1={:.4}  b2={:.4}  a1={:.4}  a2={:.4}",
+        WEIGHTS_PHYS.b0, WEIGHTS_PHYS.b1, WEIGHTS_PHYS.b2, WEIGHTS_PHYS.a1, WEIGHTS_PHYS.a2,
     );
     println!(
-        "  FMAC R={}    b=[{:#06x},{:#06x},{:#06x}]  a=[{:#06x},{:#06x}]",
-        FMAC_R, b[0] as u16, b[1] as u16, b[2] as u16, a[0] as u16, a[1] as u16,
+        "  Code-domain: b0={:.4}  b1={:.4}  b2={:.4}",
+        WEIGHTS_CODE.b0, WEIGHTS_CODE.b1, WEIGHTS_CODE.b2,
     );
-    println!("  I/O shift  : codes × {} → q1.15;  y_bits >> {} → codes", 1u32 << FMAC_R, FMAC_R);
-    println!("  Target code: {:.0}  (q1.15 = {:#06x})", TARGET_CODE, target_q115());
-    println!("  DAC max    : {:.0}  (q1.15 y_max = {:#06x})", DAC_MAX_CODE, y_max as u16);
+    println!("  Divider    : {:.4} (R_hi={:.0}Ω  R_lo={:.0}Ω)", DIVIDER_RATIO, R_FB_HI, R_FB_LO);
+    println!("  Target code: {:.0}  (1 LSB ≈ {:.1} mV at output)", TARGET_CODE, LSB / DIVIDER_RATIO * 1e3);
+    println!("  DAC max    : {:.0}  (= {:.1} A)", DAC_MAX_CODE, MAX_CURRENT.0);
     println!("  Slope      : {:.0} A/s", SLOPE_AMP_PER_SEC);
     println!();
 
@@ -128,11 +115,12 @@ fn main() {
         tau_dac: Time(0.0),
         t_prop_delay: Time(0.0),
         t_dac_sample: Time(0.0),
+        current_conduction: CurrentConduction::Diode,
     };
     let mut sim = CurrentModeConverter::new(sim_params, Mode::Buck);
 
-    // FMAC controller — operates entirely in q1.15
-    let mut ctrl = FmacIir::new(b, a, FMAC_R, y_min, y_max);
+    // Controller operating on ADC/DAC codes
+    let mut ctrl = WEIGHTS_CODE.to_controller(0.0_f32, DAC_MAX_CODE as f32);
 
     let mut time = Time(0.0);
 
@@ -148,15 +136,13 @@ fn main() {
     // ── Soft-start ─────────────────────────────────────────────────────────
     let soft_cycles = 3000_usize;
     for i in 0..soft_cycles {
-        // Ramp target from 0 to TARGET_CODE in q1.15
-        let soft_tgt_q115 =
-            ((TARGET_CODE * (i + 1) as f64 / soft_cycles as f64) as i32 * (1i32 << FMAC_R))
-                as i16;
+        let soft_target = TARGET_CODE as f32 * (i + 1) as f32 / soft_cycles as f32;
 
         let adc_code = adc_read(sim.v_out);
-        let x0 = q115_error(soft_tgt_q115, adc_code);
-        let y_bits = ctrl.update(x0);
-        let dac_code = q115_to_dac(y_bits);
+        let error = soft_target - adc_code as f32;
+        let output = ctrl.update(error);
+
+        let dac_code = (output.round() as i32).clamp(0, DAC_MAX_CODE as i32) as u16;
         let trip = dac_to_trip(dac_code);
 
         let (t_on, _i_max) = sim.tick(V_IN, trip, |v| Current(v.0 / R_LOAD));
@@ -176,9 +162,10 @@ fn main() {
     let steady_cycles = 5000_usize;
     for i in 0..steady_cycles {
         let adc_code = adc_read(sim.v_out);
-        let x0 = q115_error(target_q115(), adc_code);
-        let y_bits = ctrl.update(x0);
-        let dac_code = q115_to_dac(y_bits);
+        let error = TARGET_CODE as f32 - adc_code as f32;
+        let output = ctrl.update(error);
+
+        let dac_code = (output.round() as i32).clamp(0, DAC_MAX_CODE as i32) as u16;
         let trip = dac_to_trip(dac_code);
 
         let (t_on, _i_max) = sim.tick(V_IN, trip, |v| Current(v.0 / R_LOAD));
@@ -199,9 +186,10 @@ fn main() {
     let load_cycles = 5000_usize;
     for i in 0..load_cycles {
         let adc_code = adc_read(sim.v_out);
-        let x0 = q115_error(target_q115(), adc_code);
-        let y_bits = ctrl.update(x0);
-        let dac_code = q115_to_dac(y_bits);
+        let error = TARGET_CODE as f32 - adc_code as f32;
+        let output = ctrl.update(error);
+
+        let dac_code = (output.round() as i32).clamp(0, DAC_MAX_CODE as i32) as u16;
         let trip = dac_to_trip(dac_code);
 
         let (t_on, _i_max) = sim.tick(V_IN, trip, |v| Current(v.0 / load_r));
@@ -215,30 +203,10 @@ fn main() {
     }
 }
 
-/// Target ADC code in q1.15 (= TARGET_CODE × 2^FMAC_R).
-#[inline(always)]
-fn target_q115() -> i16 {
-    (TARGET_CODE as i32 * (1i32 << FMAC_R)) as i16
-}
-
 /// Model 12-bit ADC read: output voltage through resistor divider, quantized.
 fn adc_read(v_out: Voltage) -> u16 {
     let v_adc = v_out.0 * DIVIDER_RATIO;
     (v_adc / LSB).round().clamp(0.0, ADC_MAX) as u16
-}
-
-/// Compute q1.15 error: target_q115 − adc_code × 2^R, clamped to i16.
-#[inline(always)]
-fn q115_error(target_q115: i16, adc_code: u16) -> i16 {
-    let adc_q115 = (adc_code as i32) << FMAC_R;
-    (target_q115 as i32 - adc_q115).clamp(i16::MIN as i32, i16::MAX as i32) as i16
-}
-
-/// Convert q1.15 FMAC output to a 12-bit DAC code (codes = y_bits >> R, rounded).
-#[inline(always)]
-fn q115_to_dac(y_bits: i16) -> u16 {
-    let rounding = 1i32 << (FMAC_R - 1);
-    ((y_bits as i32 + rounding) >> FMAC_R).clamp(0, DAC_MAX_CODE as i32) as u16
 }
 
 /// Convert a 12-bit DAC code to a physical trip current for the simulator.

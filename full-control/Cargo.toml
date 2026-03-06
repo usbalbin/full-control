@@ -1,0 +1,12 @@
+[package]
+name = "full-control"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+defmt = { version = "1.0.1", optional = true }
+fixed = { version = "1.30.0", default-features = false }
+
+[features]
+defmt = ["dep:defmt"]
+std = []

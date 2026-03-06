@@ -1,6 +1,7 @@
 
 use electronics_sim::{
-    Capacitance, Current, CurrentModeConverter, Inductance, Parameters, Resistance, Time, Topology, Voltage
+    Capacitance, Current, CurrentConduction, CurrentModeConverter, Inductance, Parameters,
+    Resistance, Time, Topology, Voltage,
 };
 
 fn main() {
@@ -26,6 +27,7 @@ fn main() {
         tau_dac: Time(0.0),
         t_prop_delay: Time(0.0),
         t_dac_sample: Time(0.0),
+        current_conduction: CurrentConduction::Synchronous,
     };
     let mut sim = CurrentModeConverter::new(params, Topology::Buck);
 

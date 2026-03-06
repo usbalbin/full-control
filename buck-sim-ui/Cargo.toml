@@ -1,0 +1,29 @@
+[package]
+name = "buck-sim-ui"
+version = "0.1.0"
+edition = "2024"
+
+# cdylib is needed so trunk can build a .wasm file; rlib allows the bin to use the lib.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "buck-sim-ui"
+path = "src/main.rs"
+
+[features]
+text-log = []
+
+[dependencies]
+electronics-sim = { path = "../electronics-sim", default-features = false }
+full-control    = { path = "../full-control",    default-features = false }
+
+# egui + eframe + egui_plot must use the same major.minor version.
+eframe    = { version = "0.33", features = ["glow"] }
+egui      = "0.33"
+egui_plot = "0.34"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen         = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Document", "HtmlCanvasElement", "Window"] }
