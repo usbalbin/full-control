@@ -1,0 +1,28 @@
+[package]
+name = "kwr103-ui"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "kwr103-ui"
+path = "src/main.rs"
+
+[features]
+default = ["tcp"]
+tcp = []
+
+[dependencies]
+kwr103 = "0.1"
+
+# egui + eframe + egui_plot must use the same major.minor version.
+eframe = { version = "0.33", features = ["glow"] }
+egui = "0.33"
+egui_plot = "0.33"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Document", "HtmlCanvasElement", "Window"] }
