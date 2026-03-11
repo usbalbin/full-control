@@ -291,6 +291,39 @@ impl VoltageSequence {
         let current = self.steps[self.current_step];
         (self.step_timer as f32 / current.duration_ms as f32).min(1.0)
     }
+
+    /// Get the current step to apply to power supply, returns None if not playing or no steps
+    pub fn get_current_active_step(&self) -> Option<SequenceStep> {
+        if self.steps.is_empty() || self.step_timer == 0 {
+            return None;
+        }
+        Some(self.steps[self.current_step])
+    }
+
+    /// Check if sequence is actively playing (has started at least one step)
+    pub fn is_playing(&self) -> bool {
+        !self.steps.is_empty() && self.step_timer > 0
+    }
+}
+
+/// Apply a sequence step to the power supply
+pub fn apply_sequence_step(supply: &mut RealPowerSupply, step: SequenceStep) -> Result<(), String> {
+    if let Err(e) = supply.set_voltage(step.voltage) {
+        eprintln!("Failed to set voltage: {}", e);
+    }
+    if let Err(e) = supply.set_current(step.current_limit) {
+        eprintln!("Failed to set current: {}", e);
+    }
+    if step.output_on {
+        if let Err(e) = supply.set_output(true) {
+            eprintln!("Failed to turn on output: {}", e);
+        }
+    } else {
+        if let Err(e) = supply.set_output(false) {
+            eprintln!("Failed to turn off output: {}", e);
+        }
+    }
+    Ok(())
 }
 
 impl Default for VoltageSequence {

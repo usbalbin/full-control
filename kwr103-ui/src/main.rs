@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use eframe::NativeOptions;
 
-use kwr103_ui::{PowerSupplyUi, ConnectionType, PowerSupplyControl};
+use kwr103_ui::{PowerSupplyUi, ConnectionType, PowerSupplyControl, apply_sequence_step};
 
 // Desktop app needs interior mutability since Kwr103 is !Send + !Sync
 type SupplyRef = Rc<RefCell<Option<kwr103_ui::RealPowerSupply>>>;
@@ -17,6 +17,9 @@ struct PowerSupplyApp {
     last_state: Option<kwr103_ui::PowerSupplyState>,
     refresh_interval: u32,
     refresh_counter: u32,
+    // Sequence playback state
+    sequence_playing: bool,
+    sequence_last_update: std::time::Instant,
 }
 
 impl PowerSupplyApp {
@@ -29,6 +32,8 @@ impl PowerSupplyApp {
             last_state: None,
             refresh_interval: 100, // ms
             refresh_counter: 0,
+            sequence_playing: false,
+            sequence_last_update: std::time::Instant::now(),
         }
     }
 
@@ -135,12 +140,12 @@ impl eframe::App for PowerSupplyApp {
                     let btn_text = if self.ui_state.output_enabled { "Turn OFF" } else { "Turn ON" };
                     if ui.button(btn_text).clicked() {
                         self.ui_state.output_enabled = !self.ui_state.output_enabled;
-                        if let Some(mut s) = self.supply.borrow_mut().as_mut() {
+                        if let Some(s) = self.supply.borrow_mut().as_mut() {
                             let _ = s.set_output(self.ui_state.output_enabled);
                         }
                     }
                     if ui.button("Apply Settings").clicked() {
-                        if let Some(mut s) = self.supply.borrow_mut().as_mut() {
+                        if let Some(s) = self.supply.borrow_mut().as_mut() {
                             let _ = s.set_voltage(self.ui_state.target_voltage);
                             let _ = s.set_current(self.ui_state.target_current);
                         }
@@ -156,11 +161,32 @@ impl eframe::App for PowerSupplyApp {
             });
         });
 
+        // ── Sequence playback ───────────────────────────────────────────────
+        if self.sequence_playing && !self.ui_state.sequence.is_empty() {
+            let elapsed = self.sequence_last_update.elapsed();
+            self.sequence_last_update = std::time::Instant::now();
+
+            // Convert to milliseconds (handle overflow)
+            let delta_ms = elapsed.as_millis() as u32;
+
+            if let Some(next_step) = self.ui_state.sequence.update(delta_ms) {
+                // Apply the step to power supply
+                if let Some(s) = self.supply.borrow_mut().as_mut() {
+                    let _ = apply_sequence_step(s, next_step);
+                }
+            }
+
+            // Check if sequence completed (wrapped around)
+            if !self.ui_state.sequence.is_playing() {
+                self.sequence_playing = false;
+            }
+        }
+
         // ── Auto-refresh state ─────────────────────────────────────────────
         static REFRESH_TICK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let tick = REFRESH_TICK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if tick % 10 == 0 {
-            if let Some(mut s) = self.supply.borrow_mut().as_mut() {
+            if let Some(s) = self.supply.borrow_mut().as_mut() {
                 let _ = s.refresh();
                 self.last_state = s.get_state();
             }
@@ -182,9 +208,17 @@ impl PowerSupplyApp {
             }
             if ui.button("Play").clicked() {
                 self.ui_state.sequence.reset();
+                self.sequence_playing = true;
+                self.sequence_last_update = std::time::Instant::now();
             }
             if ui.button("Stop").clicked() {
                 self.ui_state.sequence.reset();
+                self.sequence_playing = false;
+            }
+
+            // Show playing status
+            if self.sequence_playing && !self.ui_state.sequence.is_empty() {
+                ui.label("▶ Playing");
             }
         });
 
