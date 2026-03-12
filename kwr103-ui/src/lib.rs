@@ -3,6 +3,9 @@
 //! This library provides shared logic for controlling a KWR103 programmable
 //! power supply via USB or Ethernet.
 
+#[cfg(target_arch = "wasm32")]
+pub mod web;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
@@ -67,10 +70,11 @@ impl AtomicF32 {
 #[derive(Clone)]
 pub struct MockPowerSupply {
     state: Arc<PowerSupplyState>,
-    config: Arc<PowerSupplyConfig>,
     output_on: Arc<AtomicBool>,
     target_voltage: Arc<AtomicF32>,
     target_current: Arc<AtomicF32>,
+    /// Simulated load resistance in ohms (0 = short / current-limited)
+    pub load_resistance: f32,
 }
 
 impl MockPowerSupply {
@@ -81,10 +85,10 @@ impl MockPowerSupply {
                 voltage: 0.0,
                 current: 0.0,
             }),
-            config: Arc::new(PowerSupplyConfig::default()),
             output_on: Arc::new(AtomicBool::new(false)),
             target_voltage: Arc::new(AtomicF32::new(0.0)),
             target_current: Arc::new(AtomicF32::new(0.0)),
+            load_resistance: 10.0,
         }
     }
 }
@@ -116,18 +120,29 @@ impl PowerSupplyControl for MockPowerSupply {
     }
 
     fn refresh(&mut self) -> Result<(), String> {
-        // Update state based on target values
         let target_v = self.target_voltage.load(Ordering::SeqCst);
         let target_c = self.target_current.load(Ordering::SeqCst);
         let output = self.output_on.load(Ordering::SeqCst);
 
-        let new_state = PowerSupplyState {
-            output_on: output,
-            voltage: if output { target_v } else { 0.0 },
-            current: if output && target_v > 0.0 { target_c } else { 0.0 },
+        let (voltage, current) = if output {
+            let load_current = if self.load_resistance > 0.0 {
+                target_v / self.load_resistance
+            } else {
+                target_c // short circuit → current limited
+            };
+            let actual_current = load_current.min(target_c);
+            // Voltage sags to V = I * R when current-limited
+            let actual_voltage = if self.load_resistance > 0.0 {
+                actual_current * self.load_resistance
+            } else {
+                0.0
+            };
+            (actual_voltage, actual_current)
+        } else {
+            (0.0, 0.0)
         };
 
-        self.state = Arc::new(new_state);
+        self.state = Arc::new(PowerSupplyState { output_on: output, voltage, current });
         Ok(())
     }
 }
@@ -141,13 +156,13 @@ impl RealPowerSupply {
     pub fn new(connection: ConnectionType) -> Result<Self, String> {
         let device = match connection {
             ConnectionType::Usb => {
-                use kwr103::{UsbConnection, Transport};
+                use kwr103::UsbConnection;
                 let conn = UsbConnection::new("/dev/ttyACM0", 115200, None)
                     .map_err(|e| format!("Failed to open USB: {}", e))?;
                 kwr103::Kwr103::from(conn)
             }
             ConnectionType::Eth { ip } => {
-                use kwr103::{EthConnection, Transport};
+                use kwr103::EthConnection;
                 let conn = EthConnection::new(&ip)
                     .map_err(|e| format!("Failed to connect to {}: {}", ip, e))?;
                 kwr103::Kwr103::from(conn)
@@ -233,8 +248,14 @@ impl VoltageSequence {
         let current = self.steps[self.current_step];
 
         if self.step_timer >= current.duration_ms {
-            // Move to next step
-            self.current_step = (self.current_step + 1) % self.steps.len();
+            let next = self.current_step + 1;
+            if next >= self.steps.len() {
+                // Sequence finished - reset for re-use
+                self.current_step = 0;
+                self.step_timer = 0;
+                return None;
+            }
+            self.current_step = next;
             self.step_timer = 0;
             Some(self.steps[self.current_step])
         } else {
@@ -280,10 +301,6 @@ impl VoltageSequence {
         Some(&self.steps[self.current_step])
     }
 
-    pub(crate) fn set_current_step(&mut self, step: usize) {
-        self.current_step = step;
-    }
-
     pub fn get_playback_progress(&self) -> f32 {
         if self.steps.is_empty() || self.step_timer == 0 {
             return 0.0;
@@ -300,14 +317,13 @@ impl VoltageSequence {
         Some(self.steps[self.current_step])
     }
 
-    /// Check if sequence is actively playing (has started at least one step)
-    pub fn is_playing(&self) -> bool {
-        !self.steps.is_empty() && self.step_timer > 0
-    }
 }
 
-/// Apply a sequence step to the power supply
-pub fn apply_sequence_step(supply: &mut RealPowerSupply, step: SequenceStep) -> Result<(), String> {
+/// Apply a sequence step to the power supply (works with both RealPowerSupply and MockPowerSupply)
+pub fn apply_sequence_step<S>(supply: &mut S, step: SequenceStep) -> Result<(), String>
+where
+    S: PowerSupplyControl + ?Sized,
+{
     if let Err(e) = supply.set_voltage(step.voltage) {
         eprintln!("Failed to set voltage: {}", e);
     }
@@ -357,13 +373,108 @@ impl PowerSupplyUi {
         self.target_current = self.target_current.min(config.max_current);
     }
 
-    pub(crate) fn get_sequence_mut(&mut self) -> &mut VoltageSequence {
-        &mut self.sequence
-    }
 }
+
 
 impl Default for PowerSupplyUi {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Whether the supply is regulating voltage (CV) or current (CC).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum LimitMode {
+    /// Constant Voltage – load current is below the limit
+    CV,
+    /// Constant Current – output is current-limited; voltage has sagged
+    CC,
+}
+
+/// Infer CC/CV mode by comparing measured current against the current setpoint.
+/// Returns `None` when the output is off (mode is meaningless).
+pub fn infer_limit_mode(
+    state: &PowerSupplyState,
+    target_current: f32,
+) -> Option<LimitMode> {
+    if !state.output_on {
+        return None;
+    }
+    // Allow 2 % headroom to avoid flickering near the boundary
+    if target_current > 0.0 && state.current >= target_current * 0.98 {
+        Some(LimitMode::CC)
+    } else {
+        Some(LimitMode::CV)
+    }
+}
+
+/// Rolling buffer of (time_s, voltage_V, current_A) samples
+pub struct MeasurementHistory {
+    samples: std::collections::VecDeque<(f64, f32, f32)>,
+    max_age_s: f64,
+}
+
+impl MeasurementHistory {
+    pub fn new(max_age_s: f64) -> Self {
+        Self {
+            samples: std::collections::VecDeque::new(),
+            max_age_s,
+        }
+    }
+
+    pub fn push(&mut self, time_s: f64, voltage: f32, current: f32) {
+        self.samples.push_back((time_s, voltage, current));
+        let cutoff = time_s - self.max_age_s;
+        while self.samples.front().map_or(false, |s| s.0 < cutoff) {
+            self.samples.pop_front();
+        }
+    }
+
+    pub fn voltage_points(&self) -> Vec<[f64; 2]> {
+        self.samples.iter().map(|&(t, v, _)| [t, v as f64]).collect()
+    }
+
+    pub fn current_points(&self) -> Vec<[f64; 2]> {
+        self.samples.iter().map(|&(t, _, c)| [t, c as f64]).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+}
+
+/// Render a two-panel voltage/current plot from a MeasurementHistory.
+pub fn show_measurement_plot(history: &MeasurementHistory, ui: &mut egui::Ui) {
+    use egui_plot::{Line, Plot};
+
+    let voltage_pts = history.voltage_points();
+    let current_pts = history.current_points();
+
+    Plot::new("voltage_plot")
+        .height(120.0)
+        .y_axis_label("Voltage [V]")
+        .include_y(0.0)
+        .allow_zoom(false)
+        .allow_drag(false)
+        .show(ui, |plot_ui| {
+            plot_ui.line(
+                Line::new("Voltage", voltage_pts)
+                    .color(egui::Color32::YELLOW)
+                    .width(1.5),
+            );
+        });
+
+    Plot::new("current_plot")
+        .height(80.0)
+        .y_axis_label("Current [A]")
+        .include_y(0.0)
+        .allow_zoom(false)
+        .allow_drag(false)
+        .show(ui, |plot_ui| {
+            plot_ui.line(
+                Line::new("Current", current_pts)
+                    .color(egui::Color32::from_rgb(100, 200, 255))
+                    .width(1.5),
+            );
+        });
 }

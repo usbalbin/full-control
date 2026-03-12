@@ -1,0 +1,10 @@
+[build]
+# Target for the build (wasm or not)
+target = "index.html"
+dist_dir = "./dist"
+release = true
+no_default_features = true
+
+[build.wasm]
+# Additional rustflags for wasm builds
+rustflags = ["--cfg", "web_sys_unstable_apis"]

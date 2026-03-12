@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>KWR103 Power Supply Control</title>
+    <!-- Tell trunk to build the cdylib, not the native binary -->
+    <link data-trunk rel="rust" data-crate-type='["cdylib"]' data-name="kwr103-ui" data-no-default-features />
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        width: 100%;
+        height: 100%;
+        background: #1a1a1a;
+      }
+      canvas {
+        width: 100%;
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- trunk replaces this with the generated JS + WASM loader -->
+    <canvas id="kwr103_canvas"></canvas>
+  </body>
+</html>

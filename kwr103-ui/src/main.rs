@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use eframe::NativeOptions;
 
-use kwr103_ui::{PowerSupplyUi, ConnectionType, PowerSupplyControl, apply_sequence_step};
+use kwr103_ui::{PowerSupplyUi, ConnectionType, PowerSupplyControl, MeasurementHistory, LimitMode, infer_limit_mode, apply_sequence_step};
 
 // Desktop app needs interior mutability since Kwr103 is !Send + !Sync
 type SupplyRef = Rc<RefCell<Option<kwr103_ui::RealPowerSupply>>>;
@@ -15,10 +15,11 @@ struct PowerSupplyApp {
     connection_type: ConnectionType,
     ip_address: String,
     last_state: Option<kwr103_ui::PowerSupplyState>,
-    refresh_interval: u32,
-    refresh_counter: u32,
+    history: MeasurementHistory,
+    start_time: std::time::Instant,
     // Sequence playback state
     sequence_playing: bool,
+    sequence_repeat: bool,
     sequence_last_update: std::time::Instant,
 }
 
@@ -30,9 +31,10 @@ impl PowerSupplyApp {
             connection_type: ConnectionType::Usb,
             ip_address: "192.168.1.100".to_string(),
             last_state: None,
-            refresh_interval: 100, // ms
-            refresh_counter: 0,
+            history: MeasurementHistory::new(60.0),
+            start_time: std::time::Instant::now(),
             sequence_playing: false,
+            sequence_repeat: false,
             sequence_last_update: std::time::Instant::now(),
         }
     }
@@ -107,6 +109,16 @@ impl eframe::App for PowerSupplyApp {
                         ui.label("Output:");
                         let color = if state.output_on { egui::Color32::GREEN } else { egui::Color32::RED };
                         ui.colored_label(color, if state.output_on { "ON" } else { "OFF" });
+
+                        match infer_limit_mode(&state, self.ui_state.target_current) {
+                            Some(LimitMode::CV) => {
+                                ui.colored_label(egui::Color32::GREEN, "CV");
+                            }
+                            Some(LimitMode::CC) => {
+                                ui.colored_label(egui::Color32::from_rgb(255, 165, 0), "CC");
+                            }
+                            None => {}
+                        }
                     });
                     ui.horizontal(|ui| {
                         ui.label("Voltage: ");
@@ -120,6 +132,11 @@ impl eframe::App for PowerSupplyApp {
                     ui.label("Waiting for data...");
                 }
             });
+
+            ui.separator();
+
+            // ── Plot ────────────────────────────────────────────────────────
+            kwr103_ui::show_measurement_plot(&self.history, ui);
 
             ui.separator();
 
@@ -166,19 +183,21 @@ impl eframe::App for PowerSupplyApp {
             let elapsed = self.sequence_last_update.elapsed();
             self.sequence_last_update = std::time::Instant::now();
 
-            // Convert to milliseconds (handle overflow)
             let delta_ms = elapsed.as_millis() as u32;
 
-            if let Some(next_step) = self.ui_state.sequence.update(delta_ms) {
-                // Apply the step to power supply
-                if let Some(s) = self.supply.borrow_mut().as_mut() {
-                    let _ = apply_sequence_step(s, next_step);
+            match self.ui_state.sequence.update(delta_ms) {
+                Some(step) => {
+                    if let Some(supply) = self.supply.borrow_mut().as_mut() {
+                        let _ = apply_sequence_step(&mut *supply, step);
+                    }
                 }
-            }
-
-            // Check if sequence completed (wrapped around)
-            if !self.ui_state.sequence.is_playing() {
-                self.sequence_playing = false;
+                None => {
+                    if self.sequence_repeat {
+                        self.ui_state.sequence.reset();
+                    } else {
+                        self.sequence_playing = false;
+                    }
+                }
             }
         }
 
@@ -190,7 +209,13 @@ impl eframe::App for PowerSupplyApp {
                 let _ = s.refresh();
                 self.last_state = s.get_state();
             }
+            if let Some(state) = self.last_state {
+                let t = self.start_time.elapsed().as_secs_f64();
+                self.history.push(t, state.voltage, state.current);
+            }
         }
+
+        ctx.request_repaint_after(std::time::Duration::from_millis(10));
     }
 }
 
@@ -215,6 +240,7 @@ impl PowerSupplyApp {
                 self.ui_state.sequence.reset();
                 self.sequence_playing = false;
             }
+            ui.checkbox(&mut self.sequence_repeat, "Repeat");
 
             // Show playing status
             if self.sequence_playing && !self.ui_state.sequence.is_empty() {

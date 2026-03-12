@@ -6,13 +6,16 @@ edition = "2021"
 [lib]
 crate-type = ["cdylib", "rlib"]
 
+# Native binary - only built for non-wasm targets
 [[bin]]
 name = "kwr103-ui"
 path = "src/main.rs"
+required-features = ["native"]
 
 [features]
-default = ["tcp"]
+default = ["tcp", "native"]
 tcp = []
+native = [] # Disable this to only build WASM library
 
 [dependencies]
 kwr103 = "0.1"
@@ -20,9 +23,9 @@ kwr103 = "0.1"
 # egui + eframe + egui_plot must use the same major.minor version.
 eframe = { version = "0.33", features = ["glow"] }
 egui = "0.33"
-egui_plot = "0.33"
+egui_plot = "0.34"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Document", "HtmlCanvasElement", "Window"] }
+web-sys = { version = "0.3", features = ["Document", "HtmlCanvasElement", "Performance", "Window"] }
