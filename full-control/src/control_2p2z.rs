@@ -385,6 +385,53 @@ impl Parameters {
         self.to_transfer_function_inner(self.crossover_divisor(topology, v_in), v_in, topology)
     }
 
+    /// Compute only the DAC slope-compensation settings for a given input voltage.
+    ///
+    /// Unlike [`to_transfer_function`], this function is cheap and depends only on
+    /// `v_in` — suitable for calling from a control task after measuring the actual
+    /// bus voltage for Vin feed-forward.
+    ///
+    /// The 2P2Z coefficients produced by `to_transfer_function` do **not** need to
+    /// be recomputed when Vin changes for a **Buck** converter: `q_inv_no_pi` always
+    /// simplifies to the constant `1/π` regardless of duty cycle, so `h_dc` and
+    /// `ω_p1` depend only on the load and reactive components.  For Boost/BuckBoost
+    /// the `D'²` factor in `h_dc` and `ω_p1` does vary with Vin.
+    ///
+    /// # Runtime slope update pattern
+    ///
+    /// ```ignore
+    /// // In a 1 ms task, after measuring v_in:
+    /// let s = CTRL_PARAMS.dac_settings(v_in, Topology::Buck);
+    /// // INCDATA = ceil(|dac_slope| / LSB  ×  16 / F_HR  ×  HR_TICKS_PER_DAC_INC)
+    /// let step = ((-s.dac_slope / LSB) * 16.0 / F_HR * CR2).ceil().max(1.0) as u16;
+    /// DAC_STEP_LIVE.store(step, Ordering::Relaxed);
+    /// ```
+    pub const fn dac_settings(self, v_in: f64, topology: Topology) -> DacSettings {
+        let t_sw = 1.0 / self.f_sw;
+        let (steady_state_duty, inductor_current_up_slope) = match topology {
+            Topology::Buck => (
+                (self.v_out + self.v_diode) / v_in,
+                (v_in - self.v_out - self.v_diode) * self.current_sense_gain / self.l_inductor,
+            ),
+            Topology::Boost => (
+                1.0 - v_in / (self.v_out - self.v_diode),
+                v_in * self.current_sense_gain / self.l_inductor,
+            ),
+            Topology::BuckBoost => (
+                self.v_out / (v_in + self.v_out - self.v_diode),
+                v_in * self.current_sense_gain / self.l_inductor,
+            ),
+        };
+        let inv_steady_state_duty = 1.0 - steady_state_duty;
+        let slope_compensation_factor = (1.0 + PI / 2.0) / (PI * inv_steady_state_duty);
+        let dac_down_slope = -(slope_compensation_factor - 1.0) * inductor_current_up_slope;
+        let vpp = -dac_down_slope * t_sw;
+        DacSettings {
+            dac_slope: dac_down_slope,
+            vpp,
+        }
+    }
+
     /// Compute the transfer function for a given crossover divisor.
     /// This is the inner implementation called by both `to_transfer_function`
     /// (which passes the auto-computed divisor) and `crossover_divisor`
