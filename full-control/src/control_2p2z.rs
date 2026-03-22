@@ -154,12 +154,13 @@ impl<T: Scalar> TwoPoleTwoZero<T> {
             + self.params.b1 * self.errors[0]
             + self.params.b2 * self.errors[1];
         self.outputs.rotate_right(1);
-        self.outputs[0] = output.clamp(self.limit_min, self.limit_max);
+        let clamped = output.clamp(self.limit_min, self.limit_max);
+        self.outputs[0] = clamped;
 
         self.errors.rotate_right(1);
         self.errors[0] = error;
 
-        output
+        clamped
     }
 
     pub fn reset(&mut self) {
