@@ -37,6 +37,11 @@ pub struct BuckSimApp {
     bat_r_int_mohm: f64,    // [mΩ]  battery internal resistance
     bat_c_mf: f64,          // [mF]  battery capacitance (controls charging speed)
 
+    // ── Timing ────────────────────────────────────────────────────────────────
+    blanking_ns: f64,       // [ns]
+    adc_sample_ns: f64,     // [ns]
+    max_duty_pct: f64,      // [%]
+
     // ── Hardware profiles ─────────────────────────────────────────────────────
     mcu: McuProfile,
     mcu_preset_idx: usize,
@@ -86,6 +91,9 @@ impl Default for BuckSimApp {
             bat_v_init: defaults.bat_v_init,
             bat_r_int_mohm: defaults.bat_r_int_mohm,
             bat_c_mf: defaults.bat_c_mf,
+            blanking_ns: defaults.blanking_ns,
+            adc_sample_ns: defaults.adc_sample_ns,
+            max_duty_pct: defaults.max_duty_pct,
             mcu: defaults.mcu.clone(),
             mcu_preset_idx: 0,
             cs: defaults.cs.clone(),
@@ -128,6 +136,9 @@ impl BuckSimApp {
             bat_v_init: self.bat_v_init,
             bat_r_int_mohm: self.bat_r_int_mohm,
             bat_c_mf: self.bat_c_mf,
+            blanking_ns: self.blanking_ns,
+            adc_sample_ns: self.adc_sample_ns,
+            max_duty_pct: self.max_duty_pct,
             mcu: self.mcu.clone(),
             cs: self.cs.clone(),
             dac: self.dac.clone(),
@@ -201,6 +212,21 @@ impl eframe::App for BuckSimApp {
                     egui::Slider::new(&mut self.f_sw_khz, 50.0..=2000.0)
                         .text("f_sw [kHz]")
                         .step_by(10.0),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.blanking_ns, 0.0..=500.0)
+                        .text("Blanking [ns]")
+                        .step_by(1.0),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.adc_sample_ns, 0.0..=2000.0)
+                        .text("ADC sample [ns]")
+                        .step_by(1.0),
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.max_duty_pct, 50.0..=100.0)
+                        .text("Max duty [%]")
+                        .step_by(0.1),
                 );
 
                 ui.separator();

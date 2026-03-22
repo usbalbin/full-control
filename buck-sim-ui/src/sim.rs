@@ -139,6 +139,11 @@ pub struct SimParams {
     pub bat_r_int_mohm: f64, // Battery internal resistance [mΩ]
     pub bat_c_mf: f64,       // Battery capacitance [mF] (sets charging speed in sim)
 
+    // ── Timing ─────────────────────────────────────────────────────────────
+    pub blanking_ns: f64,       // Comparator blanking window [ns] (0 = no blanking)
+    pub adc_sample_ns: f64,     // ADC sample point [ns from period start] (0 = start of cycle)
+    pub max_duty_pct: f64,      // Maximum duty cycle [%] (100 = no limit)
+
     // ── Hardware profiles ─────────────────────────────────────────────────
     pub mcu: McuProfile,
     pub cs: CsProfile,
@@ -165,6 +170,9 @@ impl Default for SimParams {
             bat_v_init: 11.0,
             bat_r_int_mohm: 50.0,
             bat_c_mf: 20.0,
+            blanking_ns: 0.0,
+            adc_sample_ns: 0.0,
+            max_duty_pct: 100.0,
             mcu: McuProfile::ideal(),
             cs: CsProfile::ideal(),
             dac: DacProfile::ideal(),
@@ -347,6 +355,9 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
         t_prop_delay: Time(p.mcu.comp_delay_ns * 1e-9),
         t_dac_sample: Time(0.0),
         current_conduction: p.current_conduction,
+        t_blanking: Time(p.blanking_ns * 1e-9),
+        t_adc_sample_point: Time(p.adc_sample_ns * 1e-9),
+        max_duty: p.max_duty_pct / 100.0,
     };
     let mut sim = CurrentModeConverter::new(sim_params, Mode::Buck);
 
@@ -491,7 +502,7 @@ fn tick_one(
     // Decimation: only update controller when ctrl_update is true
     let dac_code = if ctrl_update {
         let adc_code = {
-            let v_adc = sim.v_out.0 * divider_ratio;
+            let v_adc = sim.v_out_at_adc.0 * divider_ratio;
             (v_adc / LSB).round().clamp(0.0, ADC_MAX) as u16
         };
         let error = target_code - adc_code as f32;
