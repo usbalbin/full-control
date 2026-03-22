@@ -64,17 +64,12 @@ const TF_DAC: (TransferFunction, DacSettings) =
     CTRL_PARAMS.to_transfer_function(V_IN.0, ControlTopology::Buck);
 
 // Physical-domain weights (error in Volts, output in current-sense Volts)
-const WEIGHTS_PHYS: TwoPoleTwoZeroParams<f32> = TF_DAC.0.to_2p2z();
+const WEIGHTS_PHYS: TwoPoleTwoZeroParams<f32> = TF_DAC.0.to_2p2z()
+    .expect("compensator infeasible: phi_v >= 90deg, reduce crossover_hz or cycles_per_tick");
 
 // Code-domain weights: b-coefficients scaled by 1/divider_ratio.
 // The a-coefficients are unchanged (they multiply past outputs already in codes).
-const WEIGHTS_CODE: TwoPoleTwoZeroParams<f32> = TwoPoleTwoZeroParams {
-    a1: WEIGHTS_PHYS.a1,
-    a2: WEIGHTS_PHYS.a2,
-    b0: (WEIGHTS_PHYS.b0 as f64 / DIVIDER_RATIO) as f32,
-    b1: (WEIGHTS_PHYS.b1 as f64 / DIVIDER_RATIO) as f32,
-    b2: (WEIGHTS_PHYS.b2 as f64 / DIVIDER_RATIO) as f32,
-};
+const WEIGHTS_CODE: TwoPoleTwoZeroParams<f32> = WEIGHTS_PHYS.to_code_domain(DIVIDER_RATIO);
 
 // FMAC gain exponent: smallest R such that all |coeff| / 2^R < 1.0 (fits q1.15).
 // Derived automatically from WEIGHTS_CODE — updates if circuit constants change.
@@ -129,6 +124,9 @@ fn main() {
         t_prop_delay: Time(0.0),
         t_dac_sample: Time(0.0),
         current_conduction: CurrentConduction::Diode,
+        t_blanking: Time(0.0),
+        t_adc_sample_point: Time(0.0),
+        max_duty: 1.0,
     };
     let mut sim = CurrentModeConverter::new(sim_params, Mode::Buck);
 

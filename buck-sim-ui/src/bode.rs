@@ -4,6 +4,8 @@ use egui::Color32;
 use egui_plot::{HLine, Line, PlotPoints, VLine};
 use full_control::control_2p2z::DesignSummary;
 
+use crate::sim::{SimParams, has_transport_delays};
+
 /// Number of frequency points in the sweep.
 const N_POINTS: usize = 500;
 
@@ -25,6 +27,84 @@ fn c_mag(a: C) -> f64 {
 
 fn c_phase_deg(a: C) -> f64 {
     a.1.atan2(a.0).to_degrees()
+}
+
+/// Non-ideal effects that modify the loop gain but not the ideal plant/compensator.
+pub struct NonIdealParams {
+    /// Total transport delay [s]: t_adc + t_processing + t_dac + t_hold.
+    /// Zero when PhaseMargin::Manual (ideal).
+    pub tau_delay: f64,
+    /// ZOH control period [s] = cycles_per_tick / f_sw.
+    pub t_ctrl: f64,
+    /// Current sensor −3 dB bandwidth [rad/s]. 0 = ideal.
+    pub omega_cs: f64,
+    /// DAC output filter −3 dB bandwidth [rad/s]. 0 = ideal.
+    pub omega_dac: f64,
+}
+
+impl NonIdealParams {
+    pub fn from_sim_params(p: &SimParams) -> Self {
+        let f_sw = p.f_sw_khz * 1e3;
+        let tau_delay = if has_transport_delays(&p.mcu, &p.dac) {
+            let t_adc = p.mcu.t_adc_us * 1e-6;
+            let t_processing = p.mcu.t_processing_us * 1e-6;
+            let t_dac = p.dac.t_dac_us * 1e-6;
+            let t_hold = (p.cycles_per_tick as f64 - 1.0) / f_sw;
+            t_adc + t_processing + t_dac + t_hold
+        } else {
+            0.0
+        };
+        let t_ctrl = p.cycles_per_tick as f64 / f_sw;
+        let omega_cs = if p.cs.cs_bandwidth_khz > 0.0 {
+            2.0 * PI * p.cs.cs_bandwidth_khz * 1e3
+        } else {
+            0.0
+        };
+        let omega_dac = if p.dac.dac_filter_bw_khz > 0.0 {
+            2.0 * PI * p.dac.dac_filter_bw_khz * 1e3
+        } else {
+            0.0
+        };
+        Self { tau_delay, t_ctrl, omega_cs, omega_dac }
+    }
+}
+
+/// Evaluate the combined non-ideal transfer function at angular frequency ω.
+///
+/// Returns a complex number (re, im) representing the product of:
+/// - Transport delay: e^{−jωτ}
+/// - ZOH sinc droop: sinc(ω·T_ctrl/2) (magnitude only, phase already in τ)
+/// - Current sensor pole: 1 / (1 + jω/ω_cs)
+/// - DAC filter pole: 1 / (1 + jω/ω_dac)
+fn non_ideal(omega: f64, ni: &NonIdealParams) -> C {
+    let mut result: C = (1.0, 0.0);
+
+    // Transport delay: e^{-jωτ}
+    if ni.tau_delay > 0.0 {
+        let phi = omega * ni.tau_delay;
+        result = c_mul(result, (phi.cos(), -phi.sin()));
+    }
+
+    // ZOH sinc droop (magnitude only — phase lag already captured in tau_delay)
+    if ni.t_ctrl > 0.0 {
+        let x = omega * ni.t_ctrl / 2.0;
+        let sinc = if x.abs() < 1e-12 { 1.0 } else { x.sin() / x };
+        result = (result.0 * sinc, result.1 * sinc);
+    }
+
+    // Current sensor first-order pole: 1 / (1 + jω/ω_cs)
+    if ni.omega_cs > 0.0 {
+        let pole: C = (1.0, omega / ni.omega_cs);
+        result = c_div(result, pole);
+    }
+
+    // DAC filter first-order pole: 1 / (1 + jω/ω_dac)
+    if ni.omega_dac > 0.0 {
+        let pole: C = (1.0, omega / ni.omega_dac);
+        result = c_div(result, pole);
+    }
+
+    result
 }
 
 /// Pre-computed Bode sweep data.
@@ -49,6 +129,12 @@ pub struct BodeData {
     pub f_esr: f64,
     pub f_cz1: f64,
     pub f_x_design: f64,
+
+    // Non-ideal annotation frequencies [Hz] for vertical markers.
+    pub f_cs: Option<f64>,
+    pub f_dac_filter: Option<f64>,
+    /// Transport delay [µs] for summary display.
+    pub tau_delay_us: f64,
 
     // Measured from sweep.
     pub f_x_actual: f64,
@@ -85,7 +171,7 @@ fn compensator(omega: f64, ds: &DesignSummary) -> C {
 }
 
 impl BodeData {
-    pub fn compute(ds: &DesignSummary) -> Self {
+    pub fn compute(ds: &DesignSummary, ni: &NonIdealParams) -> Self {
         let f_min = 1.0_f64;
         let f_max = ds.f_sw;
         let log_min = f_min.log10();
@@ -106,7 +192,8 @@ impl BodeData {
 
             let hp = plant(omega, ds);
             let hc = compensator(omega, ds);
-            let ht = c_mul(hp, hc);
+            let hni = non_ideal(omega, ni);
+            let ht = c_mul(c_mul(hp, hc), hni);
 
             freq.push(f);
             plant_mag.push(20.0 * c_mag(hp).log10());
@@ -142,6 +229,9 @@ impl BodeData {
             }
         }
 
+        let f_cs = if ni.omega_cs > 0.0 { Some(ni.omega_cs / (2.0 * PI)) } else { None };
+        let f_dac_filter = if ni.omega_dac > 0.0 { Some(ni.omega_dac / (2.0 * PI)) } else { None };
+
         BodeData {
             freq,
             plant_mag,
@@ -154,6 +244,9 @@ impl BodeData {
             f_esr: ds.omega_esr / (2.0 * PI),
             f_cz1: ds.omega_cz1 / (2.0 * PI),
             f_x_design: ds.omega_x / (2.0 * PI),
+            f_cs,
+            f_dac_filter,
+            tau_delay_us: ni.tau_delay * 1e6,
             f_x_actual,
             phase_margin_deg,
             gain_margin_db,
@@ -190,24 +283,31 @@ pub fn show_bode(ui: &mut egui::Ui, data: &BodeData) {
     let phase_h = (total_h * 0.40).max(80.0);
 
     // Annotation lines at key frequencies (in log10 space).
-    let markers: Vec<(f64, &str, Color32)> = vec![
+    let mut markers: Vec<(f64, &str, Color32)> = vec![
         (data.f_p1, "f_p1", Color32::from_rgb(180, 180, 180)),
         (data.f_esr, "f_esr", Color32::from_rgb(180, 180, 180)),
         (data.f_cz1, "f_cz1", Color32::from_rgb(180, 180, 180)),
         (data.f_x_actual, "f_x", Color32::from_rgb(255, 80, 80)),
     ];
+    if let Some(f) = data.f_cs {
+        markers.push((f, "f_cs", Color32::from_rgb(200, 140, 255)));
+    }
+    if let Some(f) = data.f_dac_filter {
+        markers.push((f, "f_dac", Color32::from_rgb(140, 200, 255)));
+    }
 
     // Summary text
     ui.horizontal(|ui| {
-        ui.label(
-            egui::RichText::new(format!(
-                "f_x = {}   PM = {:.1}°   GM = {:.1} dB",
-                fmt_freq(data.f_x_actual),
-                data.phase_margin_deg,
-                data.gain_margin_db,
-            ))
-            .strong(),
+        let mut text = format!(
+            "f_x = {}   PM = {:.1}°   GM = {:.1} dB",
+            fmt_freq(data.f_x_actual),
+            data.phase_margin_deg,
+            data.gain_margin_db,
         );
+        if data.tau_delay_us > 0.0 {
+            text.push_str(&format!("   τ = {:.1} µs", data.tau_delay_us));
+        }
+        ui.label(egui::RichText::new(text).strong());
     });
     ui.add_space(2.0);
 

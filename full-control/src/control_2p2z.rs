@@ -89,6 +89,20 @@ impl TwoPoleTwoZeroParams<f32> {
         }
     }
 
+    /// Scale b-coefficients from physical domain (error in Volts) to code domain
+    /// (error in ADC codes) by dividing by the feedback divider ratio.
+    ///
+    /// The a-coefficients are dimensionless and remain unchanged.
+    pub const fn to_code_domain(self, divider_ratio: f64) -> Self {
+        Self {
+            a1: self.a1,
+            a2: self.a2,
+            b0: (self.b0 as f64 / divider_ratio) as f32,
+            b1: (self.b1 as f64 / divider_ratio) as f32,
+            b2: (self.b2 as f64 / divider_ratio) as f32,
+        }
+    }
+
     /// Minimum FMAC gain exponent R such that every coefficient divided by 2^R
     /// fits in q1.15 (i.e. |coeff| / 2^R < 1.0).
     ///
@@ -197,6 +211,19 @@ impl<T: Scalar> TwoPoleTwoZero<T> {
     pub fn set_last_output(&mut self, u: T) {
         self.outputs[0] = u;
     }
+
+    /// Update the controller and apply an external dynamic output clamp.
+    ///
+    /// The internal limits (set at construction) apply first via `update()`.
+    /// The result is then further clamped to `[ext_min, ext_max]` and the
+    /// output history is updated for clamped-feedback anti-windup.
+    #[inline(always)]
+    pub fn update_clamped(&mut self, error: T, ext_min: T, ext_max: T) -> T {
+        let output = self.update(error);
+        let clamped = output.clamp(ext_min, ext_max);
+        self.set_last_output(clamped);
+        clamped
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -281,6 +308,19 @@ impl DacSettings {
     pub const fn vpp(&self) -> f64 {
         self.vpp
     }
+
+    /// Slope ramp accumulated during the on-time, in ADC/DAC codes.
+    ///
+    /// Add this to `dac_max_code` to get the dynamic controller output limit.
+    /// Initialise the controller with a high internal limit (e.g. 4096),
+    /// then externally clamp to `dynamic_limit` each cycle and call
+    /// `set_last_output(clamped)` for anti-windup.
+    ///
+    /// `duty` is the steady-state switch duty cycle (0–1).
+    /// `lsb` is the ADC/DAC least-significant-bit voltage (V_ref / 2^N).
+    pub const fn slope_offset_codes(&self, duty: f64, lsb: f64) -> f64 {
+        self.vpp * duty / lsb
+    }
 }
 
 macro_rules! p {
@@ -299,19 +339,14 @@ macro_rules! p {
 }
 
 impl Parameters {
-    /// Returns the crossover frequency as `f_sw / divisor`.
+    /// Returns the highest crossover frequency (Hz) satisfying all constraints:
     ///
-    /// The divisor is the most conservative (largest) of three constraints:
-    /// 1. **User ceiling**: `f_sw / crossover_hz`
-    /// 2. **Ripple criterion**: highest bandwidth where `b0 × ΔV_ripple ≤ vpp / safety_factor`
+    /// 1. **Phase feasibility**: `to_2p2z()` returns `Some` (φ_v < π/2)
+    /// 2. **Ripple / limit-cycling**: `b0 × ΔV_out_ripple ≤ vpp / safety_factor`
     /// 3. **RHP zero** (boost/buck-boost): `f_x ≤ f_RHP / (2 × safety_factor)`
     ///
-    /// With low-ESR ceramics the ripple constraint is permissive (divisor ≈ 8),
-    /// so `crossover_hz` dominates — giving predictable, user-controlled bandwidth.
-    ///
-    /// Useful for informational display: call `params.crossover_divisor()` to
-    /// inspect the selected f_x without re-running the full compensator design.
-    pub const fn crossover_divisor(self, topology: Topology, v_in: f64) -> f64 {
+    /// Call this to discover the limit before setting `crossover_hz`.
+    pub const fn max_feasible_crossover_hz(&self, v_in: f64, topology: Topology) -> f64 {
         // Steady-state duty cycle and inductor voltage during the on-phase.
         let d = match topology {
             Topology::Buck => (self.v_out + self.v_diode) / v_in,
@@ -326,127 +361,125 @@ impl Parameters {
         // Estimated peak-to-peak output voltage ripple (capacitive + ESR components).
         let di_l = v_l_on * d / (self.f_sw * self.l_inductor);
         let dv_out = match topology {
-            // Buck: triangular ripple current flows through cap the whole cycle.
-            //   ΔV_cap = ΔI_L / (8·f_sw·C),  ΔV_ESR = ΔI_L · R_ESR
             Topology::Buck => di_l * (self.r_esr_out_cap + 1.0 / (8.0 * self.f_sw * self.c_out)),
-            // Boost/BuckBoost: cap is disconnected from the inductor during the ON
-            // phase and must supply the load alone, so:
-            //   ΔV_cap = I_load · D / (f_sw · C)
-            //   ΔV_ESR = ΔI_L · R_ESR  (current step at the ON→OFF transition)
             Topology::Boost | Topology::BuckBoost => {
                 self.i_load * d / (self.f_sw * self.c_out)
                     + di_l * self.r_esr_out_cap
             }
         };
 
-        // vpp is independent of f_x_divisor — probe at a reference divisor.
-        // to_transfer_function_inner does NOT call crossover_divisor, so no recursion.
-        let (_, dac) = self.to_transfer_function_inner(1.0, v_in, topology);
+        // vpp is independent of crossover — probe at a reference frequency.
+        let (_, dac) = self.to_transfer_function_inner(self.f_sw / 8.0, v_in, topology);
         let vpp = dac.vpp;
         let b0_max = vpp / (dv_out * self.safety_factor);
 
-        // Binary search in the valid region (divisor ≥ 8, i.e. f_x ≤ f_sw/8).
-        // Below divisor=8 the bilinear transform breaks down near the Nyquist
-        // frequency and produces non-physical b0 values.
-        // In the valid region b0 is monotonically decreasing with divisor.
-        let mut lo = 8.0_f64;
-        let mut hi = 100_000.0_f64;
+        // Binary search for the highest feasible crossover frequency.
+        // Upper bound: f_sw / 8 (bilinear transform breaks down near Nyquist).
+        // Lower bound: 1 Hz.
+        // b0 increases monotonically with crossover frequency in the valid region.
+        let mut lo = 1.0_f64;
+        let mut hi = self.f_sw / 8.0;
         let mut i = 0;
         while i < 60 {
             let mid = (lo + hi) / 2.0;
             let (tf, _) = self.to_transfer_function_inner(mid, v_in, topology);
-            let b0 = tf.to_2p2z().b0 as f64;
+            let b0 = match tf.to_2p2z() {
+                Some(w) => w.b0 as f64,
+                None => f64::MAX, // phase infeasible — too high
+            };
             if b0 <= b0_max {
-                hi = mid; // criterion met — try lower divisor (higher bandwidth)
+                lo = mid; // criterion met — try higher frequency
             } else {
-                lo = mid; // criterion violated — increase divisor (lower bandwidth)
+                hi = mid; // criterion violated — reduce frequency
             }
             i += 1;
         }
 
         // Additional constraint for Boost and BuckBoost: RHP zero.
-        //
-        // Boost-type topologies have a right-half-plane zero at
-        //   ω_RHP = D'^2 × R_load / L
-        // that limits the outer voltage-loop bandwidth regardless of whether
-        // peak current mode control is used.  Exceeding it causes the output
-        // to move in the wrong direction in response to a control action,
-        // leading to large oscillations — exactly what is observed when the
-        // controller exits the clamped region after a long saturated transient.
-        //
-        // Constraint: f_x ≤ f_RHP / (2 × safety_factor)
-        //   → divisor ≥ 4π × safety_factor × f_sw / ω_RHP
-        let rhp_divisor = match topology {
-            Topology::Buck => 0.0, // Buck has no RHP zero
+        let rhp_limit = match topology {
+            Topology::Buck => f64::MAX,
             Topology::Boost | Topology::BuckBoost => {
                 let d_prime = 1.0 - d;
                 let r_load = self.v_out / self.i_load;
                 let omega_rhp = d_prime * d_prime * r_load / self.l_inductor;
-                4.0 * PI * self.safety_factor * self.f_sw / omega_rhp
+                omega_rhp / (4.0 * PI * self.safety_factor)
             }
         };
 
-        // User-specified crossover ceiling.
-        let user_divisor = self.f_sw / self.crossover_hz;
-
-        // Return the most conservative of all three constraints.
-        let max_div = if user_divisor > hi { user_divisor } else { hi };
-        if rhp_divisor > max_div { rhp_divisor } else { max_div }
+        // Return the most conservative limit.
+        if lo < rhp_limit { lo } else { rhp_limit }
     }
 
     /// Design the 2P2Z compensator for these circuit parameters.
     ///
-    /// The crossover frequency is selected automatically via `crossover_divisor()`:
-    /// the most conservative of the user-specified `crossover_hz` ceiling, the
-    /// ripple criterion (`b0 × ΔV ≤ vpp / safety_factor`), and the RHP zero limit.
+    /// Uses `crossover_hz` as the exact target crossover frequency.
+    /// If the design is infeasible (phase or ripple), `to_2p2z()` will return `None`
+    /// or the caller should check the ripple criterion separately.
+    /// Use `max_feasible_crossover_hz()` to find the highest valid crossover.
     pub const fn to_transfer_function(
         self,
         v_in: f64,
         topology: Topology,
     ) -> (TransferFunction, DacSettings) {
-        self.to_transfer_function_inner(self.crossover_divisor(topology, v_in), v_in, topology)
+        self.to_transfer_function_inner(self.crossover_hz, v_in, topology)
     }
 
-    /// Compute only the DAC slope-compensation settings for a given input voltage.
+    /// Compute DAC slope-compensation settings at the design-point `v_out`.
     ///
-    /// Unlike [`to_transfer_function`], this function is cheap and depends only on
-    /// `v_in` — suitable for calling from a control task after measuring the actual
-    /// bus voltage for Vin feed-forward.
+    /// Equivalent to `self.dac_settings_at(v_in, self.v_out, topology, 1.0)`.
+    /// See [`dac_settings_at`](Self::dac_settings_at) for details.
+    pub const fn dac_settings(self, v_in: f64, topology: Topology) -> DacSettings {
+        self.dac_settings_at(v_in, self.v_out, topology, 1.0)
+    }
+
+    /// Compute DAC slope-compensation settings for arbitrary Vin/Vout.
     ///
-    /// The 2P2Z coefficients produced by `to_transfer_function` do **not** need to
-    /// be recomputed when Vin changes for a **Buck** converter: `q_inv_no_pi` always
-    /// simplifies to the constant `1/π` regardless of duty cycle, so `h_dc` and
-    /// `ω_p1` depend only on the load and reactive components.  For Boost/BuckBoost
-    /// the `D'²` factor in `h_dc` and `ω_p1` does vary with Vin.
+    /// Unlike [`to_transfer_function`], this function is cheap — suitable for
+    /// calling from a runtime control task after measuring the actual bus
+    /// voltage (Vin feed-forward) or during soft-start when the target
+    /// voltage is ramping.
+    ///
+    /// `overcomp` is a multiplicative safety margin applied to the slope
+    /// magnitude (`S_e`).  Use `1.0` for the theoretical value, `1.5` for
+    /// the 50 % over-compensation used in the firmware.
     ///
     /// # Runtime slope update pattern
     ///
     /// ```ignore
-    /// // In a 1 ms task, after measuring v_in:
-    /// let s = CTRL_PARAMS.dac_settings(v_in, Topology::Buck);
+    /// // In a 1 ms task, after measuring v_in and knowing the current target:
+    /// let s = CTRL_PARAMS.dac_settings_at(v_in, v_target, Topology::Buck, 1.5);
     /// // INCDATA = ceil(|dac_slope| / LSB  ×  16 / F_HR  ×  HR_TICKS_PER_DAC_INC)
     /// let step = ((-s.dac_slope / LSB) * 16.0 / F_HR * CR2).ceil().max(1.0) as u16;
     /// DAC_STEP_LIVE.store(step, Ordering::Relaxed);
+    /// // slope_offset for controller dynamic limit:
+    /// let offset = s.slope_offset_codes(v_target / v_in, LSB) as u16;
     /// ```
-    pub const fn dac_settings(self, v_in: f64, topology: Topology) -> DacSettings {
+    pub const fn dac_settings_at(
+        self,
+        v_in: f64,
+        v_out: f64,
+        topology: Topology,
+        overcomp: f64,
+    ) -> DacSettings {
         let t_sw = 1.0 / self.f_sw;
         let (steady_state_duty, inductor_current_up_slope) = match topology {
             Topology::Buck => (
-                (self.v_out + self.v_diode) / v_in,
-                (v_in - self.v_out - self.v_diode) * self.current_sense_gain / self.l_inductor,
+                (v_out + self.v_diode) / v_in,
+                (v_in - v_out - self.v_diode) * self.current_sense_gain / self.l_inductor,
             ),
             Topology::Boost => (
-                1.0 - v_in / (self.v_out - self.v_diode),
+                1.0 - v_in / (v_out - self.v_diode),
                 v_in * self.current_sense_gain / self.l_inductor,
             ),
             Topology::BuckBoost => (
-                self.v_out / (v_in + self.v_out - self.v_diode),
+                v_out / (v_in + v_out - self.v_diode),
                 v_in * self.current_sense_gain / self.l_inductor,
             ),
         };
         let inv_steady_state_duty = 1.0 - steady_state_duty;
         let slope_compensation_factor = (1.0 + PI / 2.0) / (PI * inv_steady_state_duty);
-        let dac_down_slope = -(slope_compensation_factor - 1.0) * inductor_current_up_slope;
+        let dac_down_slope =
+            -(slope_compensation_factor - 1.0) * inductor_current_up_slope * overcomp;
         let vpp = -dac_down_slope * t_sw;
         DacSettings {
             dac_slope: dac_down_slope,
@@ -454,14 +487,10 @@ impl Parameters {
         }
     }
 
-    /// Compute the transfer function for a given crossover divisor.
-    /// This is the inner implementation called by both `to_transfer_function`
-    /// (which passes the auto-computed divisor) and `crossover_divisor`
-    /// (which probes different divisor values during the binary search).
-    /// Neither calls the other — there is no recursion.
+    /// Compute the transfer function for a given crossover frequency (Hz).
     const fn to_transfer_function_inner(
         self,
-        f_x_divisor: f64,
+        crossover_hz: f64,
         v_in: f64,
         topology: Topology,
     ) -> (TransferFunction, DacSettings) {
@@ -567,7 +596,7 @@ impl Parameters {
         (
             TransferFunction {
                 f_sw,
-                f_x_divisor,
+                crossover_hz,
                 phase_margin,
                 cycles_per_tick,
 
@@ -600,7 +629,7 @@ pub enum PhaseMargin {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct TransferFunction {
     f_sw: f64,
-    f_x_divisor: f64,
+    crossover_hz: f64,
     phase_margin: PhaseMargin,
     cycles_per_tick: usize,
 
@@ -642,7 +671,7 @@ impl TransferFunction {
     /// (before bilinear transform to discrete coefficients).
     pub const fn design_summary(&self) -> DesignSummary {
         let ohmega_n = self.ohmega_n();
-        let f_x = self.f_sw / self.f_x_divisor;
+        let f_x = self.crossover_hz;
         let ohmega_x = 2.0 * PI * f_x;
 
         let phase_margin = match self.phase_margin {
@@ -686,10 +715,19 @@ impl TransferFunction {
         }
     }
 
-    pub const fn to_2p2z(self) -> TwoPoleTwoZeroParams<f32> {
+    /// Convert to discrete 2P2Z coefficients via bilinear (Tustin) transform.
+    ///
+    /// Returns `None` when the compensator design is infeasible — specifically
+    /// when the required compensator zero phase angle φ_v ≥ 90°.  This happens
+    /// when total transport delay (ADC + processing + DAC + ZOH hold) erodes
+    /// too much phase at the chosen crossover frequency.
+    ///
+    /// In firmware `const` contexts, use `.unwrap()` or `.expect("…")` to get
+    /// a compile-time error when parameters are infeasible.
+    pub const fn to_2p2z(self) -> Option<TwoPoleTwoZeroParams<f32>> {
         let TransferFunction {
             f_sw,
-            f_x_divisor,
+            crossover_hz,
             phase_margin,
             cycles_per_tick,
             ohmega_p1,
@@ -700,12 +738,7 @@ impl TransferFunction {
         let ohmega_n = self.ohmega_n();
         p!(ohmega_n, "628 300");
 
-        // Crossover frequency: f_x = f_sw / f_x_divisor.
-        // Typical: 13.33 (≈ 7.5 % of f_sw) for Buck.  Use 50–100 for large-Cout
-        // Boost/BuckBoost where the very low plant pole (ω_p1 ≈ D'^2/(R·C)) would
-        // otherwise force extremely large b-coefficients that cause limit cycling.
-        let f_x = f_sw / f_x_divisor;
-        //p!(f_x, "15000");
+        let f_x = crossover_hz;
 
         //println!("----------------------------------");
         //println!("----------------------------------");
@@ -743,6 +776,14 @@ impl TransferFunction {
         let phi_v = -0.5 * PI + phase_margin + atan(ohmega_x / ohmega_p1) + complex_pole_pair;
         //dbg!(ohmega_x);
 
+        // Guard: at φ_v ≥ π/2, tan(φ_v) ≤ 0 and ω_cz1 flips sign, producing
+        // non-physical coefficients.  This means the transport delays erode too
+        // much phase at the chosen crossover frequency — reduce f_x, lower
+        // cycles_per_tick, or shorten ADC/processing/DAC delays.
+        if phi_v >= 0.5 * PI {
+            return None;
+        }
+
         let ohmega_cp1 = ohmega_esr; // eq. 8
         let ohmega_cz1 = ohmega_x / tan(phi_v); // eq. 10
         p!(ohmega_cp1, "73_310");
@@ -778,13 +819,13 @@ impl TransferFunction {
         let a1 = 4.0 / (2.0 + t_ctrl * ohmega_cp1);
         let a2 = (-2.0 + t_ctrl * ohmega_cp1) / (2.0 + t_ctrl * ohmega_cp1);
 
-        TwoPoleTwoZeroParams {
+        Some(TwoPoleTwoZeroParams {
             a1: a1 as _,
             a2: a2 as _,
             b0: b0 as _,
             b1: b1 as _,
             b2: b2 as _,
-        }
+        })
     }
 
     pub const fn ohmega_n(&self) -> f64 {
@@ -827,5 +868,315 @@ impl TransferFunction {
     pub fn print_dc_gain(&self) {
         println!("{}", self.h_dc);
         println!("{:.2}", self.h_dc);
+    }
+}
+
+// ── Integration tests against Hallworth 2012 ─────────────────────────────────
+//
+// Reference: M. Hallworth, S.A. Shirsavar, "Microcontroller-based peak current
+// mode control using digital slope compensation", IEEE Trans. Power Electron.,
+// vol. 27, no. 7, pp. 3340–3351, Jul. 2012.
+// DOI: 10.1109/TPEL.2011.2182210
+//
+// The design example in Section V (Tables I–III) specifies a 16 W buck converter
+// and derives the complete compensator analytically.  These tests verify that
+// our code reproduces the paper's published numerical results.
+#[cfg(test)]
+mod hallworth_2012_tests {
+    use super::*;
+    use core::f64::consts::PI;
+
+    /// Helper: assert `actual` is within `tol_pct` percent of `expected`.
+    fn assert_close(actual: f64, expected: f64, tol_pct: f64, label: &str) {
+        let rel_err = ((actual - expected) / expected).abs() * 100.0;
+        assert!(
+            rel_err < tol_pct,
+            "{label}: expected {expected}, got {actual} (rel err {rel_err:.4}% > {tol_pct}%)",
+        );
+    }
+
+    // ── Paper Table Ia — Specification ───────────────────────────────────────
+    const V_IN: f64 = 16.0;       // V
+    const V_OUT: f64 = 8.0;       // V
+    const I_OUT: f64 = 2.0;       // A
+    const C_OUT: f64 = 440e-6;    // F
+    const L_OUT: f64 = 22e-6;     // H
+    const R_I: f64 = 0.48;        // V/A  (current sense gain)
+    const R_ESR: f64 = 31e-3;     // Ω
+    const V_DIODE: f64 = 0.6;     // V
+    const F_SW: f64 = 200e3;      // Hz
+    const F_X: f64 = 15e3;        // Hz   (crossover frequency)
+    const PHI_M_DEG: f64 = 75.0;  // °    (phase margin)
+
+    fn hallworth_params() -> Parameters {
+        Parameters {
+            v_out: V_OUT,
+            v_diode: V_DIODE,
+            c_out: C_OUT,
+            f_sw: F_SW,
+            l_inductor: L_OUT,
+            r_esr_out_cap: R_ESR,
+            current_sense_gain: R_I,
+            i_load: I_OUT,
+            phase_margin: PhaseMargin::Manual {
+                phase_margin: PHI_M_DEG.to_radians(),
+            },
+            safety_factor: 2.0,
+            crossover_hz: F_X,
+            cycles_per_tick: 1,
+        }
+    }
+
+    // ── Table Ib — Operational parameters ────────────────────────────────────
+
+    /// Verify duty cycle D = (V_O + V_DIODE) / V_IN = 0.5375 (Table Ib)
+    #[test]
+    fn duty_cycle() {
+        let d = (V_OUT + V_DIODE) / V_IN;
+        assert_close(d, 0.5375, 0.01, "D");
+    }
+
+    /// Verify slope compensation factor m_C = 1.7693 (Table Ib, eq. 2 with Q_C=1)
+    #[test]
+    fn slope_compensation_factor() {
+        let d = (V_OUT + V_DIODE) / V_IN;
+        let m_c = (1.0 + PI / 2.0) / (PI * (1.0 - d));
+        assert_close(m_c, 1.7693, 0.01, "m_C");
+    }
+
+    /// Verify plant pole ω_P1 = 732.6 rad/s (Table Ib)
+    #[test]
+    fn plant_pole_omega_p1() {
+        let p = hallworth_params();
+        let (tf, _) = p.to_transfer_function(V_IN, Topology::Buck);
+        let ds = tf.design_summary();
+        assert_close(ds.omega_p1, 732.6, 0.05, "ω_P1");
+    }
+
+    /// Verify ESR zero ω_Z1 = ω_ESR = 7.331e4 rad/s (Table Ib)
+    #[test]
+    fn esr_zero_omega_z1() {
+        let p = hallworth_params();
+        let (tf, _) = p.to_transfer_function(V_IN, Topology::Buck);
+        let ds = tf.design_summary();
+        // ω_ESR = 1/(R_ESR × C_out)
+        let omega_esr_expected = 1.0 / (R_ESR * C_OUT);
+        assert_close(ds.omega_esr, omega_esr_expected, 0.01, "ω_ESR exact");
+        assert_close(ds.omega_esr, 7.331e4, 0.05, "ω_ESR paper");
+    }
+
+    /// Verify subharmonic double-pole frequency ω_N = 6.283e5 rad/s (Table Ib)
+    #[test]
+    fn subharmonic_pole_omega_n() {
+        let p = hallworth_params();
+        let (tf, _) = p.to_transfer_function(V_IN, Topology::Buck);
+        let ds = tf.design_summary();
+        assert_close(ds.omega_n, PI * F_SW, 0.01, "ω_N exact");
+        assert_close(ds.omega_n, 6.283e5, 0.05, "ω_N paper");
+    }
+
+    /// Verify DC gain K_DC = 6.4631 (Table Ib, eq. 17)
+    #[test]
+    fn dc_gain() {
+        let p = hallworth_params();
+        let (tf, _) = p.to_transfer_function(V_IN, Topology::Buck);
+        let ds = tf.design_summary();
+        assert_close(ds.h_dc, 6.4631, 0.05, "K_DC");
+    }
+
+    /// Verify slope compensation ramp V_PP = 0.621 V (Table Ib, eq. 6)
+    #[test]
+    fn slope_ramp_vpp() {
+        let p = hallworth_params();
+        let (_, dac) = p.to_transfer_function(V_IN, Topology::Buck);
+        assert_close(dac.vpp(), 0.621, 0.5, "V_PP");
+    }
+
+    // ── Table Ic — Compensator poles and zeros ───────────────────────────────
+
+    /// Verify compensator pole ω_CP1 = 7.331e4 rad/s (Table Ic, eq. 8)
+    /// The compensator pole is placed at the ESR zero frequency.
+    #[test]
+    fn compensator_pole_omega_cp1() {
+        let p = hallworth_params();
+        let (tf, _) = p.to_transfer_function(V_IN, Topology::Buck);
+        let ds = tf.design_summary();
+        assert_close(ds.omega_cp1, 7.331e4, 0.05, "ω_CP1");
+        // ω_CP1 must equal ω_ESR (eq. 8)
+        assert!(
+            (ds.omega_cp1 - ds.omega_esr).abs() < 1e-6,
+            "ω_CP1 must equal ω_ESR"
+        );
+    }
+
+    /// Verify compensator zero ω_CZ1 = 1.111e4 rad/s (Table Ic, eq. 10)
+    #[test]
+    fn compensator_zero_omega_cz1() {
+        let p = hallworth_params();
+        let (tf, _) = p.to_transfer_function(V_IN, Topology::Buck);
+        let ds = tf.design_summary();
+        assert_close(ds.omega_cz1, 1.111e4, 0.5, "ω_CZ1");
+    }
+
+    /// Verify integrator gain ω_CP0 = 2.171e5 rad/s (Table Ic, eq. 16)
+    #[test]
+    fn integrator_gain_omega_cp0() {
+        let p = hallworth_params();
+        let (tf, _) = p.to_transfer_function(V_IN, Topology::Buck);
+        let ds = tf.design_summary();
+        assert_close(ds.omega_cp0, 2.171e5, 0.5, "ω_CP0");
+    }
+
+    // ── Table II — Digital controller coefficients (bilinear transform) ──────
+
+    /// Verify all five 2P2Z coefficients match Table II of the paper.
+    ///
+    /// B0 =  3.112327,  B1 =  0.168173,  B2 = -2.944154
+    /// A1 =  1.690211,  A2 = -0.690211
+    #[test]
+    fn bilinear_coefficients() {
+        let p = hallworth_params();
+        let (tf, _) = p.to_transfer_function(V_IN, Topology::Buck);
+        let w = tf.to_2p2z().expect("compensator design must be feasible");
+
+        // The paper tabulates 6-7 significant figures.  Use 0.5% tolerance
+        // to allow for minor differences in intermediate rounding.
+        let tol = 0.5; // percent
+
+        assert_close(w.b0 as f64, 3.112327, tol, "B0");
+        assert_close(w.b1 as f64, 0.168173, tol, "B1");
+        assert_close(w.b2 as f64, -2.944154, tol, "B2");
+        assert_close(w.a1 as f64, 1.690211, tol, "A1");
+        assert_close(w.a2 as f64, -0.690211, tol, "A2");
+    }
+
+    /// Verify analytical coefficient formulas (eqs. 23–27) directly.
+    ///
+    /// Uses the paper's exact compensator pole/zero values and confirms
+    /// the bilinear transform produces the tabulated coefficients.
+    #[test]
+    fn bilinear_formulas_direct() {
+        // Paper's compensator values (Table Ic)
+        let omega_cp0 = 2.171e5;
+        let omega_cp1 = 7.331e4;
+        let omega_cz1 = 1.111e4;
+        let t_s = 1.0 / F_SW;
+
+        // Eq. 23
+        let b0 = t_s * omega_cp0 * omega_cp1 * (2.0 + t_s * omega_cz1)
+            / (2.0 * (2.0 + t_s * omega_cp1) * omega_cz1);
+        // Eq. 24
+        let b1 = t_s * t_s * omega_cp0 * omega_cp1 / (2.0 + t_s * omega_cp1);
+        // Eq. 25
+        let b2 = t_s * omega_cp0 * omega_cp1 * (-2.0 + t_s * omega_cz1)
+            / (2.0 * (2.0 + t_s * omega_cp1) * omega_cz1);
+        // Eq. 26
+        let a1 = 4.0 / (2.0 + t_s * omega_cp1);
+        // Eq. 27
+        let a2 = (-2.0 + t_s * omega_cp1) / (2.0 + t_s * omega_cp1);
+
+        // These are computed from the paper's rounded intermediate values,
+        // so use 1% tolerance against the paper's final tabulated results.
+        let tol = 1.0;
+        assert_close(b0, 3.112327, tol, "B0 formula");
+        assert_close(b1, 0.168173, tol, "B1 formula");
+        assert_close(b2, -2.944154, tol, "B2 formula");
+        assert_close(a1, 1.690211, tol, "A1 formula");
+        assert_close(a2, -0.690211, tol, "A2 formula");
+    }
+
+    /// Verify that the compensator has unity gain at crossover: |H_P × H_C| = 1.
+    ///
+    /// This is the fundamental design requirement (eq. 15).
+    #[test]
+    fn unity_gain_at_crossover() {
+        let p = hallworth_params();
+        let (tf, _) = p.to_transfer_function(V_IN, Topology::Buck);
+        let ds = tf.design_summary();
+
+        let omega_x = ds.omega_x;
+
+        // Plant magnitude at crossover: K_DC × |H_p| × |H_h|
+        // H_p(jω) = (1 + jω/ω_esr) / (1 + jω/ω_p1)
+        let hp_num = (1.0 + (omega_x / ds.omega_esr).powi(2)).sqrt();
+        let hp_den = (1.0 + (omega_x / ds.omega_p1).powi(2)).sqrt();
+        let hp_mag = hp_num / hp_den;
+
+        // H_h(jω) = 1 / |1 - (ω/ω_n)² + j·ω/ω_n|   (Q_C = 1)
+        let r = omega_x / ds.omega_n;
+        let hh_mag = 1.0 / ((1.0 - r * r).powi(2) + r * r).sqrt();
+
+        let plant_mag = ds.h_dc * hp_mag * hh_mag;
+
+        // Compensator magnitude at crossover: ω_cp0/ω × |1 + jω/ω_cz1| / |1 + jω/ω_cp1|
+        let hc_int = ds.omega_cp0 / omega_x;
+        let hc_num = (1.0 + (omega_x / ds.omega_cz1).powi(2)).sqrt();
+        let hc_den = (1.0 + (omega_x / ds.omega_cp1).powi(2)).sqrt();
+        let comp_mag = hc_int * hc_num / hc_den;
+
+        let open_loop_mag = plant_mag * comp_mag;
+        assert_close(open_loop_mag, 1.0, 1.0, "|T(jω_x)| = 1");
+    }
+
+    /// Verify the integrating property: a1 + a2 ≈ 1.
+    ///
+    /// The 2P2Z has a pole at z=1 (integrator), so the denominator
+    /// is (1 − z⁻¹)(1 − p·z⁻¹) and the sum of feedback coefficients = 1.
+    #[test]
+    fn integrating_property() {
+        let p = hallworth_params();
+        let (tf, _) = p.to_transfer_function(V_IN, Topology::Buck);
+        let w = tf.to_2p2z().unwrap();
+        let sum = w.a1 as f64 + w.a2 as f64;
+        assert_close(sum, 1.0, 0.01, "a1 + a2");
+    }
+
+    // ── Table III — Digital slope compensation ───────────────────────────────
+
+    /// Verify digital slope compensation parameters (Table III).
+    ///
+    /// V_DAC = 3.3V, n_DAC = 10 bits → Ramp = V_PP × (2^10 - 1) / 3.3 = 192.53
+    /// T_STEP = 50ns, T_SLOPE = 3950ns → Steps = 79, ΔRamp = -2.437
+    #[test]
+    fn digital_slope_compensation() {
+        let p = hallworth_params();
+        let (_, dac) = p.to_transfer_function(V_IN, Topology::Buck);
+
+        let v_dac = 3.3;
+        let n_dac = 10;
+
+        // Eq. 31: Ramp = V_PP × (2^n_DAC - 1) / V_DAC
+        let ramp = dac.vpp() * ((1u32 << n_dac) - 1) as f64 / v_dac;
+        assert_close(ramp, 192.53, 0.5, "Ramp");
+
+        // Eq. 32: Steps = T_SLOPE / T_STEP
+        let t_step: f64 = 50e-9; // 50 ns
+        let t_slope: f64 = 3950e-9; // 3950 ns (= T_S - T_START, where T_START ≈ 400 ns + blanking)
+        let steps = (t_slope / t_step).round();
+        assert_close(steps, 79.0, 0.01, "Steps");
+
+        // Eq. 33: ΔRamp = -Ramp / Steps
+        let delta_ramp = -ramp / steps;
+        assert_close(delta_ramp, -2.437, 0.5, "ΔRamp");
+    }
+
+    /// Verify that the dac_slope in V/s matches S_E from the paper.
+    ///
+    /// S_N = (V_IN - V_OUT - V_DIODE) × R_I / L_O   (eq. 4, current-sense domain)
+    /// S_E = (m_C - 1) × S_N                          (eq. 5)
+    /// dac_slope = -S_E
+    #[test]
+    fn dac_slope_matches_se() {
+        let p = hallworth_params();
+        let (_, dac) = p.to_transfer_function(V_IN, Topology::Buck);
+
+        let s_n = (V_IN - V_OUT - V_DIODE) * R_I / L_OUT;
+        let d = (V_OUT + V_DIODE) / V_IN;
+        let m_c = (1.0 + PI / 2.0) / (PI * (1.0 - d));
+        let s_e = (m_c - 1.0) * s_n;
+
+        assert_close(-dac.dac_slope, s_e, 0.1, "S_E = -dac_slope");
+        // Confirm V_PP = S_E × T_S
+        assert_close(dac.vpp(), s_e / F_SW, 0.1, "V_PP = S_E × T_S");
     }
 }

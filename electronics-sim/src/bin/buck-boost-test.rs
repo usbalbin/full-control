@@ -116,7 +116,8 @@ const PARAMS: Parameters = Parameters {
 
 const CONTROLLER_DAC_SETTINGS: BuckBoostTransferFunction =
     BuckBoostTransferFunction::new(PARAMS, 24.0, 8.0, V_TARGET.0);
-const WEIGHTS: BuckBoostWeights<f32> = CONTROLLER_DAC_SETTINGS.to_weights();
+const WEIGHTS: BuckBoostWeights<f32> = CONTROLLER_DAC_SETTINGS.to_weights()
+    .expect("compensator infeasible: phi_v >= 90deg, reduce crossover_hz or cycles_per_tick");
 
 // Slope compensation in A/s for each gain-schedule region (negative = downward).
 // The BuckBoost plant always has S_n = V_in/L, so each slope is computed from
@@ -332,6 +333,9 @@ fn main() {
         t_prop_delay: Time(T_COMPARATOR_DELAY),
         t_dac_sample: Time(1.0 / 15e6),
         current_conduction: CurrentConduction::Synchronous,
+        t_blanking: Time(0.0),
+        t_adc_sample_point: Time(0.0),
+        max_duty: 1.0,
     };
     let mut sim = CurrentModeConverter::new(parameters, Mode::BuckBoost);
 

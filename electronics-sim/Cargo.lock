@@ -2610,6 +2610,7 @@ dependencies = [
  "full-control",
  "pid",
  "rerun",
+ "serde",
 ]
 
 [[package]]

@@ -5,13 +5,13 @@ use electronics_sim::{
 pub use electronics_sim::CurrentConduction;
 use full_control::{
     buck_boost::Mode,
-    control_2p2z::{Parameters, PhaseMargin, Topology as ControlTopology, TwoPoleTwoZeroParams},
+    control_2p2z::{Parameters, PhaseMargin, Topology as ControlTopology},
 };
 
 // ── Hardware profiles ────────────────────────────────────────────────────────
 
 /// MCU-specific parameters (comparator, ADC, processing, HRTIM slope quantization).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct McuProfile {
     pub name: String,
     pub comp_delay_ns: f64,           // Comparator propagation delay [ns]
@@ -47,19 +47,20 @@ impl McuProfile {
 }
 
 /// Current sensor parameters.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct CsProfile {
     pub name: String,
+    pub cs_gain_mv_a: f64,     // Sensitivity [mV/A]
     pub cs_bandwidth_khz: f64, // Current-sense amplifier bandwidth [kHz] (0 = ideal)
 }
 
 impl CsProfile {
     pub fn ideal() -> Self {
-        Self { name: "Ideal".into(), cs_bandwidth_khz: 0.0 }
+        Self { name: "Ideal".into(), cs_gain_mv_a: 66.0, cs_bandwidth_khz: 0.0 }
     }
 
     pub fn acs37030() -> Self {
-        Self { name: "ACS37030".into(), cs_bandwidth_khz: 1000.0 }
+        Self { name: "ACS37030 ±20A".into(), cs_gain_mv_a: 66.0, cs_bandwidth_khz: 5000.0 }
     }
 
     pub fn presets() -> Vec<Self> {
@@ -68,7 +69,7 @@ impl CsProfile {
 }
 
 /// Slope compensation DAC parameters.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DacProfile {
     pub name: String,
     pub dac_filter_bw_khz: f64, // DAC output LP filter bandwidth [kHz] (0 = ideal)
@@ -103,14 +104,14 @@ const V_REF: f64 = 3.3;
 const ADC_MAX: f64 = 4095.0;
 const LSB: f64 = V_REF / ADC_MAX;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LoadKind {
     Steps,
     Battery,
 }
 
 /// All adjustable simulation parameters — one field per slider.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SimParams {
     pub v_in: f64,          // Input voltage [V]
     pub v_out_target: f64,  // Output voltage setpoint [V]
@@ -119,7 +120,6 @@ pub struct SimParams {
     pub c_out_uf: f64,      // Output capacitance [µF]
     pub r_esr_mohm: f64,    // Output cap ESR [mΩ]
     pub r_series_mohm: f64, // Inductor DCR + switch R_ds(on) [mΩ]
-    pub cs_gain_mv_a: f64,  // Current-sense gain [mV/A]
     pub max_current: f64,   // Maximum trip current [A]
 
     pub load_kind: LoadKind,
@@ -143,6 +143,7 @@ pub struct SimParams {
     pub blanking_ns: f64,       // Comparator blanking window [ns] (0 = no blanking)
     pub adc_sample_ns: f64,     // ADC sample point [ns from period start] (0 = start of cycle)
     pub max_duty_pct: f64,      // Maximum duty cycle [%] (100 = no limit)
+    pub slope_overcomp: f64,    // Slope over-compensation factor (1.0 = none, 1.5 = firmware default)
 
     // ── Hardware profiles ─────────────────────────────────────────────────
     pub mcu: McuProfile,
@@ -160,7 +161,6 @@ impl Default for SimParams {
             c_out_uf: 47.0,
             r_esr_mohm: 10.0,
             r_series_mohm: 35.0,
-            cs_gain_mv_a: 66.0,
             max_current: 10.0,
             current_conduction: CurrentConduction::Synchronous,
             load_kind: LoadKind::Steps,
@@ -173,6 +173,7 @@ impl Default for SimParams {
             blanking_ns: 0.0,
             adc_sample_ns: 0.0,
             max_duty_pct: 100.0,
+            slope_overcomp: 1.5,
             mcu: McuProfile::ideal(),
             cs: CsProfile::ideal(),
             dac: DacProfile::ideal(),
@@ -207,7 +208,7 @@ pub fn build_ctrl_params(p: &SimParams) -> Option<Parameters> {
     let l_inductor = p.l_uh * 1e-6;
     let c_out = p.c_out_uf * 1e-6;
     let r_esr = p.r_esr_mohm * 1e-3;
-    let cs_gain = p.cs_gain_mv_a * 1e-3;
+    let cs_gain = p.cs.cs_gain_mv_a * 1e-3;
     let nominal_r = match p.load_kind {
         LoadKind::Steps => p.r_loads[0],
         LoadKind::Battery => p.v_out_target / p.max_current * 2.0,
@@ -265,29 +266,29 @@ impl Battery {
 
 /// Run soft-start → steady-state → load-step (or battery charging) simulation.
 ///
-/// Returns `None` when parameters are invalid (e.g. V_out ≥ V_in, or the
-/// controller design produces non-finite coefficients).
-pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
+/// Returns `Err(reason)` when parameters are invalid or the compensator design
+/// is infeasible, so the UI can display the specific cause.
+pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
     if p.v_out_target >= p.v_in * 0.99 {
-        return None; // not a Buck operating point
+        return Err("V_out must be less than V_in".into());
     }
     if p.f_sw_khz <= 0.0 || p.l_uh <= 0.0 || p.c_out_uf <= 0.0 {
-        return None;
+        return Err("f_sw, L, and C_out must be positive".into());
     }
 
     // Validate load-specific params
     match p.load_kind {
         LoadKind::Steps => {
             if p.r_loads.is_empty() || p.r_loads.iter().any(|&r| r <= 0.0) {
-                return None;
+                return Err("Load resistances must be positive".into());
             }
         }
         LoadKind::Battery => {
-            if p.bat_v_init >= p.v_out_target
-                || p.bat_r_int_mohm <= 0.0
-                || p.bat_c_mf <= 0.0
-            {
-                return None;
+            if p.bat_v_init >= p.v_out_target {
+                return Err("Battery initial voltage must be below V_out target".into());
+            }
+            if p.bat_r_int_mohm <= 0.0 || p.bat_c_mf <= 0.0 {
+                return Err("Battery R_int and C must be positive".into());
             }
         }
     }
@@ -299,19 +300,20 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
     let c_out = p.c_out_uf * 1e-6;
     let r_esr = p.r_esr_mohm * 1e-3;
     let r_series = p.r_series_mohm * 1e-3;
-    let cs_gain = p.cs_gain_mv_a * 1e-3;
+    let cs_gain = p.cs.cs_gain_mv_a * 1e-3;
 
     // Auto-scale feedback divider so V_adc ≈ 75 % of ADC range at the target.
     let divider_ratio = (V_REF * 0.75) / p.v_out_target;
     if divider_ratio >= 1.0 {
-        return None; // v_out_target too small (< V_REF * 0.75)
+        return Err("V_out target too low (< V_ref × 0.75)".into());
     }
 
     let target_code = p.v_out_target * divider_ratio / LSB;
     let dac_max_code = p.max_current * cs_gain / LSB;
 
     // Design the 2P2Z controller at the nominal operating point
-    let ctrl_params = build_ctrl_params(p)?;
+    let ctrl_params = build_ctrl_params(p)
+        .ok_or("Invalid operating point for controller design")?;
 
     let (tf, dac) = ctrl_params.to_transfer_function(p.v_in, ControlTopology::Buck);
     let slope_amp_per_sec = dac.dac_slope / cs_gain;
@@ -324,20 +326,40 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
         0.0
     };
 
-    let weights_phys = tf.to_2p2z();
-    let weights_code = TwoPoleTwoZeroParams {
-        a1: weights_phys.a1,
-        a2: weights_phys.a2,
-        b0: (weights_phys.b0 as f64 / divider_ratio) as f32,
-        b1: (weights_phys.b1 as f64 / divider_ratio) as f32,
-        b2: (weights_phys.b2 as f64 / divider_ratio) as f32,
-    };
+    let weights_phys = tf.to_2p2z().ok_or_else(|| {
+        format!(
+            "Compensator infeasible: transport delays erode too much phase \
+             at this crossover frequency. Max feasible: {:.1} kHz. \
+             Reduce f_x, lower cycles/tick, or reduce ADC/processing/DAC delays.",
+            ctrl_params.max_feasible_crossover_hz(p.v_in, ControlTopology::Buck) / 1e3
+        )
+    })?;
+
+    // Ripple / limit-cycling check: b0 × ΔV_ripple must fit inside vpp / safety_factor
+    {
+        let d = p.v_out_target / p.v_in;
+        let v_l_on = p.v_in - p.v_out_target;
+        let di_l = v_l_on * d / (f_sw * l_inductor);
+        let dv_out = di_l * (r_esr + 1.0 / (8.0 * f_sw * c_out));
+        let b0_dv = (weights_phys.b0 as f64).abs() * dv_out;
+        let vpp_sf = dac.vpp() / ctrl_params.safety_factor;
+        if b0_dv > vpp_sf {
+            return Err(format!(
+                "Crossover too high: b0 \u{00d7} \u{0394}V_ripple ({:.2}) exceeds vpp/SF ({:.2}), \
+                 limit cycling likely. Max feasible: {:.1} kHz",
+                b0_dv,
+                vpp_sf,
+                ctrl_params.max_feasible_crossover_hz(p.v_in, ControlTopology::Buck) / 1e3
+            ));
+        }
+    }
+    let weights_code = weights_phys.to_code_domain(divider_ratio);
 
     if !weights_code.b0.is_finite() || weights_code.b0.abs() > 1e6 {
-        return None;
+        return Err("Controller coefficients out of range (b0 non-finite or > 1e6)".into());
     }
 
-    let mut ctrl = weights_code.to_controller(0.0_f32, dac_max_code as f32);
+    let mut ctrl = weights_code.to_controller(0.0_f32, 4096.0_f32);
 
     let sim_params = SimParameters {
         period: Time(t_period),
@@ -380,8 +402,9 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
                 let pt = tick_one(
                     &mut ctrl, &mut sim, v_in, target,
                     |v| Current(v.0 / r0),
-                    divider_ratio, dac_max_code, cs_gain, p.max_current, f_sw, time,
-                    ctrl_update, &mut held_dac_code, slope_step_size_a,
+                    divider_ratio, dac_max_code, &ctrl_params, p.max_current,
+                    time, ctrl_update, &mut held_dac_code, slope_step_size_a,
+                    p.slope_overcomp,
                 );
                 results.push(pt);
                 time += t_period;
@@ -395,8 +418,9 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
                 let pt = tick_one(
                     &mut ctrl, &mut sim, v_in, target_code as f32,
                     |v| Current(v.0 / r0),
-                    divider_ratio, dac_max_code, cs_gain, p.max_current, f_sw, time,
-                    ctrl_update, &mut held_dac_code, slope_step_size_a,
+                    divider_ratio, dac_max_code, &ctrl_params, p.max_current,
+                    time, ctrl_update, &mut held_dac_code, slope_step_size_a,
+                    p.slope_overcomp,
                 );
                 results.push(pt);
                 time += t_period;
@@ -410,8 +434,9 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
                     let pt = tick_one(
                         &mut ctrl, &mut sim, v_in, target_code as f32,
                         |v| Current(v.0 / r),
-                        divider_ratio, dac_max_code, cs_gain, p.max_current, f_sw, time,
-                        ctrl_update, &mut held_dac_code, slope_step_size_a,
+                        divider_ratio, dac_max_code, &ctrl_params, p.max_current,
+                        time, ctrl_update, &mut held_dac_code, slope_step_size_a,
+                        p.slope_overcomp,
                     );
                     results.push(pt);
                     time += t_period;
@@ -419,7 +444,7 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
                 }
             }
 
-            Some(results)
+            Ok(results)
         }
 
         LoadKind::Battery => {
@@ -445,8 +470,9 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
                 let mut pt = tick_one(
                     &mut ctrl, &mut sim, v_in, target,
                     |v| Current(((v.0 - v_oc) / r_int).max(0.0)),
-                    divider_ratio, dac_max_code, cs_gain, p.max_current, f_sw, time,
-                    ctrl_update, &mut held_dac_code, slope_step_size_a,
+                    divider_ratio, dac_max_code, &ctrl_params, p.max_current,
+                    time, ctrl_update, &mut held_dac_code, slope_step_size_a,
+                    p.slope_overcomp,
                 );
                 let avg_i = (pt.i_l_min as f64 + pt.i_l_max as f64) / 2.0;
                 bat.update(avg_i, t_period);
@@ -467,8 +493,9 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
                 let mut pt = tick_one(
                     &mut ctrl, &mut sim, v_in, target_code as f32,
                     |v| Current(((v.0 - v_oc) / r_int).max(0.0)),
-                    divider_ratio, dac_max_code, cs_gain, p.max_current, f_sw, time,
-                    ctrl_update, &mut held_dac_code, slope_step_size_a,
+                    divider_ratio, dac_max_code, &ctrl_params, p.max_current,
+                    time, ctrl_update, &mut held_dac_code, slope_step_size_a,
+                    p.slope_overcomp,
                 );
                 let avg_i = (pt.i_l_min as f64 + pt.i_l_max as f64) / 2.0;
                 bat.update(avg_i, t_period);
@@ -478,7 +505,7 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
                 cycle_counter += 1;
             }
 
-            Some(results)
+            Ok(results)
         }
     }
 }
@@ -491,14 +518,17 @@ fn tick_one(
     load: impl FnMut(Voltage) -> Current,
     divider_ratio: f64,
     dac_max_code: f64,
-    cs_gain: f64,
+    ctrl_params: &Parameters,
     max_current: f64,
-    f_sw: f64,
     time: f64,
     ctrl_update: bool,
     held_dac_code: &mut u16,
     slope_step_size_a: f64,
+    slope_overcomp: f64,
 ) -> SimPoint {
+    let cs_gain = ctrl_params.current_sense_gain;
+    let f_sw = ctrl_params.f_sw;
+
     // Decimation: only update controller when ctrl_update is true
     let dac_code = if ctrl_update {
         let adc_code = {
@@ -506,20 +536,32 @@ fn tick_one(
             (v_adc / LSB).round().clamp(0.0, ADC_MAX) as u16
         };
         let error = target_code - adc_code as f32;
-        let output = ctrl.update(error);
-        let code = (output.round() as i32).clamp(0, dac_max_code as i32) as u16;
+
+        // Recompute slope offset from current operating point (matches firmware task1)
+        let v_target_eff = target_code as f64 * LSB / divider_ratio;
+        let dac = ctrl_params.dac_settings_at(
+            v_in.0, v_target_eff, ControlTopology::Buck, slope_overcomp,
+        );
+        let d = (v_target_eff / v_in.0).clamp(0.01, 0.99);
+        let slope_offset = dac.slope_offset_codes(d, LSB);
+
+        let dynamic_limit = (dac_max_code + slope_offset) as f32;
+        let output = ctrl.update_clamped(error, 0.0_f32, dynamic_limit);
+
+        let code = (output.round() as i32).clamp(0, i32::MAX) as u16;
         *held_dac_code = code;
         code
     } else {
         *held_dac_code // ZOH: reuse last control output
     };
 
-    let mut trip = Current((dac_code as f64 * LSB / cs_gain).clamp(0.0, max_current));
+    let trip_limit = max_current * 2.0;
+    let mut trip = Current((dac_code as f64 * LSB / cs_gain).clamp(0.0, trip_limit));
 
     // Slope step quantization: snap trip to nearest step boundary
     if slope_step_size_a > 0.0 {
         trip = Current((trip.0 / slope_step_size_a).round() * slope_step_size_a);
-        trip = Current(trip.0.clamp(0.0, max_current));
+        trip = Current(trip.0.clamp(0.0, trip_limit));
     }
 
     let i_l_min = sim.i_inductor.0 as f32;

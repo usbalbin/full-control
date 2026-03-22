@@ -28,6 +28,9 @@ fn main() {
         t_prop_delay: Time(0.0),
         t_dac_sample: Time(0.0),
         current_conduction: CurrentConduction::Synchronous,
+        t_blanking: Time(0.0),
+        t_adc_sample_point: Time(0.0),
+        max_duty: 1.0,
     };
     let mut sim = CurrentModeConverter::new(params, Topology::Buck);
 

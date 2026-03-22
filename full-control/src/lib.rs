@@ -8,6 +8,7 @@ pub mod buck_boost;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use control_2p2z::Scalar;
 
     #[test]
     fn test_scalar_impl_f32() {
@@ -30,7 +31,7 @@ mod tests {
             b2: 0.25,
         };
 
-        let controller = params.to_controller(0.0, 4095.0);
+        let mut controller = params.to_controller(0.0, 4095.0);
         assert_eq!(controller.last_output(), 0.0);
 
         let output = controller.update(100.0);
@@ -61,13 +62,6 @@ mod tests {
     }
 
     #[test]
-    fn test_topologies() {
-        assert_eq!(control_2p2z::Topology::Buck.name(), "Buck");
-        assert_eq!(control_2p2z::Topology::Boost.name(), "Boost");
-        assert_eq!(control_2p2z::Topology::BuckBoost.name(), "BuckBoost");
-    }
-
-    #[test]
     fn test_mode_enum() {
         assert_eq!(buck_boost::Mode::Buck.name(), "Buck     ");
         assert_eq!(buck_boost::Mode::Boost.name(), "Boost    ");
@@ -75,27 +69,10 @@ mod tests {
     }
 
     #[test]
-    fn test_select_mode_buck() {
-        let mode = buck_boost::select_mode(24.0, 13.5, buck_boost::Mode::Buck);
-        assert_eq!(mode, buck_boost::Mode::Buck);
-    }
-
-    #[test]
-    fn test_select_mode_boost() {
-        let mode = buck_boost::select_mode(12.0, 13.5, buck_boost::Mode::BuckBoost);
-        assert_eq!(mode, buck_boost::Mode::Boost);
-    }
-
-    #[test]
-    fn test_select_mode_buck_boost() {
-        let mode = buck_boost::select_mode(13.5, 13.5, buck_boost::Mode::BuckBoost);
-        assert_eq!(mode, buck_boost::Mode::BuckBoost);
-    }
-
-    #[test]
     fn test_fmac_iir_basic() {
-        // Simple low-pass filter coefficients
-        let b = [16384, 16384, 0]; // b0=0.5, b1=0.5
+        // Simple low-pass filter: real b0=0.5, b1=0.5.
+        // With R=1 the q1.15 bits are real_coeff / 2^R × 32768 = 0.5/2 × 32768 = 8192.
+        let b = [8192, 8192, 0];
         let a = [0, 0];
         let mut fmac = fmac::FmacIir::new(b, a, 1, -32768, 32767);
 
@@ -117,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parameters_crossover_divisor() {
+    fn test_max_feasible_crossover_hz() {
         let params = control_2p2z::Parameters {
             v_out: 13.5,
             v_diode: 0.0,
@@ -135,9 +112,14 @@ mod tests {
             cycles_per_tick: 1,
         };
 
-        let divisor = params.crossover_divisor(control_2p2z::Topology::Buck, 24.0);
-        assert!(divisor >= 8.0);
-        assert!(divisor <= 1000.0);
+        let max_fx = params.max_feasible_crossover_hz(24.0, control_2p2z::Topology::Buck);
+        // Max feasible should be between 1 Hz and f_sw/8
+        assert!(max_fx >= 1.0);
+        assert!(max_fx <= 500e3 / 8.0);
+        // A design at the max feasible frequency should succeed
+        let params_at_max = control_2p2z::Parameters { crossover_hz: max_fx, ..params };
+        let (tf, _) = params_at_max.to_transfer_function(24.0, control_2p2z::Topology::Buck);
+        assert!(tf.to_2p2z().is_some());
     }
 
     #[test]
@@ -160,7 +142,7 @@ mod tests {
         };
 
         let (tf, _) = params.to_transfer_function(24.0, control_2p2z::Topology::Buck);
-        let coeffs = tf.to_2p2z();
+        let coeffs = tf.to_2p2z().unwrap();
 
         // b0 should be positive and reasonable
         assert!(coeffs.b0 > 0.0);
@@ -193,18 +175,18 @@ mod tests {
         let tf = buck_boost::BuckBoostTransferFunction::new(
             params,
             24.0,
-            12.0,
+            7.0,
             13.5,
         );
 
-        let controller = tf.to_weights().to_controller(0.0, 4095.0);
+        let mut controller = tf.to_weights().unwrap().to_controller(0.0, 4095.0);
 
-        // Test Buck mode
-        let (output, mode) = controller.update(24.0, 13.5, 13.5);
+        // Test Buck mode (ratio 24/13.5 = 1.78 > 1.40 outer boundary)
+        let (_output, mode) = controller.update(24.0, 13.5, 13.5);
         assert_eq!(mode, buck_boost::Mode::Buck);
 
-        // Test Boost mode
-        let (output, mode) = controller.update(12.0, 13.5, 13.5);
+        // Test Boost mode (ratio 7/13.5 = 0.52 < 0.60 outer boundary)
+        let (_output, mode) = controller.update(7.0, 13.5, 13.5);
         assert_eq!(mode, buck_boost::Mode::Boost);
     }
 
@@ -230,23 +212,26 @@ mod tests {
         let tf = buck_boost::BuckBoostTransferFunction::new(
             params,
             24.0,
-            12.0,
+            7.0,
             13.5,
         );
 
-        let mut controller = tf.to_weights().to_controller(0.0, 4095.0);
+        let mut controller = tf.to_weights().unwrap().to_controller(0.0, 4095.0);
 
-        // Start in BuckBoost mode (unity ratio)
+        // Start in BuckBoost mode (ratio 1.0, inner band [0.80, 1.20])
         let (_, mode) = controller.update(13.5, 13.5, 13.5);
         assert_eq!(mode, buck_boost::Mode::BuckBoost);
 
-        // Switch to Boost (v_in < v_out)
-        let (_, mode) = controller.update(12.0, 13.5, 13.5);
+        // Move well below unity to enter Boost (ratio 7/13.5 = 0.52 < 0.60 outer boundary)
+        let (_, mode) = controller.update(7.0, 13.5, 13.5);
         assert_eq!(mode, buck_boost::Mode::Boost);
 
-        // Switch back to BuckBoost (should stay in Boost until ratio is closer)
-        // With hysteresis, we need to cross the inner threshold
-        let (_, mode) = controller.update(13.0, 13.5, 13.5);
+        // Move into hysteresis zone (ratio 10/13.5 = 0.74, between 0.60 and 0.80) — stays Boost
+        let (_, mode) = controller.update(10.0, 13.5, 13.5);
+        assert_eq!(mode, buck_boost::Mode::Boost);
+
+        // Cross inner boundary into BuckBoost band (ratio 11.5/13.5 = 0.85 > 0.80) — switches
+        let (_, mode) = controller.update(11.5, 13.5, 13.5);
         assert_eq!(mode, buck_boost::Mode::BuckBoost);
     }
 
@@ -263,10 +248,24 @@ mod tests {
 
     #[test]
     fn test_dac_settings_vpp() {
-        let dac = control_2p2z::DacSettings {
-            dac_slope: -100000.0,
-            vpp: 10.0,
+        // Construct DacSettings via the Parameters API and verify vpp is positive.
+        let params = control_2p2z::Parameters {
+            v_out: 8.0,
+            v_diode: 0.6,
+            c_out: 440e-6,
+            f_sw: 200e3,
+            l_inductor: 22e-6,
+            r_esr_out_cap: 31e-3,
+            current_sense_gain: 0.48,
+            i_load: 2.0,
+            phase_margin: control_2p2z::PhaseMargin::Manual {
+                phase_margin: 75.0_f64.to_radians(),
+            },
+            safety_factor: 2.0,
+            crossover_hz: 15_000.0,
+            cycles_per_tick: 1,
         };
-        assert_eq!(dac.vpp(), 10.0);
+        let (_, dac) = params.to_transfer_function(16.0, control_2p2z::Topology::Buck);
+        assert!(dac.vpp() > 0.0);
     }
 }

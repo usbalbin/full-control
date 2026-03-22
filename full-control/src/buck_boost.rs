@@ -54,7 +54,11 @@ impl BuckBoostTransferFunction {
         }
     }
 
-    pub const fn to_weights(self) -> BuckBoostWeights<f32> {
+    /// Convert all three transfer functions to 2P2Z coefficients.
+    ///
+    /// Returns `None` if any of the three compensator designs is infeasible
+    /// (see [`TransferFunction::to_2p2z`]).
+    pub const fn to_weights(self) -> Option<BuckBoostWeights<f32>> {
         let BuckBoostTransferFunction {
             buck,
             boost,
@@ -64,11 +68,17 @@ impl BuckBoostTransferFunction {
             dac_buck_boost: _,
         } = self;
 
-        BuckBoostWeights {
-            buck: buck.to_2p2z(),
-            boost: boost.to_2p2z(),
-            buck_boost: buck_boost.to_2p2z(),
-        }
+        let (Some(buck), Some(boost), Some(buck_boost)) =
+            (buck.to_2p2z(), boost.to_2p2z(), buck_boost.to_2p2z())
+        else {
+            return None;
+        };
+
+        Some(BuckBoostWeights {
+            buck,
+            boost,
+            buck_boost,
+        })
     }
 }
 

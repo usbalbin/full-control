@@ -15,3 +15,4 @@ rerun = ["dep:rerun"]
 full-control = { path = "../full-control", default-features = false }
 pid = "4.0.0"
 rerun = { version = "0.24.0", optional = true}
+serde = { version = "1", features = ["derive"] }
