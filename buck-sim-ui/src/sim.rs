@@ -8,56 +8,94 @@ use full_control::{
     control_2p2z::{Parameters, PhaseMargin, Topology as ControlTopology, TwoPoleTwoZeroParams},
 };
 
-// ── Hardware profile ─────────────────────────────────────────────────────────
+// ── Hardware profiles ────────────────────────────────────────────────────────
 
+/// MCU-specific parameters (comparator, ADC, processing, HRTIM slope quantization).
 #[derive(Debug, Clone, PartialEq)]
-pub struct HwProfile {
+pub struct McuProfile {
     pub name: String,
-    // Current sensing
-    pub cs_bandwidth_khz: f64,    // Current-sense amplifier bandwidth [kHz] (0 = ideal)
-    // Comparator
-    pub comp_delay_ns: f64,       // Comparator propagation delay [ns]
-    // Slope compensation DAC
-    pub dac_filter_bw_khz: f64,   // DAC output LP filter bandwidth [kHz] (0 = ideal)
-    // Control loop transport delays (affect Bode phase margin)
-    pub t_adc_us: f64,            // ADC conversion + sampling [µs]
-    pub t_processing_us: f64,     // ISR execution [µs]
-    pub t_dac_us: f64,            // DAC/comparator update latency [µs]
+    pub comp_delay_ns: f64,           // Comparator propagation delay [ns]
+    pub t_adc_us: f64,                // ADC conversion + sampling [µs]
+    pub t_processing_us: f64,         // ISR execution [µs]
+    pub min_slope_steps_on_time: u16, // Min DAC steps during on-time (0 = ideal)
 }
 
-impl HwProfile {
+impl McuProfile {
     pub fn ideal() -> Self {
         Self {
             name: "Ideal".into(),
-            cs_bandwidth_khz: 0.0,
             comp_delay_ns: 0.0,
-            dac_filter_bw_khz: 0.0,
             t_adc_us: 0.0,
             t_processing_us: 0.0,
-            t_dac_us: 0.0,
+            min_slope_steps_on_time: 0,
         }
     }
 
-    pub fn stm32g4_acs37030() -> Self {
+    pub fn stm32g4() -> Self {
         Self {
-            name: "STM32G4 + ACS37030".into(),
-            cs_bandwidth_khz: 1000.0,
+            name: "STM32G4".into(),
             comp_delay_ns: 30.0,
-            dac_filter_bw_khz: 0.0,
             t_adc_us: 1.2,
             t_processing_us: 1.5,
-            t_dac_us: 0.2,
+            min_slope_steps_on_time: 55,
         }
     }
 
     pub fn presets() -> Vec<Self> {
-        vec![Self::ideal(), Self::stm32g4_acs37030()]
+        vec![Self::ideal(), Self::stm32g4()]
+    }
+}
+
+/// Current sensor parameters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CsProfile {
+    pub name: String,
+    pub cs_bandwidth_khz: f64, // Current-sense amplifier bandwidth [kHz] (0 = ideal)
+}
+
+impl CsProfile {
+    pub fn ideal() -> Self {
+        Self { name: "Ideal".into(), cs_bandwidth_khz: 0.0 }
     }
 
-    /// True when all transport delays are zero (preserves legacy Manual phase margin).
-    pub fn has_transport_delays(&self) -> bool {
-        self.t_adc_us != 0.0 || self.t_processing_us != 0.0 || self.t_dac_us != 0.0
+    pub fn acs37030() -> Self {
+        Self { name: "ACS37030".into(), cs_bandwidth_khz: 1000.0 }
     }
+
+    pub fn presets() -> Vec<Self> {
+        vec![Self::ideal(), Self::acs37030()]
+    }
+}
+
+/// Slope compensation DAC parameters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DacProfile {
+    pub name: String,
+    pub dac_filter_bw_khz: f64, // DAC output LP filter bandwidth [kHz] (0 = ideal)
+    pub t_dac_us: f64,          // DAC settling / update latency [µs]
+}
+
+impl DacProfile {
+    pub fn ideal() -> Self {
+        Self { name: "Ideal".into(), dac_filter_bw_khz: 0.0, t_dac_us: 0.0 }
+    }
+
+    pub fn dac_1msps() -> Self {
+        Self { name: "1 MSPS (buffered)".into(), dac_filter_bw_khz: 0.0, t_dac_us: 1.7 }
+    }
+
+    pub fn dac_15msps() -> Self {
+        Self { name: "15 MSPS (internal)".into(), dac_filter_bw_khz: 0.0, t_dac_us: 0.07 }
+    }
+
+    pub fn presets() -> Vec<Self> {
+        vec![Self::ideal(), Self::dac_1msps(), Self::dac_15msps()]
+    }
+}
+
+/// True when any transport delays are non-zero (triggers Calculated phase margin).
+pub fn has_transport_delays(mcu: &McuProfile, dac: &DacProfile) -> bool {
+    mcu.t_adc_us != 0.0 || mcu.t_processing_us != 0.0 || dac.t_dac_us != 0.0
 }
 
 // Fixed ADC/DAC constants (STM32G474)
@@ -101,8 +139,10 @@ pub struct SimParams {
     pub bat_r_int_mohm: f64, // Battery internal resistance [mΩ]
     pub bat_c_mf: f64,       // Battery capacitance [mF] (sets charging speed in sim)
 
-    // ── Hardware delays ──────────────────────────────────────────────────
-    pub hw: HwProfile,
+    // ── Hardware profiles ─────────────────────────────────────────────────
+    pub mcu: McuProfile,
+    pub cs: CsProfile,
+    pub dac: DacProfile,
 }
 
 impl Default for SimParams {
@@ -125,7 +165,9 @@ impl Default for SimParams {
             bat_v_init: 11.0,
             bat_r_int_mohm: 50.0,
             bat_c_mf: 20.0,
-            hw: HwProfile::ideal(),
+            mcu: McuProfile::ideal(),
+            cs: CsProfile::ideal(),
+            dac: DacProfile::ideal(),
         }
     }
 }
@@ -162,11 +204,11 @@ pub fn build_ctrl_params(p: &SimParams) -> Option<Parameters> {
         LoadKind::Steps => p.r_loads[0],
         LoadKind::Battery => p.v_out_target / p.max_current * 2.0,
     };
-    let phase_margin = if p.hw.has_transport_delays() {
+    let phase_margin = if has_transport_delays(&p.mcu, &p.dac) {
         PhaseMargin::Calculated {
-            t_adc: p.hw.t_adc_us * 1e-6,
-            t_processing: p.hw.t_processing_us * 1e-6,
-            t_dac: p.hw.t_dac_us * 1e-6,
+            t_adc: p.mcu.t_adc_us * 1e-6,
+            t_processing: p.mcu.t_processing_us * 1e-6,
+            t_dac: p.dac.t_dac_us * 1e-6,
         }
     } else {
         PhaseMargin::Manual { phase_margin: 75.0_f64.to_radians() }
@@ -266,6 +308,14 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
     let (tf, dac) = ctrl_params.to_transfer_function(p.v_in, ControlTopology::Buck);
     let slope_amp_per_sec = dac.dac_slope / cs_gain;
 
+    let slope_step_size_a = if p.mcu.min_slope_steps_on_time > 0 {
+        let d_nom = p.v_out_target / p.v_in;
+        let steps_per_period = (p.mcu.min_slope_steps_on_time as f64 / d_nom).ceil();
+        slope_amp_per_sec.abs() * t_period / steps_per_period
+    } else {
+        0.0
+    };
+
     let weights_phys = tf.to_2p2z();
     let weights_code = TwoPoleTwoZeroParams {
         a1: weights_phys.a1,
@@ -292,9 +342,9 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
         r_esr_cin: Resistance(0.0),
         r_in: Resistance(0.0),
         l_in: Inductance(0.0),
-        tau_current_sense: SimParameters::bw_to_tau(p.hw.cs_bandwidth_khz * 1e3),
-        tau_dac: SimParameters::bw_to_tau(p.hw.dac_filter_bw_khz * 1e3),
-        t_prop_delay: Time(p.hw.comp_delay_ns * 1e-9),
+        tau_current_sense: SimParameters::bw_to_tau(p.cs.cs_bandwidth_khz * 1e3),
+        tau_dac: SimParameters::bw_to_tau(p.dac.dac_filter_bw_khz * 1e3),
+        t_prop_delay: Time(p.mcu.comp_delay_ns * 1e-9),
         t_dac_sample: Time(0.0),
         current_conduction: p.current_conduction,
     };
@@ -303,6 +353,8 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
     let v_in = Voltage(p.v_in);
     let mut time = 0.0_f64;
     let soft_cycles = 1500_usize;
+    let mut held_dac_code: u16 = 0;
+    let mut cycle_counter: usize = 0;
 
     match p.load_kind {
         LoadKind::Steps => {
@@ -313,37 +365,46 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
             for i in 0..soft_cycles {
                 let target = target_code as f32 * (i + 1) as f32 / soft_cycles as f32;
                 let r0 = p.r_loads[0];
+                let ctrl_update = cycle_counter % p.cycles_per_tick == 0;
                 let pt = tick_one(
                     &mut ctrl, &mut sim, v_in, target,
                     |v| Current(v.0 / r0),
                     divider_ratio, dac_max_code, cs_gain, p.max_current, f_sw, time,
+                    ctrl_update, &mut held_dac_code, slope_step_size_a,
                 );
                 results.push(pt);
                 time += t_period;
+                cycle_counter += 1;
             }
 
             // ── Steady-state ─────────────────────────────────────────────────
             for _ in 0..1500_usize {
                 let r0 = p.r_loads[0];
+                let ctrl_update = cycle_counter % p.cycles_per_tick == 0;
                 let pt = tick_one(
                     &mut ctrl, &mut sim, v_in, target_code as f32,
                     |v| Current(v.0 / r0),
                     divider_ratio, dac_max_code, cs_gain, p.max_current, f_sw, time,
+                    ctrl_update, &mut held_dac_code, slope_step_size_a,
                 );
                 results.push(pt);
                 time += t_period;
+                cycle_counter += 1;
             }
 
             // ── Load steps: 2000 cycles each for r_loads[1..] ─────────────────
             for &r in &p.r_loads[1..] {
                 for _ in 0..2000_usize {
+                    let ctrl_update = cycle_counter % p.cycles_per_tick == 0;
                     let pt = tick_one(
                         &mut ctrl, &mut sim, v_in, target_code as f32,
                         |v| Current(v.0 / r),
                         divider_ratio, dac_max_code, cs_gain, p.max_current, f_sw, time,
+                        ctrl_update, &mut held_dac_code, slope_step_size_a,
                     );
                     results.push(pt);
                     time += t_period;
+                    cycle_counter += 1;
                 }
             }
 
@@ -369,16 +430,19 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
                 let target = target_code as f32 * (i + 1) as f32 / soft_cycles as f32;
                 let v_oc = bat.v_oc;
                 let r_int = bat.r_int;
+                let ctrl_update = cycle_counter % p.cycles_per_tick == 0;
                 let mut pt = tick_one(
                     &mut ctrl, &mut sim, v_in, target,
                     |v| Current(((v.0 - v_oc) / r_int).max(0.0)),
                     divider_ratio, dac_max_code, cs_gain, p.max_current, f_sw, time,
+                    ctrl_update, &mut held_dac_code, slope_step_size_a,
                 );
                 let avg_i = (pt.i_l_min as f64 + pt.i_l_max as f64) / 2.0;
                 bat.update(avg_i, t_period);
                 pt.v_bat = bat.v_oc as f32;
                 results.push(pt);
                 time += t_period;
+                cycle_counter += 1;
             }
 
             // ── CC-CV battery charging ────────────────────────────────────────
@@ -388,16 +452,19 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
             for _ in 0..bat_cycles {
                 let v_oc = bat.v_oc;
                 let r_int = bat.r_int;
+                let ctrl_update = cycle_counter % p.cycles_per_tick == 0;
                 let mut pt = tick_one(
                     &mut ctrl, &mut sim, v_in, target_code as f32,
                     |v| Current(((v.0 - v_oc) / r_int).max(0.0)),
                     divider_ratio, dac_max_code, cs_gain, p.max_current, f_sw, time,
+                    ctrl_update, &mut held_dac_code, slope_step_size_a,
                 );
                 let avg_i = (pt.i_l_min as f64 + pt.i_l_max as f64) / 2.0;
                 bat.update(avg_i, t_period);
                 pt.v_bat = bat.v_oc as f32;
                 results.push(pt);
                 time += t_period;
+                cycle_counter += 1;
             }
 
             Some(results)
@@ -417,15 +484,33 @@ fn tick_one(
     max_current: f64,
     f_sw: f64,
     time: f64,
+    ctrl_update: bool,
+    held_dac_code: &mut u16,
+    slope_step_size_a: f64,
 ) -> SimPoint {
-    let adc_code = {
-        let v_adc = sim.v_out.0 * divider_ratio;
-        (v_adc / LSB).round().clamp(0.0, ADC_MAX) as u16
+    // Decimation: only update controller when ctrl_update is true
+    let dac_code = if ctrl_update {
+        let adc_code = {
+            let v_adc = sim.v_out.0 * divider_ratio;
+            (v_adc / LSB).round().clamp(0.0, ADC_MAX) as u16
+        };
+        let error = target_code - adc_code as f32;
+        let output = ctrl.update(error);
+        let code = (output.round() as i32).clamp(0, dac_max_code as i32) as u16;
+        *held_dac_code = code;
+        code
+    } else {
+        *held_dac_code // ZOH: reuse last control output
     };
-    let error = target_code - adc_code as f32;
-    let output = ctrl.update(error);
-    let dac_code = (output.round() as i32).clamp(0, dac_max_code as i32) as u16;
-    let trip = Current((dac_code as f64 * LSB / cs_gain).clamp(0.0, max_current));
+
+    let mut trip = Current((dac_code as f64 * LSB / cs_gain).clamp(0.0, max_current));
+
+    // Slope step quantization: snap trip to nearest step boundary
+    if slope_step_size_a > 0.0 {
+        trip = Current((trip.0 / slope_step_size_a).round() * slope_step_size_a);
+        trip = Current(trip.0.clamp(0.0, max_current));
+    }
+
     let i_l_min = sim.i_inductor.0 as f32;
     let (t_on, i_l_max) = sim.tick(v_in, trip, load);
     let i_l_max = i_l_max.0 as f32;

@@ -3,7 +3,7 @@ use egui_plot::{HLine, Line, Plot, PlotPoints};
 use full_control::control_2p2z::Topology as ControlTopology;
 
 use crate::bode::{BodeData, show_bode};
-use crate::sim::{CurrentConduction, HwProfile, LoadKind, SimParams, SimPoint, build_ctrl_params, run_simulation};
+use crate::sim::{CurrentConduction, McuProfile, CsProfile, DacProfile, LoadKind, SimParams, SimPoint, build_ctrl_params, run_simulation};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
@@ -37,9 +37,13 @@ pub struct BuckSimApp {
     bat_r_int_mohm: f64,    // [mΩ]  battery internal resistance
     bat_c_mf: f64,          // [mF]  battery capacitance (controls charging speed)
 
-    // ── Hardware profile ──────────────────────────────────────────────────────
-    hw: HwProfile,
-    hw_preset_idx: usize, // index into HwProfile::presets(), or usize::MAX for "Custom"
+    // ── Hardware profiles ─────────────────────────────────────────────────────
+    mcu: McuProfile,
+    mcu_preset_idx: usize,
+    cs: CsProfile,
+    cs_preset_idx: usize,
+    dac: DacProfile,
+    dac_preset_idx: usize,
 
     // ── Cached simulation output ────────────────────────────────────────────
     sim_data: Option<Vec<SimPoint>>,
@@ -82,8 +86,12 @@ impl Default for BuckSimApp {
             bat_v_init: defaults.bat_v_init,
             bat_r_int_mohm: defaults.bat_r_int_mohm,
             bat_c_mf: defaults.bat_c_mf,
-            hw: defaults.hw.clone(),
-            hw_preset_idx: 0, // "Ideal"
+            mcu: defaults.mcu.clone(),
+            mcu_preset_idx: 0,
+            cs: defaults.cs.clone(),
+            cs_preset_idx: 0,
+            dac: defaults.dac.clone(),
+            dac_preset_idx: 0,
             sim_data,
             bode_data,
             last_params: defaults,
@@ -120,7 +128,9 @@ impl BuckSimApp {
             bat_v_init: self.bat_v_init,
             bat_r_int_mohm: self.bat_r_int_mohm,
             bat_c_mf: self.bat_c_mf,
-            hw: self.hw.clone(),
+            mcu: self.mcu.clone(),
+            cs: self.cs.clone(),
+            dac: self.dac.clone(),
         }
     }
 
@@ -247,71 +257,139 @@ impl eframe::App for BuckSimApp {
                 );
                 self.cycles_per_tick = cpt as usize;
 
-                // ── Hardware profile ────────────────────────────────────
+                // ── Hardware profiles ───────────────────────────────────
                 ui.separator();
                 egui::CollapsingHeader::new("Hardware")
                     .default_open(false)
                     .show(ui, |ui| {
-                        // Preset combo box
-                        let presets = HwProfile::presets();
-                        let combo_label = if self.hw_preset_idx < presets.len() {
-                            presets[self.hw_preset_idx].name.as_str()
-                        } else {
-                            "Custom"
-                        };
-                        egui::ComboBox::from_label("Preset")
-                            .selected_text(combo_label)
-                            .show_ui(ui, |ui| {
-                                for (i, preset) in presets.iter().enumerate() {
-                                    if ui.selectable_value(
-                                        &mut self.hw_preset_idx, i, &preset.name,
-                                    ).clicked() {
-                                        self.hw = presets[i].clone();
+                        // ── MCU ───────────────────────────────────────────
+                        ui.label("MCU");
+                        {
+                            let presets = McuProfile::presets();
+                            let label = if self.mcu_preset_idx < presets.len() {
+                                presets[self.mcu_preset_idx].name.as_str()
+                            } else { "Custom" };
+                            egui::ComboBox::from_id_salt("mcu_preset")
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    for (i, p) in presets.iter().enumerate() {
+                                        if ui.selectable_value(
+                                            &mut self.mcu_preset_idx, i, &p.name,
+                                        ).clicked() {
+                                            self.mcu = presets[i].clone();
+                                        }
                                     }
-                                }
-                                ui.selectable_value(
-                                    &mut self.hw_preset_idx, usize::MAX, "Custom",
-                                );
-                            });
+                                    ui.selectable_value(
+                                        &mut self.mcu_preset_idx, usize::MAX, "Custom",
+                                    );
+                                });
 
-                        let before = self.hw.clone();
+                            let before = self.mcu.clone();
+                            ui.add(
+                                egui::Slider::new(&mut self.mcu.comp_delay_ns, 0.0..=500.0)
+                                    .text("Comp delay [ns]")
+                                    .step_by(1.0),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut self.mcu.t_adc_us, 0.0..=10.0)
+                                    .text("t_ADC [us]")
+                                    .step_by(0.1),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut self.mcu.t_processing_us, 0.0..=10.0)
+                                    .text("t_proc [us]")
+                                    .step_by(0.1),
+                            );
+                            let mut steps = self.mcu.min_slope_steps_on_time as f64;
+                            ui.add(
+                                egui::Slider::new(&mut steps, 0.0..=200.0)
+                                    .text("min steps/t_on")
+                                    .step_by(1.0),
+                            ).on_hover_text("Min DAC slope steps during on-time (0 = ideal)");
+                            self.mcu.min_slope_steps_on_time = steps as u16;
 
-                        ui.add(
-                            egui::Slider::new(&mut self.hw.cs_bandwidth_khz, 0.0..=10000.0)
-                                .text("CS BW [kHz]")
-                                .logarithmic(true)
-                                .max_decimals(0),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.hw.comp_delay_ns, 0.0..=500.0)
-                                .text("Comp delay [ns]")
-                                .step_by(1.0),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.hw.dac_filter_bw_khz, 0.0..=10000.0)
-                                .text("DAC BW [kHz]")
-                                .logarithmic(true)
-                                .max_decimals(0),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.hw.t_adc_us, 0.0..=10.0)
-                                .text("t_ADC [us]")
-                                .step_by(0.1),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.hw.t_processing_us, 0.0..=10.0)
-                                .text("t_proc [us]")
-                                .step_by(0.1),
-                        );
-                        ui.add(
-                            egui::Slider::new(&mut self.hw.t_dac_us, 0.0..=10.0)
-                                .text("t_DAC [us]")
-                                .step_by(0.1),
-                        );
+                            if self.mcu != before && self.mcu_preset_idx != usize::MAX {
+                                self.mcu_preset_idx = usize::MAX;
+                            }
+                        }
 
-                        // If user manually changed a slider, switch to Custom
-                        if self.hw != before && self.hw_preset_idx != usize::MAX {
-                            self.hw_preset_idx = usize::MAX;
+                        ui.separator();
+
+                        // ── Current sensor ────────────────────────────────
+                        ui.label("Current sensor");
+                        {
+                            let presets = CsProfile::presets();
+                            let label = if self.cs_preset_idx < presets.len() {
+                                presets[self.cs_preset_idx].name.as_str()
+                            } else { "Custom" };
+                            egui::ComboBox::from_id_salt("cs_preset")
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    for (i, p) in presets.iter().enumerate() {
+                                        if ui.selectable_value(
+                                            &mut self.cs_preset_idx, i, &p.name,
+                                        ).clicked() {
+                                            self.cs = presets[i].clone();
+                                        }
+                                    }
+                                    ui.selectable_value(
+                                        &mut self.cs_preset_idx, usize::MAX, "Custom",
+                                    );
+                                });
+
+                            let before = self.cs.clone();
+                            ui.add(
+                                egui::Slider::new(&mut self.cs.cs_bandwidth_khz, 0.0..=10000.0)
+                                    .text("CS BW [kHz]")
+                                    .logarithmic(true)
+                                    .max_decimals(0),
+                            );
+
+                            if self.cs != before && self.cs_preset_idx != usize::MAX {
+                                self.cs_preset_idx = usize::MAX;
+                            }
+                        }
+
+                        ui.separator();
+
+                        // ── Slope DAC ─────────────────────────────────────
+                        ui.label("Slope DAC");
+                        {
+                            let presets = DacProfile::presets();
+                            let label = if self.dac_preset_idx < presets.len() {
+                                presets[self.dac_preset_idx].name.as_str()
+                            } else { "Custom" };
+                            egui::ComboBox::from_id_salt("dac_preset")
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    for (i, p) in presets.iter().enumerate() {
+                                        if ui.selectable_value(
+                                            &mut self.dac_preset_idx, i, &p.name,
+                                        ).clicked() {
+                                            self.dac = presets[i].clone();
+                                        }
+                                    }
+                                    ui.selectable_value(
+                                        &mut self.dac_preset_idx, usize::MAX, "Custom",
+                                    );
+                                });
+
+                            let before = self.dac.clone();
+                            ui.add(
+                                egui::Slider::new(&mut self.dac.dac_filter_bw_khz, 0.0..=10000.0)
+                                    .text("DAC BW [kHz]")
+                                    .logarithmic(true)
+                                    .max_decimals(0),
+                            );
+                            ui.add(
+                                egui::Slider::new(&mut self.dac.t_dac_us, 0.0..=10.0)
+                                    .text("t_DAC [us]")
+                                    .step_by(0.01),
+                            );
+
+                            if self.dac != before && self.dac_preset_idx != usize::MAX {
+                                self.dac_preset_idx = usize::MAX;
+                            }
                         }
                     });
 
