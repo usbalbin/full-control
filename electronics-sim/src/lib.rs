@@ -394,7 +394,7 @@ impl CurrentModeConverter {
                 // throughout whether or not the inductor is conducting.
                 let (i_final, q_off) = match self.parameters.current_conduction {
                     CurrentConduction::Synchronous => (i_final, q_off),
-                    CurrentConduction::Diode if i_final.0 < 0.0 && i_max.0 > 0.0 => {
+                    CurrentConduction::Diode if i_final.0 < 0.0 && i_max.0 >= 0.0 => {
                         let t_zero = bisect_zero(|t| i_off_func.f(t), 0.0, t_off.0);
                         (Current(0.0), i_off_func.integral(0.0).f(t_zero))
                     }
@@ -521,7 +521,7 @@ impl CurrentModeConverter {
                     let q_in_full = i_off_func.integral(0.0).f(t_off.0);
                     match self.parameters.current_conduction {
                         CurrentConduction::Synchronous => (i_final, q_in_full),
-                        CurrentConduction::Diode if i_final.0 < 0.0 && i_max.0 > 0.0 => {
+                        CurrentConduction::Diode if i_final.0 < 0.0 && i_max.0 >= 0.0 => {
                             let t_zero = bisect_zero(|t| i_off_func.f(t), 0.0, t_off.0);
                             (Current(0.0), i_off_func.integral(0.0).f(t_zero))
                         }
