@@ -1,7 +1,15 @@
 use egui::Color32;
 use egui_plot::{HLine, Line, Plot, PlotPoints};
+use full_control::control_2p2z::Topology as ControlTopology;
 
-use crate::sim::{LoadKind, SimParams, SimPoint, run_simulation};
+use crate::bode::{BodeData, show_bode};
+use crate::sim::{CurrentConduction, HwProfile, LoadKind, SimParams, SimPoint, build_ctrl_params, run_simulation};
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Tab {
+    Simulation,
+    Bode,
+}
 
 pub struct BuckSimApp {
     // ── Slider state (human-friendly units) ────────────────────────────────
@@ -15,6 +23,13 @@ pub struct BuckSimApp {
     cs_gain_mv_a: f64,  // [mV/A]
     max_current: f64,   // [A]
 
+    // ── Controller tuning ──────────────────────────────────────────────────
+    crossover_khz: f64,    // [kHz]
+    cycles_per_tick: usize,
+
+    // ── Rectifier configuration ──────────────────────────────────────────────
+    current_conduction: CurrentConduction,
+
     // ── Load configuration ───────────────────────────────────────────────────
     load_kind: LoadKind,
     r_loads: Vec<f64>,      // [Ω] per-phase load resistances (Steps mode)
@@ -22,11 +37,17 @@ pub struct BuckSimApp {
     bat_r_int_mohm: f64,    // [mΩ]  battery internal resistance
     bat_c_mf: f64,          // [mF]  battery capacitance (controls charging speed)
 
+    // ── Hardware profile ──────────────────────────────────────────────────────
+    hw: HwProfile,
+    hw_preset_idx: usize, // index into HwProfile::presets(), or usize::MAX for "Custom"
+
     // ── Cached simulation output ────────────────────────────────────────────
     sim_data: Option<Vec<SimPoint>>,
+    bode_data: Option<BodeData>,
     last_params: SimParams,
 
-    // ── Plot options ────────────────────────────────────────────────────────
+    // ── UI state ─────────────────────────────────────────────────────────────
+    tab: Tab,
     plot_option: PlotOption,
 }
 
@@ -42,6 +63,7 @@ impl Default for BuckSimApp {
     fn default() -> Self {
         let defaults = SimParams::default();
         let sim_data = run_simulation(&defaults);
+        let bode_data = build_bode(&defaults);
         Self {
             v_in: defaults.v_in,
             v_out_target: defaults.v_out_target,
@@ -52,16 +74,30 @@ impl Default for BuckSimApp {
             r_series_mohm: defaults.r_series_mohm,
             cs_gain_mv_a: defaults.cs_gain_mv_a,
             max_current: defaults.max_current,
+            crossover_khz: defaults.crossover_khz,
+            cycles_per_tick: defaults.cycles_per_tick,
+            current_conduction: defaults.current_conduction,
             load_kind: defaults.load_kind.clone(),
             r_loads: defaults.r_loads.clone(),
             bat_v_init: defaults.bat_v_init,
             bat_r_int_mohm: defaults.bat_r_int_mohm,
             bat_c_mf: defaults.bat_c_mf,
+            hw: defaults.hw.clone(),
+            hw_preset_idx: 0, // "Ideal"
             sim_data,
+            bode_data,
             last_params: defaults,
+            tab: Tab::Simulation,
             plot_option: PlotOption::Average,
         }
     }
+}
+
+fn build_bode(p: &SimParams) -> Option<BodeData> {
+    let ctrl = build_ctrl_params(p)?;
+    let (tf, _) = ctrl.to_transfer_function(p.v_in, ControlTopology::Buck);
+    let ds = tf.design_summary();
+    Some(BodeData::compute(&ds))
 }
 
 impl BuckSimApp {
@@ -76,11 +112,15 @@ impl BuckSimApp {
             r_series_mohm: self.r_series_mohm,
             cs_gain_mv_a: self.cs_gain_mv_a,
             max_current: self.max_current,
+            crossover_khz: self.crossover_khz,
+            cycles_per_tick: self.cycles_per_tick,
+            current_conduction: self.current_conduction,
             load_kind: self.load_kind.clone(),
             r_loads: self.r_loads.clone(),
             bat_v_init: self.bat_v_init,
             bat_r_int_mohm: self.bat_r_int_mohm,
             bat_c_mf: self.bat_c_mf,
+            hw: self.hw.clone(),
         }
     }
 
@@ -168,7 +208,7 @@ impl eframe::App for BuckSimApp {
                 ui.add(
                     egui::Slider::new(&mut self.r_esr_mohm, 0.0..=500.0)
                         .text("R_ESR [mΩ]")
-                        .step_by(1.0),
+                        .step_by(0.1),
                 );
                 ui.add(
                     egui::Slider::new(&mut self.r_series_mohm, 0.0..=500.0)
@@ -188,6 +228,107 @@ impl eframe::App for BuckSimApp {
                         .text("I_max [A]")
                         .step_by(0.5),
                 );
+
+                // ── Controller tuning ───────────────────────────────────────
+                ui.separator();
+                ui.label("Controller");
+                let f_sw_half = self.f_sw_khz / 2.0;
+                ui.add(
+                    egui::Slider::new(&mut self.crossover_khz, 1.0..=f_sw_half)
+                        .text("f_x [kHz]")
+                        .logarithmic(true)
+                        .max_decimals(1),
+                );
+                let mut cpt = self.cycles_per_tick as f64;
+                ui.add(
+                    egui::Slider::new(&mut cpt, 1.0..=8.0)
+                        .text("cycles/tick")
+                        .step_by(1.0),
+                );
+                self.cycles_per_tick = cpt as usize;
+
+                // ── Hardware profile ────────────────────────────────────
+                ui.separator();
+                egui::CollapsingHeader::new("Hardware")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        // Preset combo box
+                        let presets = HwProfile::presets();
+                        let combo_label = if self.hw_preset_idx < presets.len() {
+                            presets[self.hw_preset_idx].name.as_str()
+                        } else {
+                            "Custom"
+                        };
+                        egui::ComboBox::from_label("Preset")
+                            .selected_text(combo_label)
+                            .show_ui(ui, |ui| {
+                                for (i, preset) in presets.iter().enumerate() {
+                                    if ui.selectable_value(
+                                        &mut self.hw_preset_idx, i, &preset.name,
+                                    ).clicked() {
+                                        self.hw = presets[i].clone();
+                                    }
+                                }
+                                ui.selectable_value(
+                                    &mut self.hw_preset_idx, usize::MAX, "Custom",
+                                );
+                            });
+
+                        let before = self.hw.clone();
+
+                        ui.add(
+                            egui::Slider::new(&mut self.hw.cs_bandwidth_khz, 0.0..=10000.0)
+                                .text("CS BW [kHz]")
+                                .logarithmic(true)
+                                .max_decimals(0),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.hw.comp_delay_ns, 0.0..=500.0)
+                                .text("Comp delay [ns]")
+                                .step_by(1.0),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.hw.dac_filter_bw_khz, 0.0..=10000.0)
+                                .text("DAC BW [kHz]")
+                                .logarithmic(true)
+                                .max_decimals(0),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.hw.t_adc_us, 0.0..=10.0)
+                                .text("t_ADC [us]")
+                                .step_by(0.1),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.hw.t_processing_us, 0.0..=10.0)
+                                .text("t_proc [us]")
+                                .step_by(0.1),
+                        );
+                        ui.add(
+                            egui::Slider::new(&mut self.hw.t_dac_us, 0.0..=10.0)
+                                .text("t_DAC [us]")
+                                .step_by(0.1),
+                        );
+
+                        // If user manually changed a slider, switch to Custom
+                        if self.hw != before && self.hw_preset_idx != usize::MAX {
+                            self.hw_preset_idx = usize::MAX;
+                        }
+                    });
+
+                ui.separator();
+                ui.label("Rectifier");
+                ui.horizontal(|ui| {
+                    ui.radio_value(
+                        &mut self.current_conduction,
+                        CurrentConduction::Diode,
+                        "Diode (DCM)",
+                    );
+                    ui.radio_value(
+                        &mut self.current_conduction,
+                        CurrentConduction::Synchronous,
+                        "Synchronous",
+                    );
+                });
 
                 // ── Load section ─────────────────────────────────────────────
                 ui.separator();
@@ -280,119 +421,148 @@ impl eframe::App for BuckSimApp {
 
         // ── Central panel — plots ────────────────────────────────────────────
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Re-run simulation only when params changed
+            // Re-run simulation / bode only when params changed
             let params = self.current_params();
             if params != self.last_params {
                 self.sim_data = run_simulation(&params);
+                self.bode_data = build_bode(&params);
                 self.last_params = params;
             }
 
-            match &self.sim_data {
-                None => {
-                    ui.centered_and_justified(|ui| {
-                        ui.colored_label(
-                            Color32::from_rgb(255, 100, 100),
-                            "⚠  Invalid parameters — V_out must be less than V_in.",
-                        );
-                    });
-                }
-                Some(data) => {
-                    // Allocate height: 3 signal plots share most space, load plot gets 15%
-                    let total_h = ui.available_height();
-                    let load_plot_h = (total_h * 0.15).max(50.0);
-                    let plot_h = ((total_h - load_plot_h) / 3.0 - PLOT_SPACING).max(80.0);
+            // Tab bar
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Simulation, "Simulation");
+                ui.selectable_value(&mut self.tab, Tab::Bode, "Bode");
+            });
+            ui.separator();
 
-                    let v_out_line = Line::new(
-                        "V_out [V]",
-                        data.iter()
-                            .map(|p| [p.t_ms as f64, p.v_out as f64])
-                            .collect::<PlotPoints>(),
-                    );
-                    let duty_line = Line::new(
-                        "Duty [%]",
-                        data.iter()
-                            .map(|p| [p.t_ms as f64, p.duty_pct as f64])
-                            .collect::<PlotPoints>(),
-                    );
-
-                    let selected_points = self.select_points(data);
-                    let il_line = Line::new("I_L [A]", PlotPoints::new(selected_points));
-
-                    let target = self.v_out_target;
-                    let t_end_ms = data.last().map(|p| p.t_ms as f64).unwrap_or(0.0);
-
-                    // Bottom plot: load profile (Steps) or battery OCV (Battery)
-                    let (bottom_y_label, bottom_line) = match self.load_kind {
-                        LoadKind::Steps => {
-                            let step_ms = 2000.0 / self.f_sw_khz;
-                            let mut pts = vec![[0.0_f64, self.r_loads[0]]];
-                            let mut t = 3000.0 / self.f_sw_khz;
-                            for i in 1..self.r_loads.len() {
-                                pts.push([t, self.r_loads[i - 1]]);
-                                pts.push([t, self.r_loads[i]]);
-                                t += step_ms;
-                            }
-                            pts.push([t_end_ms, *self.r_loads.last().unwrap()]);
-                            ("R_load [Ω]", Line::new("R_load [Ω]", PlotPoints::new(pts)))
+            match self.tab {
+                Tab::Simulation => self.show_simulation(ui),
+                Tab::Bode => {
+                    match &self.bode_data {
+                        Some(data) => show_bode(ui, data),
+                        None => {
+                            ui.centered_and_justified(|ui| {
+                                ui.colored_label(
+                                    Color32::from_rgb(255, 100, 100),
+                                    "Invalid parameters for Bode computation.",
+                                );
+                            });
                         }
-                        LoadKind::Battery => {
-                            let pts: PlotPoints = data
-                                .iter()
-                                .filter(|p| p.v_bat > 0.0)
-                                .map(|p| [p.t_ms as f64, p.v_bat as f64])
-                                .collect();
-                            ("V_bat OCV [V]", Line::new("V_bat OCV [V]", pts))
-                        }
-                    };
-
-                    let x_link = egui::Vec2b::new(true, false);
-
-                    // V_out plot
-                    Plot::new("v_out")
-                        .height(plot_h)
-                        .y_axis_label("V_out [V]")
-                        .x_axis_label("")
-                        .link_axis("time_axis", x_link)
-                        .show(ui, |plot_ui| {
-                            plot_ui.line(v_out_line);
-                            plot_ui.hline(
-                                HLine::new("Target", target)
-                                    .color(Color32::from_rgb(255, 80, 80))
-                                    .style(egui_plot::LineStyle::dashed_dense()),
-                            );
-                        });
-
-                    // Duty cycle plot
-                    Plot::new("duty")
-                        .height(plot_h)
-                        .y_axis_label("Duty [%]")
-                        .x_axis_label("")
-                        .link_axis("time_axis", x_link)
-                        .show(ui, |plot_ui| {
-                            plot_ui.line(duty_line);
-                        });
-
-                    // Inductor current plot
-                    Plot::new("i_l")
-                        .height(plot_h)
-                        .y_axis_label("I_L [A]")
-                        .x_axis_label("")
-                        .link_axis("time_axis", x_link)
-                        .show(ui, |plot_ui| {
-                            plot_ui.line(il_line);
-                        });
-
-                    // Load / battery plot
-                    Plot::new("bottom")
-                        .height(load_plot_h)
-                        .y_axis_label(bottom_y_label)
-                        .x_axis_label("t [ms]")
-                        .link_axis("time_axis", x_link)
-                        .show(ui, |plot_ui| {
-                            plot_ui.line(bottom_line);
-                        });
+                    }
                 }
             }
         });
+    }
+}
+
+impl BuckSimApp {
+    fn show_simulation(&self, ui: &mut egui::Ui) {
+        match &self.sim_data {
+            None => {
+                ui.centered_and_justified(|ui| {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 100, 100),
+                        "Invalid parameters — V_out must be less than V_in.",
+                    );
+                });
+            }
+            Some(data) => {
+                // Allocate height: 3 signal plots share most space, load plot gets 15%
+                let total_h = ui.available_height();
+                let load_plot_h = (total_h * 0.15).max(50.0);
+                let plot_h = ((total_h - load_plot_h) / 3.0 - PLOT_SPACING).max(80.0);
+
+                let v_out_line = Line::new(
+                    "V_out [V]",
+                    data.iter()
+                        .map(|p| [p.t_ms as f64, p.v_out as f64])
+                        .collect::<PlotPoints>(),
+                );
+                let duty_line = Line::new(
+                    "Duty [%]",
+                    data.iter()
+                        .map(|p| [p.t_ms as f64, p.duty_pct as f64])
+                        .collect::<PlotPoints>(),
+                );
+
+                let selected_points = self.select_points(data);
+                let il_line = Line::new("I_L [A]", PlotPoints::new(selected_points));
+
+                let target = self.v_out_target;
+                let t_end_ms = data.last().map(|p| p.t_ms as f64).unwrap_or(0.0);
+
+                // Bottom plot: load profile (Steps) or battery OCV (Battery)
+                let (bottom_y_label, bottom_line) = match self.load_kind {
+                    LoadKind::Steps => {
+                        let step_ms = 2000.0 / self.f_sw_khz;
+                        let mut pts = vec![[0.0_f64, self.r_loads[0]]];
+                        let mut t = 3000.0 / self.f_sw_khz;
+                        for i in 1..self.r_loads.len() {
+                            pts.push([t, self.r_loads[i - 1]]);
+                            pts.push([t, self.r_loads[i]]);
+                            t += step_ms;
+                        }
+                        pts.push([t_end_ms, *self.r_loads.last().unwrap()]);
+                        ("R_load [Ω]", Line::new("R_load [Ω]", PlotPoints::new(pts)))
+                    }
+                    LoadKind::Battery => {
+                        let pts: PlotPoints = data
+                            .iter()
+                            .filter(|p| p.v_bat > 0.0)
+                            .map(|p| [p.t_ms as f64, p.v_bat as f64])
+                            .collect();
+                        ("V_bat OCV [V]", Line::new("V_bat OCV [V]", pts))
+                    }
+                };
+
+                let x_link = egui::Vec2b::new(true, false);
+
+                // V_out plot
+                Plot::new("v_out")
+                    .height(plot_h)
+                    .y_axis_label("V_out [V]")
+                    .x_axis_label("")
+                    .link_axis("time_axis", x_link)
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(v_out_line);
+                        plot_ui.hline(
+                            HLine::new("Target", target)
+                                .color(Color32::from_rgb(255, 80, 80))
+                                .style(egui_plot::LineStyle::dashed_dense()),
+                        );
+                    });
+
+                // Duty cycle plot
+                Plot::new("duty")
+                    .height(plot_h)
+                    .y_axis_label("Duty [%]")
+                    .x_axis_label("")
+                    .link_axis("time_axis", x_link)
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(duty_line);
+                    });
+
+                // Inductor current plot
+                Plot::new("i_l")
+                    .height(plot_h)
+                    .y_axis_label("I_L [A]")
+                    .x_axis_label("")
+                    .link_axis("time_axis", x_link)
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(il_line);
+                    });
+
+                // Load / battery plot
+                Plot::new("bottom")
+                    .height(load_plot_h)
+                    .y_axis_label(bottom_y_label)
+                    .x_axis_label("t [ms]")
+                    .link_axis("time_axis", x_link)
+                    .show(ui, |plot_ui| {
+                        plot_ui.line(bottom_line);
+                    });
+            }
+        }
     }
 }

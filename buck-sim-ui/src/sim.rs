@@ -1,11 +1,64 @@
 use electronics_sim::{
-    Capacitance, Current, CurrentConduction, CurrentModeConverter, Inductance,
+    Capacitance, Current, CurrentModeConverter, Inductance,
     Parameters as SimParameters, Resistance, Time, Voltage,
 };
+pub use electronics_sim::CurrentConduction;
 use full_control::{
     buck_boost::Mode,
     control_2p2z::{Parameters, PhaseMargin, Topology as ControlTopology, TwoPoleTwoZeroParams},
 };
+
+// ── Hardware profile ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HwProfile {
+    pub name: String,
+    // Current sensing
+    pub cs_bandwidth_khz: f64,    // Current-sense amplifier bandwidth [kHz] (0 = ideal)
+    // Comparator
+    pub comp_delay_ns: f64,       // Comparator propagation delay [ns]
+    // Slope compensation DAC
+    pub dac_filter_bw_khz: f64,   // DAC output LP filter bandwidth [kHz] (0 = ideal)
+    // Control loop transport delays (affect Bode phase margin)
+    pub t_adc_us: f64,            // ADC conversion + sampling [µs]
+    pub t_processing_us: f64,     // ISR execution [µs]
+    pub t_dac_us: f64,            // DAC/comparator update latency [µs]
+}
+
+impl HwProfile {
+    pub fn ideal() -> Self {
+        Self {
+            name: "Ideal".into(),
+            cs_bandwidth_khz: 0.0,
+            comp_delay_ns: 0.0,
+            dac_filter_bw_khz: 0.0,
+            t_adc_us: 0.0,
+            t_processing_us: 0.0,
+            t_dac_us: 0.0,
+        }
+    }
+
+    pub fn stm32g4_acs37030() -> Self {
+        Self {
+            name: "STM32G4 + ACS37030".into(),
+            cs_bandwidth_khz: 1000.0,
+            comp_delay_ns: 30.0,
+            dac_filter_bw_khz: 0.0,
+            t_adc_us: 1.2,
+            t_processing_us: 1.5,
+            t_dac_us: 0.2,
+        }
+    }
+
+    pub fn presets() -> Vec<Self> {
+        vec![Self::ideal(), Self::stm32g4_acs37030()]
+    }
+
+    /// True when all transport delays are zero (preserves legacy Manual phase margin).
+    pub fn has_transport_delays(&self) -> bool {
+        self.t_adc_us != 0.0 || self.t_processing_us != 0.0 || self.t_dac_us != 0.0
+    }
+}
 
 // Fixed ADC/DAC constants (STM32G474)
 const V_REF: f64 = 3.3;
@@ -33,14 +86,23 @@ pub struct SimParams {
 
     pub load_kind: LoadKind,
 
+    pub current_conduction: CurrentConduction,
+
     /// Load phases [Ω]: first element is nominal (soft-start + first steady phase),
     /// each subsequent element adds a 2000-cycle step.  Used when load_kind == Steps.
     pub r_loads: Vec<f64>,
+
+    // ── Controller tuning ─────────────────────────────────────────────────
+    pub crossover_khz: f64,    // Target crossover frequency [kHz]
+    pub cycles_per_tick: usize, // Switching cycles per control update
 
     // Battery parameters — used when load_kind == Battery.
     pub bat_v_init: f64,     // Initial battery OCV [V]
     pub bat_r_int_mohm: f64, // Battery internal resistance [mΩ]
     pub bat_c_mf: f64,       // Battery capacitance [mF] (sets charging speed in sim)
+
+    // ── Hardware delays ──────────────────────────────────────────────────
+    pub hw: HwProfile,
 }
 
 impl Default for SimParams {
@@ -55,11 +117,15 @@ impl Default for SimParams {
             r_series_mohm: 35.0,
             cs_gain_mv_a: 66.0,
             max_current: 10.0,
+            current_conduction: CurrentConduction::Synchronous,
             load_kind: LoadKind::Steps,
             r_loads: vec![6.0, 3.0, 100.0],
+            crossover_khz: 50.0,
+            cycles_per_tick: 1,
             bat_v_init: 11.0,
             bat_r_int_mohm: 50.0,
             bat_c_mf: 20.0,
+            hw: HwProfile::ideal(),
         }
     }
 }
@@ -75,6 +141,51 @@ pub struct SimPoint {
     pub i_l_max: f32,
     /// Battery open-circuit voltage [V].  0.0 when not in Battery mode.
     pub v_bat: f32,
+}
+
+/// Build the compensator `Parameters` from UI-level `SimParams`.
+///
+/// Returns `None` when the operating point is invalid.
+pub fn build_ctrl_params(p: &SimParams) -> Option<Parameters> {
+    if p.v_out_target >= p.v_in * 0.99 {
+        return None;
+    }
+    if p.f_sw_khz <= 0.0 || p.l_uh <= 0.0 || p.c_out_uf <= 0.0 {
+        return None;
+    }
+    let f_sw = p.f_sw_khz * 1e3;
+    let l_inductor = p.l_uh * 1e-6;
+    let c_out = p.c_out_uf * 1e-6;
+    let r_esr = p.r_esr_mohm * 1e-3;
+    let cs_gain = p.cs_gain_mv_a * 1e-3;
+    let nominal_r = match p.load_kind {
+        LoadKind::Steps => p.r_loads[0],
+        LoadKind::Battery => p.v_out_target / p.max_current * 2.0,
+    };
+    let phase_margin = if p.hw.has_transport_delays() {
+        PhaseMargin::Calculated {
+            t_adc: p.hw.t_adc_us * 1e-6,
+            t_processing: p.hw.t_processing_us * 1e-6,
+            t_dac: p.hw.t_dac_us * 1e-6,
+        }
+    } else {
+        PhaseMargin::Manual { phase_margin: 75.0_f64.to_radians() }
+    };
+
+    Some(Parameters {
+        v_out: p.v_out_target,
+        c_out,
+        f_sw,
+        l_inductor,
+        r_esr_out_cap: r_esr,
+        current_sense_gain: cs_gain,
+        i_load: p.v_out_target / nominal_r,
+        v_diode: 0.0,
+        phase_margin,
+        safety_factor: 2.0,
+        crossover_hz: p.crossover_khz * 1e3,
+        cycles_per_tick: p.cycles_per_tick,
+    })
 }
 
 /// Simple lead-acid battery model: capacitor C with series resistance R_int.
@@ -146,29 +257,11 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
         return None; // v_out_target too small (< V_REF * 0.75)
     }
 
-    let nominal_r = match p.load_kind {
-        LoadKind::Steps => p.r_loads[0],
-        // Design controller at a representative mid-charge load
-        LoadKind::Battery => p.v_out_target / p.max_current * 2.0,
-    };
-
     let target_code = p.v_out_target * divider_ratio / LSB;
     let dac_max_code = p.max_current * cs_gain / LSB;
 
     // Design the 2P2Z controller at the nominal operating point
-    let ctrl_params = Parameters {
-        v_out: p.v_out_target,
-        c_out,
-        f_sw,
-        l_inductor,
-        r_esr_out_cap: r_esr,
-        current_sense_gain: cs_gain,
-        i_load: p.v_out_target / nominal_r,
-        v_diode: 0.0,
-        phase_margin: PhaseMargin::Manual { phase_margin: 75.0_f64.to_radians() },
-        safety_factor: 2.0,
-        cycles_per_tick: 1,
-    };
+    let ctrl_params = build_ctrl_params(p)?;
 
     let (tf, dac) = ctrl_params.to_transfer_function(p.v_in, ControlTopology::Buck);
     let slope_amp_per_sec = dac.dac_slope / cs_gain;
@@ -199,11 +292,11 @@ pub fn run_simulation(p: &SimParams) -> Option<Vec<SimPoint>> {
         r_esr_cin: Resistance(0.0),
         r_in: Resistance(0.0),
         l_in: Inductance(0.0),
-        tau_current_sense: Time(0.0),
-        tau_dac: Time(0.0),
-        t_prop_delay: Time(0.0),
+        tau_current_sense: SimParameters::bw_to_tau(p.hw.cs_bandwidth_khz * 1e3),
+        tau_dac: SimParameters::bw_to_tau(p.hw.dac_filter_bw_khz * 1e3),
+        t_prop_delay: Time(p.hw.comp_delay_ns * 1e-9),
         t_dac_sample: Time(0.0),
-        current_conduction: CurrentConduction::Diode,
+        current_conduction: p.current_conduction,
     };
     let mut sim = CurrentModeConverter::new(sim_params, Mode::Buck);
 
