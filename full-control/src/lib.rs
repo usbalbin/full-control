@@ -131,6 +131,7 @@ mod tests {
                 phase_margin: 75.0_f64.to_radians(),
             },
             safety_factor: 2.0,
+            crossover_hz: 50_000.0,
             cycles_per_tick: 1,
         };
 
@@ -154,6 +155,7 @@ mod tests {
                 phase_margin: 75.0_f64.to_radians(),
             },
             safety_factor: 2.0,
+            crossover_hz: 50_000.0,
             cycles_per_tick: 1,
         };
 
@@ -184,6 +186,7 @@ mod tests {
                 phase_margin: 75.0_f64.to_radians(),
             },
             safety_factor: 2.0,
+            crossover_hz: 50_000.0,
             cycles_per_tick: 1,
         };
 
@@ -220,6 +223,7 @@ mod tests {
                 phase_margin: 75.0_f64.to_radians(),
             },
             safety_factor: 2.0,
+            crossover_hz: 50_000.0,
             cycles_per_tick: 1,
         };
 

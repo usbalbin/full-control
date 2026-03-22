@@ -236,6 +236,18 @@ pub struct Parameters {
     /// Typical: 2.0 (ripple fits in half the DAC linear range).
     pub safety_factor: f64,
 
+    /// Target crossover frequency (Hz) for the voltage loop.
+    ///
+    /// Sets an upper bound on the compensator bandwidth.  The actual crossover
+    /// may be lower if the ripple criterion (`b0 × dV ≤ vpp / safety_factor`)
+    /// or the RHP zero constraint (boost/buck-boost) is more restrictive.
+    ///
+    /// Rule of thumb for peak current mode:
+    ///   f_sw / 10  — conservative, works with most plants
+    ///   f_sw / 20  — safe default for decimated loops (cycles_per_tick > 1)
+    ///   f_sw / 5   — aggressive, requires low-ESR output caps
+    pub crossover_hz: f64,
+
     /// Nominal load (A)
     pub i_load: f64,
 
@@ -289,9 +301,13 @@ macro_rules! p {
 impl Parameters {
     /// Returns the crossover frequency as `f_sw / divisor`.
     ///
-    /// This is the smallest divisor in the valid range (f_x ≤ f_sw/8) for which
-    /// `b0 × ΔV_out_ripple ≤ vpp / self.safety_factor`.  Lower divisor = higher
-    /// bandwidth = better transient response, at the cost of less ripple margin.
+    /// The divisor is the most conservative (largest) of three constraints:
+    /// 1. **User ceiling**: `f_sw / crossover_hz`
+    /// 2. **Ripple criterion**: highest bandwidth where `b0 × ΔV_ripple ≤ vpp / safety_factor`
+    /// 3. **RHP zero** (boost/buck-boost): `f_x ≤ f_RHP / (2 × safety_factor)`
+    ///
+    /// With low-ESR ceramics the ripple constraint is permissive (divisor ≈ 8),
+    /// so `crossover_hz` dominates — giving predictable, user-controlled bandwidth.
     ///
     /// Useful for informational display: call `params.crossover_divisor()` to
     /// inspect the selected f_x without re-running the full compensator design.
@@ -370,14 +386,19 @@ impl Parameters {
             }
         };
 
-        // Return the more conservative of the two constraints.
-        if rhp_divisor > hi { rhp_divisor } else { hi }
+        // User-specified crossover ceiling.
+        let user_divisor = self.f_sw / self.crossover_hz;
+
+        // Return the most conservative of all three constraints.
+        let max_div = if user_divisor > hi { user_divisor } else { hi };
+        if rhp_divisor > max_div { rhp_divisor } else { max_div }
     }
 
     /// Design the 2P2Z compensator for these circuit parameters.
     ///
     /// The crossover frequency is selected automatically via `crossover_divisor()`:
-    /// the highest bandwidth where `b0 × ΔV_out_ripple ≤ vpp / safety_factor`.
+    /// the most conservative of the user-specified `crossover_hz` ceiling, the
+    /// ripple criterion (`b0 × ΔV ≤ vpp / safety_factor`), and the RHP zero limit.
     pub const fn to_transfer_function(
         self,
         v_in: f64,
@@ -467,6 +488,7 @@ impl Parameters {
             i_load,
             phase_margin,
             safety_factor: _,
+            crossover_hz: _,
             cycles_per_tick,
         } = self;
 
@@ -587,7 +609,83 @@ pub struct TransferFunction {
     h_dc: f64,
 }
 
+/// All continuous-time design parameters needed to plot Bode diagrams.
+#[derive(Debug, Clone, Copy)]
+pub struct DesignSummary {
+    /// Plant pole [rad/s]
+    pub omega_p1: f64,
+    /// ESR zero [rad/s]
+    pub omega_esr: f64,
+    /// DC gain
+    pub h_dc: f64,
+    /// Inner current-loop natural freq [rad/s] = π·f_sw
+    pub omega_n: f64,
+    /// Integrator gain [rad/s]
+    pub omega_cp0: f64,
+    /// Compensator pole [rad/s] (= omega_esr)
+    pub omega_cp1: f64,
+    /// Compensator zero [rad/s]
+    pub omega_cz1: f64,
+    /// Crossover frequency [rad/s]
+    pub omega_x: f64,
+    /// Effective phase margin [rad]
+    pub phase_margin_rad: f64,
+    /// Switching frequency [Hz]
+    pub f_sw: f64,
+}
+
 impl TransferFunction {
+    /// Return all continuous-time design parameters for Bode plot rendering.
+    ///
+    /// Re-derives compensator poles/zeros from stored plant parameters using the
+    /// same formulas as `to_2p2z()`, stopping at the continuous-time stage
+    /// (before bilinear transform to discrete coefficients).
+    pub const fn design_summary(&self) -> DesignSummary {
+        let ohmega_n = self.ohmega_n();
+        let f_x = self.f_sw / self.f_x_divisor;
+        let ohmega_x = 2.0 * PI * f_x;
+
+        let phase_margin = match self.phase_margin {
+            PhaseMargin::Manual { phase_margin } => phase_margin,
+            PhaseMargin::Calculated {
+                t_adc,
+                t_processing,
+                t_dac,
+            } => {
+                let t_hold = (self.cycles_per_tick - 1) as f64 / self.f_sw;
+                let phase_erosion = 2.0 * PI * f_x * (t_adc + t_processing + t_dac + t_hold);
+                50.0_f64.to_radians() + phase_erosion
+            }
+        };
+
+        let r = ohmega_x / ohmega_n;
+        let complex_pole_pair = atan(r / (1.0 - pow2(r)));
+        let phi_v = -0.5 * PI + phase_margin + atan(ohmega_x / self.ohmega_p1) + complex_pole_pair;
+
+        let ohmega_cp1 = self.ohmega_esr;
+        let ohmega_cz1 = ohmega_x / tan(phi_v);
+
+        let k1 = sqrt(
+            (1.0 + pow2(ohmega_x / ohmega_cz1)) / (1.0 + pow2(ohmega_x / self.ohmega_p1)),
+        );
+        let k2 = sqrt(1.0
+            / (pow2(1.0 - pow2(ohmega_x / ohmega_n)) + pow2(ohmega_x / ohmega_n)));
+        let ohmega_cp0 = ohmega_x / (self.h_dc * k1 * k2);
+
+        DesignSummary {
+            omega_p1: self.ohmega_p1,
+            omega_esr: self.ohmega_esr,
+            h_dc: self.h_dc,
+            omega_n: ohmega_n,
+            omega_cp0: ohmega_cp0,
+            omega_cp1: ohmega_cp1,
+            omega_cz1: ohmega_cz1,
+            omega_x: ohmega_x,
+            phase_margin_rad: phase_margin,
+            f_sw: self.f_sw,
+        }
+    }
+
     pub const fn to_2p2z(self) -> TwoPoleTwoZeroParams<f32> {
         let TransferFunction {
             f_sw,
