@@ -271,8 +271,8 @@ impl eframe::App for BuckSimApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ── Parameter panel ──────────────────────────────────────────────────
         egui::SidePanel::left("params")
-            .min_width(240.0)
-            .max_width(320.0)
+            .min_width(320.0)
+            .max_width(380.0)
             .show(ctx, |ui| {
                 ui.heading("Buck Converter Parameters");
                 let t_sw_us = 1000.0 / self.f_sw_khz;
@@ -367,7 +367,7 @@ impl eframe::App for BuckSimApp {
                 ui.separator();
                 ui.label("Current sense");
                 ui.add(
-                    egui::Slider::new(&mut self.max_current, 0.5..=50.0)
+                    egui::Slider::new(&mut self.max_current, 0.5..=100.0)
                         .text("I_max [A]")
                         .step_by(0.5),
                 );
@@ -620,30 +620,34 @@ impl eframe::App for BuckSimApp {
                 match self.load_kind {
                     LoadKind::Steps => {
                         ui.add_space(2.0);
+                        let i = self.v_out_target / self.r_loads[0];
+                        let p = self.v_out_target * i;
                         // Nominal load — always present, no remove button
                         ui.add(
                             egui::Slider::new(&mut self.r_loads[0], 0.5..=1000.0)
-                                .text("R_nominal [Ω]")
+                                .text(format!("R_nom [Ω], {i:.1}A, {p:.1}W"))
                                 .logarithmic(true)
-                                .max_decimals(1),
+                                .max_decimals(2),
                         );
 
                         // Additional load steps — each has a remove button
                         let mut to_remove: Option<usize> = None;
-                        for i in 1..self.r_loads.len() {
+                        for step in 1..self.r_loads.len() {
                             let clicked = ui
                                 .horizontal(|ui| {
+                                    let i = self.v_out_target / self.r_loads[step];
+                                    let p = self.v_out_target * i;
                                     ui.add(
-                                        egui::Slider::new(&mut self.r_loads[i], 0.5..=10000.0)
-                                            .text(format!("step {} [Ω]", i))
+                                        egui::Slider::new(&mut self.r_loads[step], 0.1..=10000.0)
+                                            .text(format!("[Ω], {:.1}A, {:.1}W", i, p))
                                             .logarithmic(true)
-                                            .max_decimals(1),
+                                            .max_decimals(2),
                                     );
-                                    ui.small_button("−").clicked()
+                                    ui.small_button("-").clicked()
                                 })
                                 .inner;
                             if clicked {
-                                to_remove = Some(i);
+                                to_remove = Some(step);
                                 break;
                             }
                         }
