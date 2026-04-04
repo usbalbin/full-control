@@ -71,6 +71,7 @@ enum PlotOption {
     Max,
     Average,
     MinAndMax,
+    Waveform,
 }
 
 impl Default for BuckSimApp {
@@ -257,17 +258,41 @@ impl BuckSimApp {
                 .iter()
                 .map(|p| [p.t_ms as f64, p.i_total_avg() as f64])
                 .collect(),
-            PlotOption::MinAndMax => data
-                .iter()
-                .flat_map(|p| {
-                    [
-                        [p.t_ms as f64, p.i_total_min as f64],
-                        [p.t_ms as f64, p.i_total_max as f64],
-                    ]
-                })
-                .collect(),
+            PlotOption::MinAndMax | PlotOption::Waveform => {
+                // Handled separately in the plot code
+                vec![]
+            }
         }
     }
+
+    /// Reconstruct the actual triangular inductor current waveform for a single
+    /// phase within each switching cycle.
+    ///
+    /// Each cycle: current ramps from `i_l_min` → `i_l_max` over `t_on`,
+    /// then from `i_l_max` → `i_l_min` over `T - t_on`.
+    /// Phase `k` is offset by `k × T / N` from the cycle start.
+    fn phase_waveform(&self, data: &[SimPoint], phase_idx: usize) -> Vec<[f64; 2]> {
+        let n = self.num_phases.max(1);
+        let t_sw_ms = 1.0 / self.f_sw_khz; // switching period in ms
+        let offset_ms = phase_idx as f64 * t_sw_ms / n as f64;
+        let mut pts = Vec::with_capacity(data.len() * 3);
+        for p in data {
+            if phase_idx >= p.phases.len() {
+                continue;
+            }
+            let ph = &p.phases[phase_idx];
+            let t_on_ms = ph.t_on as f64 * 1e3;
+            let t0 = p.t_ms as f64 + offset_ms;
+            // Start of this phase's cycle: i_l_min
+            pts.push([t0, ph.i_l_min as f64]);
+            // End of ON time: i_l_max
+            pts.push([t0 + t_on_ms, ph.i_l_max as f64]);
+            // End of this phase's cycle: back to i_l_min
+            pts.push([t0 + t_sw_ms, ph.i_l_min as f64]);
+        }
+        pts
+    }
+
 }
 
 // Spacing between vertically stacked plots
@@ -735,6 +760,10 @@ impl eframe::App for BuckSimApp {
                     ui.radio_value(&mut self.plot_option, PlotOption::MinAndMax, "Min and Max")
                         .on_hover_text("Both peak and valley inductor current");
                 });
+                ui.horizontal(|ui| {
+                    ui.radio_value(&mut self.plot_option, PlotOption::Waveform, "Waveform")
+                        .on_hover_text("Reconstructed per-phase triangular inductor current waveforms");
+                });
 
                 ui.separator();
                 ui.label(
@@ -819,7 +848,6 @@ impl BuckSimApp {
                 );
 
                 let selected_points = self.select_points(data);
-                let il_line = Line::new("I_L [A]", PlotPoints::new(selected_points));
 
                 let target = self.v_out_target;
                 let t_end_ms = data.last().map(|p| p.t_ms as f64).unwrap_or(0.0);
@@ -875,7 +903,6 @@ impl BuckSimApp {
                         plot_ui.line(duty_line);
                     });
 
-                // Per-phase average current lines (only when multi-phase)
                 let num_phases = self.num_phases.max(1);
                 let phase_colors = [
                     Color32::from_rgb(80, 140, 255),   // blue
@@ -885,22 +912,6 @@ impl BuckSimApp {
                     Color32::from_rgb(180, 100, 255),  // purple
                     Color32::from_rgb(50, 200, 200),   // cyan
                 ];
-                let phase_lines: Vec<Line> = if num_phases > 1 {
-                    (0..num_phases).map(|k| {
-                        let pts: PlotPoints = data.iter()
-                            .filter(|p| k < p.phases.len())
-                            .map(|p| {
-                                let ph = &p.phases[k];
-                                [p.t_ms as f64, ((ph.i_l_min + ph.i_l_max) / 2.0) as f64]
-                            })
-                            .collect();
-                        Line::new(format!("Phase {}", k + 1), pts)
-                            .color(phase_colors[k % phase_colors.len()])
-                            .width(1.0)
-                    }).collect()
-                } else {
-                    vec![]
-                };
 
                 // Inductor current plot
                 Plot::new("i_l")
@@ -909,9 +920,36 @@ impl BuckSimApp {
                     .x_axis_label("")
                     .link_axis("time_axis", x_link)
                     .show(ui, |plot_ui| {
-                        plot_ui.line(il_line);
-                        for line in phase_lines {
-                            plot_ui.line(line);
+                        match self.plot_option {
+                            PlotOption::Waveform => {
+                                for k in 0..num_phases {
+                                    let pts = self.phase_waveform(data, k);
+                                    plot_ui.line(
+                                        Line::new(
+                                            if num_phases > 1 {
+                                                format!("Phase {} [A]", k + 1)
+                                            } else {
+                                                "I_L [A]".into()
+                                            },
+                                            PlotPoints::new(pts),
+                                        )
+                                        .color(phase_colors[k % phase_colors.len()]),
+                                    );
+                                }
+                            }
+                            PlotOption::MinAndMax => {
+                                let min_pts: PlotPoints = data.iter()
+                                    .map(|p| [p.t_ms as f64, p.i_total_min as f64])
+                                    .collect();
+                                let max_pts: PlotPoints = data.iter()
+                                    .map(|p| [p.t_ms as f64, p.i_total_max as f64])
+                                    .collect();
+                                plot_ui.line(Line::new("I_min [A]", min_pts));
+                                plot_ui.line(Line::new("I_max [A]", max_pts));
+                            }
+                            _ => {
+                                plot_ui.line(Line::new("I_L [A]", PlotPoints::new(selected_points.clone())));
+                            }
                         }
                     });
 
