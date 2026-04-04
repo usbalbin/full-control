@@ -690,23 +690,24 @@ fn tick_multi(
         trip = Current(trip.0.clamp(0.0, trip_limit));
     }
 
-    // Record shared v_out before ticking
-    let v_out_start = sims[0].v_out.0;
-
-    // Tick each phase, collecting per-phase data and delta_v
+    // Tick each phase with incremental v_out propagation.
+    // Each phase sees v_out after all preceding phases have contributed their
+    // charge, giving more accurate intra-period dynamics during transients.
     let mut phase_points = Vec::with_capacity(n);
-    let mut total_delta_v = 0.0_f64;
 
-    for sim in sims.iter_mut() {
-        let i_l_min = sim.i_inductor.0 as f32;
+    for k in 0..n {
+        if k > 0 {
+            // Propagate v_out from previous phase so phase k sees the
+            // incrementally updated output voltage.
+            sims[k].v_out = sims[k - 1].v_out;
+        }
+        let i_l_min = sims[k].i_inductor.0 as f32;
         let mut phase_load = load.clone();
-        let (t_on, i_l_max_val) = sim.tick(v_in, trip, |v| {
+        let (t_on, i_l_max_val) = sims[k].tick(v_in, trip, |v| {
             let full = phase_load(v);
             Current(full.0 / n as f64)
         });
         let i_l_max = i_l_max_val.0 as f32;
-        let delta_v = sim.v_out.0 - v_out_start;
-        total_delta_v += delta_v;
 
         phase_points.push(PhasePoint {
             t_on: t_on.0 as f32,
@@ -716,12 +717,17 @@ fn tick_multi(
         });
     }
 
-    // Synchronize all phases to the shared output voltage
-    let v_out_final = v_out_start + total_delta_v;
+    // Last sim's v_out naturally includes all phase contributions.
+    let v_out_final = sims[n - 1].v_out.0;
+    // Preserve phase 0's ADC reading (set inside tick() at the ADC sample point).
+    let adc_reading = sims[0].v_out_at_adc;
+    // Synchronize all phases to the shared output voltage.
     for sim in sims.iter_mut() {
         sim.v_out = Voltage(v_out_final);
         sim.v_out_at_adc = Voltage(v_out_final);
     }
+    // Restore phase 0's ADC value so the compensator sees the correct voltage.
+    sims[0].v_out_at_adc = adc_reading;
 
     // Compute interleaved envelope
     let (i_total_min, i_total_max) = interleaved_envelope(&phase_points, period as f32);
