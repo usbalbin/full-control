@@ -396,6 +396,23 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
         )
     })?;
 
+    // ESR zero proximity check: crossover must be well below f_esr to
+    // maintain adequate gain margin in the discrete-time implementation.
+    if r_esr > 0.0 && c_out > 0.0 {
+        let omega_esr = 1.0 / (r_esr * c_out);
+        let omega_x = p.crossover_khz as f64 * 1e3 * 2.0 * std::f64::consts::PI;
+        if omega_x > 0.8 * omega_esr {
+            let f_esr_khz = omega_esr / (2.0 * std::f64::consts::PI * 1e3);
+            let max_fx_khz = 0.8 * f_esr_khz;
+            return Err(format!(
+                "Crossover ({:.1} kHz) too close to ESR zero ({:.1} kHz). \
+                 The compensator pole at f_ESR degrades gain margin. \
+                 Max feasible: {:.1} kHz. Reduce crossover or decrease C_out / increase R_ESR.",
+                p.crossover_khz, f_esr_khz, max_fx_khz,
+            ));
+        }
+    }
+
     // Ripple / limit-cycling check: b0 × ΔV_ripple must fit inside vpp / safety_factor
     {
         let d = p.v_out_target / p.v_in;
@@ -1227,33 +1244,32 @@ mod tests {
 
     #[test]
     fn large_cout_sweep_crossover() {
-        // Sweep crossover frequencies with C_out = 300 µF to find the threshold
-        // where the simulation becomes stable.
+        // Sweep crossover frequencies with C_out = 300 µF.
+        // f_esr ≈ 53 kHz, so 0.8 × f_esr ≈ 42.4 kHz is the boundary.
+        // Crossover values above the boundary must be rejected;
+        // values well below must produce a stable simulation.
         for fx in [5.0, 10.0, 20.0, 30.0, 40.0, 45.0, 50.0] {
             let mut p = SimParams::default();
             p.c_out_uf = 300.0;
             p.crossover_khz = fx;
 
-            let ctrl = build_ctrl_params_multi(&p).unwrap();
-            let (tf, _) = ctrl.to_transfer_function(p.v_in, ControlTopology::Buck);
-            let ds = tf.design_summary();
-            let max_fx = ctrl.max_feasible_crossover_hz(p.v_in, ControlTopology::Buck);
-
             let result = run_simulation(&p);
             match result {
-                Err(msg) => eprintln!("f_x = {:.0} kHz: REJECTED — {}", fx, msg),
+                Err(msg) => {
+                    // Should only be rejected at higher crossovers
+                    assert!(
+                        fx >= 42.0,
+                        "f_x={fx}kHz unexpectedly rejected: {msg}"
+                    );
+                }
                 Ok(data) => {
                     let tail = &data[data.len() - 500..];
                     let duty_min = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MAX, f32::min);
                     let duty_max = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MIN, f32::max);
                     let spread = duty_max - duty_min;
-                    let status = if spread > 10.0 { "OSCILLATING" } else { "stable" };
-                    eprintln!(
-                        "f_x={:.0}kHz: {} (duty spread={:.1}%) PM={:.1}° max_fx={:.1}kHz ω_esr={:.0} ω_p1={:.0} ω_cp1={:.0}",
-                        fx, status, spread,
-                        ds.phase_margin_rad.to_degrees(),
-                        max_fx / 1e3,
-                        ds.omega_esr, ds.omega_p1, ds.omega_cp1,
+                    assert!(
+                        spread < 10.0,
+                        "f_x={fx}kHz: duty oscillating (spread={spread:.1}%)"
                     );
                 }
             }
@@ -1261,67 +1277,41 @@ mod tests {
     }
 
     #[test]
-    fn large_cout_diagnose() {
-        // Default settings with C_out = 300 µF — reproduces the oscillation
-        // the user reported (duty swinging 30–80% while v_out only ±100 mV).
+    fn large_cout_rejected_when_crossover_near_esr_zero() {
+        // Default settings with C_out = 300 µF at crossover = 50 kHz.
+        // f_esr = 1/(2π × R_ESR × C_out) ≈ 53 kHz — too close to crossover.
+        // The simulator must reject this with an ESR-zero proximity error.
         let mut p = SimParams::default();
         p.c_out_uf = 300.0;
 
-        // Compute the numbers that matter for limit cycling.
-        let f_sw = p.f_sw_khz * 1e3;
-        let c_out = p.c_out_uf * 1e-6;
-        let r_esr = p.r_esr_mohm * 1e-3;
-        let d = p.v_out_target / p.v_in;
-        let di_l = (p.v_in - p.v_out_target) * d / (f_sw * p.l_uh * 1e-6);
-
-        // Total ripple (ESR + capacitive)
-        let dv_total = di_l * (r_esr + 1.0 / (8.0 * f_sw * c_out));
-        // Capacitive ripple only (what the ADC sees at the valley sample point)
-        let dv_cap = di_l / (8.0 * f_sw * c_out);
-        // ADC resolution referred to output
-        let divider_ratio = (V_REF * 0.75) / p.v_out_target;
-        let lsb_vout = LSB / divider_ratio;
-
-        eprintln!("--- Large C_out diagnostics ---");
-        eprintln!("di_L        = {:.3} A", di_l);
-        eprintln!("dv_total    = {:.4} V  ({:.1} mV)", dv_total, dv_total * 1e3);
-        eprintln!("dv_cap      = {:.4} V  ({:.2} mV)", dv_cap, dv_cap * 1e3);
-        eprintln!("1 ADC LSB   = {:.4} V  ({:.2} mV)", lsb_vout, lsb_vout * 1e3);
-        eprintln!("dv_cap / LSB = {:.2} codes", dv_cap / lsb_vout);
-
-        let ctrl = build_ctrl_params_multi(&p).unwrap();
-        let (tf, dac_settings) = ctrl.to_transfer_function(p.v_in, ControlTopology::Buck);
-        let weights = tf.to_2p2z().unwrap();
-        let vpp = dac_settings.vpp();
-
-        let b0_phys = weights.b0 as f64;
-        eprintln!("b0_phys     = {:.4}", b0_phys);
-        eprintln!("|b0| × dv_total = {:.4} V  (vpp/SF = {:.4})", b0_phys.abs() * dv_total, vpp / 2.0);
-        eprintln!("|b0| × dv_cap   = {:.4} V  (vpp/SF = {:.4})", b0_phys.abs() * dv_cap, vpp / 2.0);
-        eprintln!("|b0| × LSB_vout = {:.4} V  (vpp/SF = {:.4})", b0_phys.abs() * lsb_vout, vpp / 2.0);
-
-        // Now run the actual simulation and measure duty cycle spread in steady state.
         let result = run_simulation(&p);
-        match result {
-            Err(msg) => eprintln!("Simulation rejected (good): {}", msg),
-            Ok(data) => {
-                // Look at the last 500 cycles (post-soft-start, post-load-step steady state)
-                let tail = &data[data.len() - 500..];
-                let duty_min = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MAX, f32::min);
-                let duty_max = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MIN, f32::max);
-                let v_min = tail.iter().map(|pt| pt.v_out).fold(f32::MAX, f32::min);
-                let v_max = tail.iter().map(|pt| pt.v_out).fold(f32::MIN, f32::max);
-                eprintln!("Duty range: {:.1}% .. {:.1}% (spread = {:.1}%)", duty_min, duty_max, duty_max - duty_min);
-                eprintln!("V_out range: {:.3} .. {:.3} V (spread = {:.0} mV)", v_min, v_max, (v_max - v_min) * 1e3);
+        assert!(
+            result.is_err(),
+            "Expected simulation to be rejected (crossover near f_esr), but it ran"
+        );
+        let msg = result.unwrap_err();
+        assert!(
+            msg.contains("ESR zero"),
+            "Error should mention ESR zero, got: {msg}"
+        );
+    }
 
-                // The duty cycle should NOT be swinging wildly.
-                // In steady state, duty spread should be < 10%.
-                assert!(
-                    duty_max - duty_min < 10.0,
-                    "Duty cycle oscillating: {:.1}% .. {:.1}% (spread {:.1}%)",
-                    duty_min, duty_max, duty_max - duty_min,
-                );
-            }
-        }
+    #[test]
+    fn large_cout_stable_with_lower_crossover() {
+        // With C_out = 300 µF but crossover reduced to 30 kHz (well below
+        // f_esr ≈ 53 kHz), the simulation should run and produce stable output.
+        let mut p = SimParams::default();
+        p.c_out_uf = 300.0;
+        p.crossover_khz = 30.0;
+
+        let data = run_simulation(&p).expect("Should run with lower crossover");
+        let tail = &data[data.len() - 500..];
+        let duty_min = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MAX, f32::min);
+        let duty_max = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MIN, f32::max);
+        assert!(
+            duty_max - duty_min < 10.0,
+            "Duty cycle oscillating at 30 kHz crossover: spread {:.1}%",
+            duty_max - duty_min,
+        );
     }
 }
