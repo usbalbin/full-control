@@ -793,3 +793,535 @@ fn tick_one(
         v_bat: 0.0, // filled in by battery loop when applicable
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Default params for tests — a stable single-phase buck converter.
+    fn test_params() -> SimParams {
+        SimParams {
+            v_in: 24.0,
+            v_out_target: 12.0,
+            f_sw_khz: 500.0,
+            l_uh: 4.0,
+            c_out_uf: 47.0,
+            r_esr_mohm: 10.0,
+            r_series_mohm: 35.0,
+            max_current: 10.0,
+            current_conduction: CurrentConduction::Synchronous,
+            load_kind: LoadKind::Steps,
+            r_loads: vec![6.0, 3.0],
+            crossover_khz: 30.0,
+            cycles_per_tick: 1,
+            bat_v_init: 11.0,
+            bat_r_int_mohm: 50.0,
+            bat_c_mf: 20.0,
+            blanking_ns: 0.0,
+            adc_sample_ns: 0.0,
+            max_duty_pct: 100.0,
+            slope_overcomp: 1.5,
+            mcu: McuProfile::ideal(),
+            cs: CsProfile::ideal(),
+            dac: DacProfile::ideal(),
+            num_phases: 1,
+        }
+    }
+
+    /// Check that the last N cycles of a simulation are "settled":
+    /// v_out within `tol_v` of `v_target`, no NaN/Inf, and positive current.
+    fn assert_settled(data: &[SimPoint], n_tail: usize, v_target: f64, tol_v: f64) {
+        let tail = &data[data.len() - n_tail..];
+        for pt in tail {
+            assert!(pt.v_out.is_finite(), "v_out is NaN/Inf");
+            assert!(
+                (pt.v_out as f64 - v_target).abs() < tol_v,
+                "v_out = {:.3} V, expected {:.1} V ± {:.1}",
+                pt.v_out,
+                v_target,
+                tol_v,
+            );
+            assert!(
+                pt.i_total_max >= pt.i_total_min,
+                "i_total_max ({}) < i_total_min ({})",
+                pt.i_total_max,
+                pt.i_total_min,
+            );
+        }
+    }
+
+    // ── Single-phase baseline ──────────────────────────────────────────────
+
+    #[test]
+    fn single_phase_settles() {
+        let p = test_params();
+        let data = run_simulation(&p).expect("simulation should succeed");
+        // After soft-start (1500 cycles) the converter should be settled.
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn single_phase_produces_one_phase_point() {
+        let p = test_params();
+        let data = run_simulation(&p).unwrap();
+        for pt in &data {
+            assert_eq!(pt.phases.len(), 1, "single-phase should have 1 PhasePoint");
+        }
+    }
+
+    // ── Multi-phase compensator gain scaling ───────────────────────────────
+
+    #[test]
+    fn multi_phase_scales_current_sense_gain() {
+        let mut p = test_params();
+        let single = build_ctrl_params(&p).unwrap();
+
+        for n in [2, 3, 4, 6] {
+            p.num_phases = n;
+            let multi = build_ctrl_params_multi(&p).unwrap();
+            let expected = single.current_sense_gain / n as f64;
+            assert!(
+                (multi.current_sense_gain - expected).abs() < 1e-12,
+                "N={}: cs_gain_multi={}, expected={}",
+                n,
+                multi.current_sense_gain,
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn multi_phase_plant_gain_scales_by_n() {
+        // The plant DC gain h_dc ∝ 1/current_sense_gain, so with N phases
+        // (cs_gain / N) the h_dc should be N× larger.
+        let mut p = test_params();
+        let single = build_ctrl_params(&p).unwrap();
+        let (tf1, _) = single.to_transfer_function(p.v_in, ControlTopology::Buck);
+        let h_dc_1 = tf1.design_summary().h_dc;
+
+        for n in [2, 3, 4] {
+            p.num_phases = n;
+            let multi = build_ctrl_params_multi(&p).unwrap();
+            let (tf_n, _) = multi.to_transfer_function(p.v_in, ControlTopology::Buck);
+            let h_dc_n = tf_n.design_summary().h_dc;
+            let ratio = h_dc_n / h_dc_1;
+            assert!(
+                (ratio - n as f64).abs() < 0.1,
+                "N={}: h_dc ratio = {:.2}, expected {:.1}",
+                n,
+                ratio,
+                n as f64,
+            );
+        }
+    }
+
+    #[test]
+    fn single_phase_params_unchanged_by_multi() {
+        // build_ctrl_params_multi must not change slope comp or other per-phase params.
+        let mut p = test_params();
+        let single = build_ctrl_params(&p).unwrap();
+
+        p.num_phases = 3;
+        let multi = build_ctrl_params_multi(&p).unwrap();
+
+        assert_eq!(single.l_inductor, multi.l_inductor);
+        assert_eq!(single.c_out, multi.c_out);
+        assert_eq!(single.r_esr_out_cap, multi.r_esr_out_cap);
+        assert_eq!(single.f_sw, multi.f_sw);
+        assert_eq!(single.v_out, multi.v_out);
+    }
+
+    #[test]
+    fn build_ctrl_params_multi_identity_for_n1() {
+        let mut p = test_params();
+        p.num_phases = 1;
+        let single = build_ctrl_params(&p).unwrap();
+        let multi = build_ctrl_params_multi(&p).unwrap();
+        assert_eq!(single.current_sense_gain, multi.current_sense_gain);
+    }
+
+    // ── Multi-phase simulation stability ───────────────────────────────────
+
+    #[test]
+    fn two_phase_settles() {
+        let mut p = test_params();
+        p.num_phases = 2;
+        let data = run_simulation(&p).expect("2-phase simulation should succeed");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn three_phase_settles() {
+        let mut p = test_params();
+        p.num_phases = 3;
+        let data = run_simulation(&p).expect("3-phase simulation should succeed");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn six_phase_settles() {
+        let mut p = test_params();
+        p.num_phases = 6;
+        let data = run_simulation(&p).expect("6-phase simulation should succeed");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn multi_phase_produces_n_phase_points() {
+        for n in [2, 3, 4] {
+            let mut p = test_params();
+            p.num_phases = n;
+            let data = run_simulation(&p).unwrap();
+            for pt in &data {
+                assert_eq!(
+                    pt.phases.len(),
+                    n,
+                    "N={}: expected {} PhasePoints, got {}",
+                    n,
+                    n,
+                    pt.phases.len(),
+                );
+            }
+        }
+    }
+
+    // ── Multi-phase v_out must match single-phase (same operating point) ──
+
+    #[test]
+    fn multi_phase_same_steady_state_voltage() {
+        let p1 = test_params();
+        let data1 = run_simulation(&p1).unwrap();
+        let v_out_1: f64 = data1[data1.len() - 200..].iter().map(|p| p.v_out as f64).sum::<f64>() / 200.0;
+
+        for n in [2, 3] {
+            let mut pn = test_params();
+            pn.num_phases = n;
+            let data_n = run_simulation(&pn).unwrap();
+            let v_out_n: f64 = data_n[data_n.len() - 200..].iter().map(|p| p.v_out as f64).sum::<f64>() / 200.0;
+
+            assert!(
+                (v_out_n - v_out_1).abs() < 0.5,
+                "N={}: steady-state v_out = {:.3} V, single-phase = {:.3} V (diff = {:.3})",
+                n,
+                v_out_n,
+                v_out_1,
+                (v_out_n - v_out_1).abs(),
+            );
+        }
+    }
+
+    // ── Interleaved envelope correctness ───────────────────────────────────
+
+    #[test]
+    fn interleaved_envelope_single_phase_passthrough() {
+        let phase = PhasePoint {
+            t_on: 0.5e-6,
+            duty_pct: 25.0,
+            i_l_min: 1.0,
+            i_l_max: 3.0,
+        };
+        let (lo, hi) = interleaved_envelope(&[phase], 2e-6);
+        assert_eq!(lo, 1.0);
+        assert_eq!(hi, 3.0);
+    }
+
+    #[test]
+    fn interleaved_envelope_two_phase_d50_cancellation() {
+        // Two identical phases at D = 0.50 should give near-complete ripple
+        // cancellation: the combined waveform is nearly flat.
+        let period: f32 = 2e-6;
+        let t_on = period * 0.5;
+        let phase = PhasePoint {
+            t_on,
+            duty_pct: 50.0,
+            i_l_min: 2.0,
+            i_l_max: 4.0,
+        };
+        let (lo, hi) = interleaved_envelope(&[phase.clone(), phase], period);
+        let ripple = hi - lo;
+        let per_phase_ripple = 4.0 - 2.0;
+        assert!(
+            ripple < per_phase_ripple * 0.15,
+            "2-phase D=0.5 ripple = {:.3}, expected near-zero (per-phase = {:.1})",
+            ripple,
+            per_phase_ripple,
+        );
+    }
+
+    #[test]
+    fn interleaved_envelope_three_phase_d33_cancellation() {
+        // Three identical phases at D ≈ 1/3 → near-complete cancellation.
+        let period: f32 = 2e-6;
+        let t_on = period / 3.0;
+        let phase = PhasePoint {
+            t_on,
+            duty_pct: 33.3,
+            i_l_min: 2.0,
+            i_l_max: 4.0,
+        };
+        let phases = vec![phase.clone(), phase.clone(), phase];
+        let (lo, hi) = interleaved_envelope(&phases, period);
+        let ripple = hi - lo;
+        let per_phase_ripple = 4.0 - 2.0;
+        assert!(
+            ripple < per_phase_ripple * 0.15,
+            "3-phase D=1/3 ripple = {:.3}, expected near-zero (per-phase = {:.1})",
+            ripple,
+            per_phase_ripple,
+        );
+    }
+
+    #[test]
+    fn interleaved_envelope_two_phase_reduces_ripple() {
+        // For a generic duty cycle (not exactly 0.5), two phases should still
+        // produce less combined ripple than a single phase.
+        let period: f32 = 2e-6;
+        let t_on = period * 0.3;
+        let phase = PhasePoint {
+            t_on,
+            duty_pct: 30.0,
+            i_l_min: 2.0,
+            i_l_max: 4.0,
+        };
+        let (_, hi_1) = interleaved_envelope(&[phase.clone()], period);
+        let (lo_1, _) = interleaved_envelope(&[phase.clone()], period);
+        let ripple_1 = hi_1 - lo_1;
+
+        let (lo_2, hi_2) = interleaved_envelope(&[phase.clone(), phase], period);
+        let ripple_2 = hi_2 - lo_2;
+        assert!(
+            ripple_2 < ripple_1 * 2.0,
+            "2-phase combined ripple ({:.3}) should be less than 2 × single-phase ({:.3})",
+            ripple_2,
+            ripple_1 * 2.0,
+        );
+    }
+
+    #[test]
+    fn interleaved_envelope_total_current_correct() {
+        // The average of the interleaved envelope should be N × per-phase average.
+        let period: f32 = 2e-6;
+        let t_on = period * 0.4;
+        let phase = PhasePoint {
+            t_on,
+            duty_pct: 40.0,
+            i_l_min: 2.0,
+            i_l_max: 4.0,
+        };
+        let per_phase_avg = (2.0 + 4.0) / 2.0;
+
+        for n in [2, 3, 4] {
+            let phases: Vec<PhasePoint> = (0..n).map(|_| phase.clone()).collect();
+            let (lo, hi) = interleaved_envelope(&phases, period);
+            let combined_mid = (lo + hi) / 2.0;
+            let expected = per_phase_avg * n as f32;
+            assert!(
+                (combined_mid - expected).abs() < 0.3,
+                "N={}: combined midpoint = {:.2}, expected {:.1}",
+                n,
+                combined_mid,
+                expected,
+            );
+        }
+    }
+
+    // ── Load step transient with multi-phase ───────────────────────────────
+
+    #[test]
+    fn multi_phase_handles_load_step() {
+        let mut p = test_params();
+        p.r_loads = vec![6.0, 2.0, 12.0]; // nom → heavy → light
+        p.num_phases = 3;
+        let data = run_simulation(&p).expect("3-phase load-step sim should succeed");
+        // After the last load step settles
+        assert_settled(&data, 200, p.v_out_target, 1.0);
+    }
+
+    // ── Battery mode with multi-phase ──────────────────────────────────────
+
+    #[test]
+    fn multi_phase_battery_mode() {
+        let mut p = test_params();
+        p.load_kind = LoadKind::Battery;
+        p.bat_v_init = 9.0;
+        p.bat_r_int_mohm = 50.0;
+        p.bat_c_mf = 10.0;
+        p.num_phases = 2;
+        let data = run_simulation(&p).expect("2-phase battery sim should succeed");
+        // Battery OCV should rise over the simulation
+        let first_bat = data.iter().find(|p| p.v_bat > 0.0).unwrap().v_bat;
+        let last_bat = data.last().unwrap().v_bat;
+        assert!(
+            last_bat > first_bat,
+            "Battery OCV should rise: first={:.2}, last={:.2}",
+            first_bat,
+            last_bat,
+        );
+        // No NaN/Inf in output
+        for pt in &data {
+            assert!(pt.v_out.is_finite(), "v_out is NaN/Inf in battery mode");
+        }
+    }
+
+    // ── SimPoint convenience methods ───────────────────────────────────────
+
+    #[test]
+    fn sim_point_i_total_avg() {
+        let pt = SimPoint {
+            t_ms: 0.0,
+            v_out: 12.0,
+            phases: vec![
+                PhasePoint { t_on: 0.5e-6, duty_pct: 25.0, i_l_min: 1.0, i_l_max: 3.0 },
+                PhasePoint { t_on: 0.5e-6, duty_pct: 25.0, i_l_min: 2.0, i_l_max: 4.0 },
+            ],
+            i_total_min: 4.0,
+            i_total_max: 6.0,
+            v_bat: 0.0,
+        };
+        let avg = pt.i_total_avg();
+        // phase0 avg = 2.0, phase1 avg = 3.0 → total = 5.0
+        assert!((avg - 5.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sim_point_duty_pct_avg() {
+        let pt = SimPoint {
+            t_ms: 0.0,
+            v_out: 12.0,
+            phases: vec![
+                PhasePoint { t_on: 0.5e-6, duty_pct: 30.0, i_l_min: 1.0, i_l_max: 3.0 },
+                PhasePoint { t_on: 0.5e-6, duty_pct: 50.0, i_l_min: 2.0, i_l_max: 4.0 },
+            ],
+            i_total_min: 4.0,
+            i_total_max: 6.0,
+            v_bat: 0.0,
+        };
+        let avg = pt.duty_pct_avg();
+        assert!((avg - 40.0).abs() < 1e-6);
+    }
+
+    // ── Serde backward compatibility ───────────────────────────────────────
+
+    #[test]
+    fn serde_default_num_phases() {
+        // Old localStorage data without num_phases should deserialize to 1.
+        let json = r#"{
+            "v_in": 24.0, "v_out_target": 12.0, "f_sw_khz": 500.0,
+            "l_uh": 4.0, "c_out_uf": 47.0, "r_esr_mohm": 10.0,
+            "r_series_mohm": 35.0, "max_current": 10.0,
+            "current_conduction": "Synchronous",
+            "load_kind": "Steps", "r_loads": [6.0],
+            "crossover_khz": 30.0, "cycles_per_tick": 1,
+            "bat_v_init": 11.0, "bat_r_int_mohm": 50.0, "bat_c_mf": 20.0,
+            "blanking_ns": 0.0, "adc_sample_ns": 0.0, "max_duty_pct": 100.0,
+            "slope_overcomp": 1.5,
+            "mcu": {"name":"Ideal","comp_delay_ns":0.0,"t_adc_us":0.0,"t_processing_us":0.0,"min_slope_steps_on_time":0},
+            "cs": {"name":"Ideal","cs_gain_mv_a":66.0,"cs_bandwidth_khz":0.0},
+            "dac": {"name":"Ideal","dac_filter_bw_khz":0.0,"t_dac_us":0.0}
+        }"#;
+        let p: SimParams = serde_json::from_str(json).expect("should deserialize");
+        assert_eq!(p.num_phases, 1, "missing num_phases should default to 1");
+    }
+
+    // ── ADC quantization limit-cycling regression ──────────────────────────
+
+    #[test]
+    fn large_cout_sweep_crossover() {
+        // Sweep crossover frequencies with C_out = 300 µF to find the threshold
+        // where the simulation becomes stable.
+        for fx in [5.0, 10.0, 20.0, 30.0, 40.0, 45.0, 50.0] {
+            let mut p = SimParams::default();
+            p.c_out_uf = 300.0;
+            p.crossover_khz = fx;
+
+            let ctrl = build_ctrl_params_multi(&p).unwrap();
+            let (tf, _) = ctrl.to_transfer_function(p.v_in, ControlTopology::Buck);
+            let ds = tf.design_summary();
+            let max_fx = ctrl.max_feasible_crossover_hz(p.v_in, ControlTopology::Buck);
+
+            let result = run_simulation(&p);
+            match result {
+                Err(msg) => eprintln!("f_x = {:.0} kHz: REJECTED — {}", fx, msg),
+                Ok(data) => {
+                    let tail = &data[data.len() - 500..];
+                    let duty_min = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MAX, f32::min);
+                    let duty_max = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MIN, f32::max);
+                    let spread = duty_max - duty_min;
+                    let status = if spread > 10.0 { "OSCILLATING" } else { "stable" };
+                    eprintln!(
+                        "f_x={:.0}kHz: {} (duty spread={:.1}%) PM={:.1}° max_fx={:.1}kHz ω_esr={:.0} ω_p1={:.0} ω_cp1={:.0}",
+                        fx, status, spread,
+                        ds.phase_margin_rad.to_degrees(),
+                        max_fx / 1e3,
+                        ds.omega_esr, ds.omega_p1, ds.omega_cp1,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn large_cout_diagnose() {
+        // Default settings with C_out = 300 µF — reproduces the oscillation
+        // the user reported (duty swinging 30–80% while v_out only ±100 mV).
+        let mut p = SimParams::default();
+        p.c_out_uf = 300.0;
+
+        // Compute the numbers that matter for limit cycling.
+        let f_sw = p.f_sw_khz * 1e3;
+        let c_out = p.c_out_uf * 1e-6;
+        let r_esr = p.r_esr_mohm * 1e-3;
+        let d = p.v_out_target / p.v_in;
+        let di_l = (p.v_in - p.v_out_target) * d / (f_sw * p.l_uh * 1e-6);
+
+        // Total ripple (ESR + capacitive)
+        let dv_total = di_l * (r_esr + 1.0 / (8.0 * f_sw * c_out));
+        // Capacitive ripple only (what the ADC sees at the valley sample point)
+        let dv_cap = di_l / (8.0 * f_sw * c_out);
+        // ADC resolution referred to output
+        let divider_ratio = (V_REF * 0.75) / p.v_out_target;
+        let lsb_vout = LSB / divider_ratio;
+
+        eprintln!("--- Large C_out diagnostics ---");
+        eprintln!("di_L        = {:.3} A", di_l);
+        eprintln!("dv_total    = {:.4} V  ({:.1} mV)", dv_total, dv_total * 1e3);
+        eprintln!("dv_cap      = {:.4} V  ({:.2} mV)", dv_cap, dv_cap * 1e3);
+        eprintln!("1 ADC LSB   = {:.4} V  ({:.2} mV)", lsb_vout, lsb_vout * 1e3);
+        eprintln!("dv_cap / LSB = {:.2} codes", dv_cap / lsb_vout);
+
+        let ctrl = build_ctrl_params_multi(&p).unwrap();
+        let (tf, dac_settings) = ctrl.to_transfer_function(p.v_in, ControlTopology::Buck);
+        let weights = tf.to_2p2z().unwrap();
+        let vpp = dac_settings.vpp();
+
+        let b0_phys = weights.b0 as f64;
+        eprintln!("b0_phys     = {:.4}", b0_phys);
+        eprintln!("|b0| × dv_total = {:.4} V  (vpp/SF = {:.4})", b0_phys.abs() * dv_total, vpp / 2.0);
+        eprintln!("|b0| × dv_cap   = {:.4} V  (vpp/SF = {:.4})", b0_phys.abs() * dv_cap, vpp / 2.0);
+        eprintln!("|b0| × LSB_vout = {:.4} V  (vpp/SF = {:.4})", b0_phys.abs() * lsb_vout, vpp / 2.0);
+
+        // Now run the actual simulation and measure duty cycle spread in steady state.
+        let result = run_simulation(&p);
+        match result {
+            Err(msg) => eprintln!("Simulation rejected (good): {}", msg),
+            Ok(data) => {
+                // Look at the last 500 cycles (post-soft-start, post-load-step steady state)
+                let tail = &data[data.len() - 500..];
+                let duty_min = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MAX, f32::min);
+                let duty_max = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MIN, f32::max);
+                let v_min = tail.iter().map(|pt| pt.v_out).fold(f32::MAX, f32::min);
+                let v_max = tail.iter().map(|pt| pt.v_out).fold(f32::MIN, f32::max);
+                eprintln!("Duty range: {:.1}% .. {:.1}% (spread = {:.1}%)", duty_min, duty_max, duty_max - duty_min);
+                eprintln!("V_out range: {:.3} .. {:.3} V (spread = {:.0} mV)", v_min, v_max, (v_max - v_min) * 1e3);
+
+                // The duty cycle should NOT be swinging wildly.
+                // In steady state, duty spread should be < 10%.
+                assert!(
+                    duty_max - duty_min < 10.0,
+                    "Duty cycle oscillating: {:.1}% .. {:.1}% (spread {:.1}%)",
+                    duty_min, duty_max, duty_max - duty_min,
+                );
+            }
+        }
+    }
+}
