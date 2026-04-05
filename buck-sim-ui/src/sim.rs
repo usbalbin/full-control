@@ -68,6 +68,48 @@ impl CsProfile {
     }
 }
 
+/// FET hardware parameters for loss estimation.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct FetProfile {
+    pub name: String,
+    pub rds_on_mohm: f64,  // Rds(on) [mΩ]
+    pub coss_pf: f64,      // Output capacitance [pF] — for Eoss switching loss
+    pub qg_nc: f64,        // Total gate charge [nC] — for gate drive loss
+    pub vgs_v: f64,        // Gate drive voltage [V]
+    pub t_rise_ns: f64,    // Current rise time [ns] — for V×I overlap loss
+    pub t_fall_ns: f64,    // Current fall time [ns] — for V×I overlap loss
+}
+
+impl FetProfile {
+    pub fn ideal() -> Self {
+        Self {
+            name: "Ideal".into(),
+            rds_on_mohm: 0.0,
+            coss_pf: 0.0,
+            qg_nc: 0.0,
+            vgs_v: 5.0,
+            t_rise_ns: 0.0,
+            t_fall_ns: 0.0,
+        }
+    }
+
+    pub fn epc2306() -> Self {
+        Self {
+            name: "EPC2306".into(),
+            rds_on_mohm: 3.1,
+            coss_pf: 600.0,
+            qg_nc: 1.1,
+            vgs_v: 5.0,
+            t_rise_ns: 1.5,
+            t_fall_ns: 1.5,
+        }
+    }
+
+    pub fn presets() -> Vec<Self> {
+        vec![Self::ideal(), Self::epc2306()]
+    }
+}
+
 /// Slope compensation DAC parameters.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DacProfile {
@@ -120,7 +162,7 @@ pub struct SimParams {
     pub l_uh: f64,          // Inductance [µH]
     pub c_out_uf: f64,      // Output capacitance [µF]
     pub r_esr_mohm: f64,    // Output cap ESR [mΩ]
-    pub r_series_mohm: f64, // Inductor DCR + switch R_ds(on) [mΩ]
+    pub dcr_mohm: f64,      // Inductor DCR [mΩ]
     pub max_current: f64,   // Maximum trip current [A]
 
     pub load_kind: LoadKind,
@@ -147,6 +189,8 @@ pub struct SimParams {
     pub slope_overcomp: f64,    // Slope over-compensation factor (1.0 = none, 1.5 = firmware default)
 
     // ── Hardware profiles ─────────────────────────────────────────────────
+    pub hs_fet: FetProfile,
+    pub ls_fet: FetProfile,
     pub mcu: McuProfile,
     pub cs: CsProfile,
     pub dac: DacProfile,
@@ -164,7 +208,7 @@ impl Default for SimParams {
             l_uh: 4.0,
             c_out_uf: 47.0,
             r_esr_mohm: 10.0,
-            r_series_mohm: 35.0,
+            dcr_mohm: 4.1,
             max_current: 10.0,
             current_conduction: CurrentConduction::Synchronous,
             load_kind: LoadKind::Steps,
@@ -178,6 +222,8 @@ impl Default for SimParams {
             adc_sample_ns: 0.0,
             max_duty_pct: 100.0,
             slope_overcomp: 1.5,
+            hs_fet: FetProfile::ideal(),
+            ls_fet: FetProfile::ideal(),
             mcu: McuProfile::ideal(),
             cs: CsProfile::ideal(),
             dac: DacProfile::ideal(),
@@ -349,7 +395,10 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
     let l_inductor = p.l_uh * 1e-6;
     let c_out = p.c_out_uf * 1e-6;
     let r_esr = p.r_esr_mohm * 1e-3;
-    let r_series = p.r_series_mohm * 1e-3;
+    let d_nom = (p.v_out_target / p.v_in).clamp(0.01, 0.99);
+    let r_series = (p.dcr_mohm
+        + d_nom * p.hs_fet.rds_on_mohm
+        + (1.0 - d_nom) * p.ls_fet.rds_on_mohm) * 1e-3;
     let cs_gain = p.cs.cs_gain_mv_a * 1e-3;
 
     // Auto-scale feedback divider so V_adc ≈ 75 % of ADC range at the target.
@@ -817,6 +866,142 @@ fn tick_one(
     }
 }
 
+// ── Power loss estimation ───────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct LossBreakdown {
+    pub hs_conduction_w: f64,
+    pub ls_conduction_w: f64,
+    pub inductor_dcr_w: f64,
+    pub hs_switching_w: f64,
+    pub ls_switching_w: f64,
+    pub hs_eoss_w: f64,
+    pub gate_drive_w: f64,
+    pub total_loss_w: f64,
+    pub p_out_w: f64,
+    pub efficiency_pct: f64,
+}
+
+/// Compute power losses from simulation data and parameters.
+///
+/// For Steps mode, uses cycles 1500–3000 (steady-state at nominal load before
+/// any load steps).  For Battery mode, uses the last 200 cycles.
+pub fn compute_losses(p: &SimParams, data: &[SimPoint]) -> Option<LossBreakdown> {
+    if data.is_empty() {
+        return None;
+    }
+
+    let window = match p.load_kind {
+        LoadKind::Steps => {
+            let start = 1500.min(data.len());
+            let end = 3000.min(data.len());
+            if end <= start {
+                return None;
+            }
+            &data[start..end]
+        }
+        LoadKind::Battery => {
+            let n = 200.min(data.len());
+            &data[data.len() - n..]
+        }
+    };
+
+    if window.is_empty() {
+        return None;
+    }
+
+    let n_phases = p.num_phases.max(1) as f64;
+    let f_sw = p.f_sw_khz * 1e3;
+    let v_in = p.v_in;
+
+    // Accumulate per-phase averages across the window
+    let mut sum_i_rms2 = 0.0_f64; // sum of I²_rms across all phases
+    let mut sum_d = 0.0_f64;      // sum of duty across all phases
+    let mut sum_i_min = 0.0_f64;  // sum of i_min (valley) across all phases
+    let mut sum_i_max = 0.0_f64;  // sum of i_max (peak) across all phases
+    let mut sum_v_out = 0.0_f64;
+    let mut sum_i_avg_total = 0.0_f64;
+    let count = window.len() as f64;
+
+    for pt in window {
+        sum_v_out += pt.v_out as f64;
+        sum_i_avg_total += pt.i_total_avg() as f64;
+
+        for ph in &pt.phases {
+            let i_min = ph.i_l_min as f64;
+            let i_max = ph.i_l_max as f64;
+            // RMS² for triangle waveform: (i_min² + i_min×i_max + i_max²) / 3
+            let i_rms2 = (i_min * i_min + i_min * i_max + i_max * i_max) / 3.0;
+            sum_i_rms2 += i_rms2;
+            sum_d += ph.duty_pct as f64 / 100.0;
+            sum_i_min += i_min;
+            sum_i_max += i_max;
+        }
+    }
+
+    let avg_i_rms2 = sum_i_rms2 / count;         // average total I²_rms (summed across N phases)
+    let avg_d = sum_d / count / n_phases;          // average duty per phase
+    let avg_i_min = sum_i_min / count / n_phases;  // average valley per phase
+    let avg_i_max = sum_i_max / count / n_phases;  // average peak per phase
+    let avg_v_out = sum_v_out / count;
+    let avg_i_total = sum_i_avg_total / count;
+
+    // Per-phase I²_rms (divide total sum by N to get per-phase)
+    let per_phase_i_rms2 = avg_i_rms2 / n_phases;
+
+    // Conduction losses (summed over all N phases)
+    let hs_conduction = p.hs_fet.rds_on_mohm * 1e-3 * avg_d * per_phase_i_rms2 * n_phases;
+    let ls_conduction = p.ls_fet.rds_on_mohm * 1e-3 * (1.0 - avg_d) * per_phase_i_rms2 * n_phases;
+    let inductor_dcr = p.dcr_mohm * 1e-3 * per_phase_i_rms2 * n_phases;
+
+    // Switching losses (per phase, summed over N phases)
+    let t_rise = p.hs_fet.t_rise_ns * 1e-9;
+    let t_fall = p.hs_fet.t_fall_ns * 1e-9;
+    let hs_switching = 0.5 * v_in * (avg_i_min * t_rise + avg_i_max * t_fall) * f_sw * n_phases;
+
+    // LS overlap loss (body diode commutation — typically small for sync FETs)
+    let t_rise_ls = p.ls_fet.t_rise_ns * 1e-9;
+    let t_fall_ls = p.ls_fet.t_fall_ns * 1e-9;
+    let ls_switching = 0.5 * v_in * (avg_i_max * t_rise_ls + avg_i_min * t_fall_ls) * f_sw * n_phases;
+
+    // Eoss: LS Coss charged/discharged each cycle (hard-switched by HS turn-on)
+    let coss_ls = p.ls_fet.coss_pf * 1e-12;
+    let hs_eoss = 0.5 * coss_ls * v_in * v_in * f_sw * n_phases;
+
+    // Gate drive loss: both FETs per phase
+    let qg_total = (p.hs_fet.qg_nc + p.ls_fet.qg_nc) * 1e-9;
+    let vgs = p.hs_fet.vgs_v.max(p.ls_fet.vgs_v);
+    let gate_drive = qg_total * vgs * f_sw * n_phases;
+
+    let total_loss = hs_conduction + ls_conduction + inductor_dcr
+        + hs_switching + ls_switching + hs_eoss + gate_drive;
+    let p_out = avg_v_out * avg_i_total;
+    let efficiency = if p_out + total_loss > 0.0 {
+        p_out / (p_out + total_loss) * 100.0
+    } else {
+        0.0
+    };
+
+    Some(LossBreakdown {
+        hs_conduction_w: hs_conduction,
+        ls_conduction_w: ls_conduction,
+        inductor_dcr_w: inductor_dcr,
+        hs_switching_w: hs_switching,
+        ls_switching_w: ls_switching,
+        hs_eoss_w: hs_eoss,
+        gate_drive_w: gate_drive,
+        total_loss_w: total_loss,
+        p_out_w: p_out,
+        efficiency_pct: efficiency,
+    })
+}
+
+/// Compute the effective series resistance [mΩ] from component parameters.
+pub fn computed_r_series_mohm(p: &SimParams) -> f64 {
+    let d_nom = (p.v_out_target / p.v_in).clamp(0.01, 0.99);
+    p.dcr_mohm + d_nom * p.hs_fet.rds_on_mohm + (1.0 - d_nom) * p.ls_fet.rds_on_mohm
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -830,7 +1015,7 @@ mod tests {
             l_uh: 4.0,
             c_out_uf: 47.0,
             r_esr_mohm: 10.0,
-            r_series_mohm: 35.0,
+            dcr_mohm: 35.0, // high DCR to match old r_series_mohm for test stability
             max_current: 10.0,
             current_conduction: CurrentConduction::Synchronous,
             load_kind: LoadKind::Steps,
@@ -844,6 +1029,8 @@ mod tests {
             adc_sample_ns: 0.0,
             max_duty_pct: 100.0,
             slope_overcomp: 1.5,
+            hs_fet: FetProfile::ideal(),
+            ls_fet: FetProfile::ideal(),
             mcu: McuProfile::ideal(),
             cs: CsProfile::ideal(),
             dac: DacProfile::ideal(),
@@ -1226,12 +1413,13 @@ mod tests {
     // ── Serde backward compatibility ───────────────────────────────────────
 
     #[test]
-    fn serde_default_num_phases() {
-        // Old localStorage data without num_phases should deserialize to 1.
+    fn serde_defaults_for_new_fields() {
+        // Old localStorage data without FET profiles or dcr_mohm should
+        // deserialize with defaults (Ideal FETs, dcr_mohm = 4.1).
         let json = r#"{
             "v_in": 24.0, "v_out_target": 12.0, "f_sw_khz": 500.0,
             "l_uh": 4.0, "c_out_uf": 47.0, "r_esr_mohm": 10.0,
-            "r_series_mohm": 35.0, "max_current": 10.0,
+            "max_current": 10.0,
             "current_conduction": "Synchronous",
             "load_kind": "Steps", "r_loads": [6.0],
             "crossover_khz": 30.0, "cycles_per_tick": 1,
@@ -1244,6 +1432,44 @@ mod tests {
         }"#;
         let p: SimParams = serde_json::from_str(json).expect("should deserialize");
         assert_eq!(p.num_phases, 1, "missing num_phases should default to 1");
+        assert_eq!(p.hs_fet.name, "Ideal");
+        assert_eq!(p.ls_fet.name, "Ideal");
+        assert!((p.dcr_mohm - 4.1).abs() < 1e-6);
+    }
+
+    // ── Loss computation ──────────────────────────────────────────────────
+
+    #[test]
+    fn compute_losses_sanity() {
+        let mut p = test_params();
+        p.hs_fet = FetProfile::epc2306();
+        p.ls_fet = FetProfile::epc2306();
+        p.dcr_mohm = 4.1;
+        let data = run_simulation(&p).expect("sim should succeed");
+        let lb = compute_losses(&p, &data).expect("losses should compute");
+        assert!(lb.total_loss_w > 0.0, "total loss should be positive");
+        assert!(lb.p_out_w > 0.0, "output power should be positive");
+        assert!(lb.efficiency_pct > 0.0 && lb.efficiency_pct < 100.0,
+            "efficiency should be between 0 and 100, got {:.1}%", lb.efficiency_pct);
+        assert!(lb.hs_conduction_w >= 0.0);
+        assert!(lb.ls_conduction_w >= 0.0);
+        assert!(lb.inductor_dcr_w >= 0.0);
+        assert!(lb.hs_switching_w >= 0.0);
+        assert!(lb.gate_drive_w >= 0.0);
+    }
+
+    #[test]
+    fn compute_losses_ideal_fets_zero_switching() {
+        let p = test_params(); // Ideal FETs
+        let data = run_simulation(&p).expect("sim should succeed");
+        let lb = compute_losses(&p, &data).expect("losses should compute");
+        // Ideal FETs: no switching losses, no gate drive, no Rds(on) conduction
+        assert!(lb.hs_conduction_w.abs() < 1e-12, "Ideal HS should have zero conduction loss");
+        assert!(lb.ls_conduction_w.abs() < 1e-12, "Ideal LS should have zero conduction loss");
+        assert!(lb.hs_switching_w.abs() < 1e-12, "Ideal should have zero switching loss");
+        assert!(lb.gate_drive_w.abs() < 1e-12, "Ideal should have zero gate drive loss");
+        // DCR loss should still exist (35 mΩ in test_params)
+        assert!(lb.inductor_dcr_w > 0.0, "DCR loss should be nonzero");
     }
 
     // ── ADC quantization limit-cycling regression ──────────────────────────

@@ -3,7 +3,7 @@ use egui_plot::{HLine, Line, Plot, PlotPoints};
 use full_control::control_2p2z::Topology as ControlTopology;
 
 use crate::bode::{BodeData, NonIdealParams, show_bode};
-use crate::sim::{CurrentConduction, McuProfile, CsProfile, DacProfile, LoadKind, SimParams, SimPoint, build_ctrl_params_multi, run_simulation};
+use crate::sim::{CurrentConduction, FetProfile, McuProfile, CsProfile, DacProfile, LossBreakdown, LoadKind, SimParams, SimPoint, build_ctrl_params_multi, compute_losses, computed_r_series_mohm, run_simulation};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
@@ -19,7 +19,7 @@ pub struct BuckSimApp {
     l_uh: f64,          // [µH]
     c_out_uf: f64,      // [µF]
     r_esr_mohm: f64,    // [mΩ]
-    r_series_mohm: f64, // [mΩ]
+    dcr_mohm: f64,      // [mΩ]
     max_current: f64,   // [A]
 
     // ── Controller tuning ──────────────────────────────────────────────────
@@ -45,6 +45,10 @@ pub struct BuckSimApp {
     max_duty_pct: f64,      // [%]
 
     // ── Hardware profiles ─────────────────────────────────────────────────────
+    hs_fet: FetProfile,
+    hs_fet_preset_idx: usize,
+    ls_fet: FetProfile,
+    ls_fet_preset_idx: usize,
     mcu: McuProfile,
     mcu_preset_idx: usize,
     cs: CsProfile,
@@ -58,6 +62,7 @@ pub struct BuckSimApp {
     // ── Cached simulation output ────────────────────────────────────────────
     sim_data: Result<Vec<SimPoint>, String>,
     bode_data: Option<BodeData>,
+    loss_breakdown: Option<LossBreakdown>,
     last_params: SimParams,
 
     // ── UI state ─────────────────────────────────────────────────────────────
@@ -77,12 +82,14 @@ enum PlotOption {
 impl Default for BuckSimApp {
     fn default() -> Self {
         if let Some(saved) = load_from_storage() {
-            Self::from_params(
-                saved.params,
-                saved.mcu_preset_idx,
-                saved.cs_preset_idx,
-                saved.dac_preset_idx,
-            )
+            let presets = SavedPresets {
+                hs_fet_preset_idx: saved.hs_fet_preset_idx,
+                ls_fet_preset_idx: saved.ls_fet_preset_idx,
+                mcu_preset_idx: saved.mcu_preset_idx,
+                cs_preset_idx: saved.cs_preset_idx,
+                dac_preset_idx: saved.dac_preset_idx,
+            };
+            Self::from_params(saved.params, presets)
         } else {
             Self::from_defaults()
         }
@@ -104,10 +111,21 @@ fn build_bode(p: &SimParams) -> Option<BodeData> {
 #[cfg(target_arch = "wasm32")]
 const STORAGE_KEY: &str = "buck_sim_settings";
 
+#[derive(Debug, Clone, Default)]
+struct SavedPresets {
+    hs_fet_preset_idx: usize,
+    ls_fet_preset_idx: usize,
+    mcu_preset_idx: usize,
+    cs_preset_idx: usize,
+    dac_preset_idx: usize,
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 struct SavedSettings {
     params: SimParams,
+    hs_fet_preset_idx: usize,
+    ls_fet_preset_idx: usize,
     mcu_preset_idx: usize,
     cs_preset_idx: usize,
     dac_preset_idx: usize,
@@ -117,6 +135,8 @@ impl Default for SavedSettings {
     fn default() -> Self {
         Self {
             params: SimParams::default(),
+            hs_fet_preset_idx: 0,
+            ls_fet_preset_idx: 0,
             mcu_preset_idx: 0,
             cs_preset_idx: 0,
             dac_preset_idx: 0,
@@ -163,8 +183,9 @@ fn load_from_storage() -> Option<SavedSettings> {
 fn clear_storage() {}
 
 impl BuckSimApp {
-    fn from_params(p: SimParams, mcu_idx: usize, cs_idx: usize, dac_idx: usize) -> Self {
+    fn from_params(p: SimParams, presets: SavedPresets) -> Self {
         let sim_data = run_simulation(&p);
+        let loss_breakdown = sim_data.as_ref().ok().and_then(|d| compute_losses(&p, d));
         let bode_data = build_bode(&p);
         Self {
             v_in: p.v_in,
@@ -173,7 +194,7 @@ impl BuckSimApp {
             l_uh: p.l_uh,
             c_out_uf: p.c_out_uf,
             r_esr_mohm: p.r_esr_mohm,
-            r_series_mohm: p.r_series_mohm,
+            dcr_mohm: p.dcr_mohm,
             max_current: p.max_current,
             crossover_khz: p.crossover_khz,
             cycles_per_tick: p.cycles_per_tick,
@@ -187,15 +208,20 @@ impl BuckSimApp {
             blanking_ns: p.blanking_ns,
             adc_sample_ns: p.adc_sample_ns,
             max_duty_pct: p.max_duty_pct,
+            hs_fet: p.hs_fet.clone(),
+            hs_fet_preset_idx: presets.hs_fet_preset_idx,
+            ls_fet: p.ls_fet.clone(),
+            ls_fet_preset_idx: presets.ls_fet_preset_idx,
             mcu: p.mcu.clone(),
-            mcu_preset_idx: mcu_idx,
+            mcu_preset_idx: presets.mcu_preset_idx,
             cs: p.cs.clone(),
-            cs_preset_idx: cs_idx,
+            cs_preset_idx: presets.cs_preset_idx,
             dac: p.dac.clone(),
-            dac_preset_idx: dac_idx,
+            dac_preset_idx: presets.dac_preset_idx,
             num_phases: p.num_phases,
             sim_data,
             bode_data,
+            loss_breakdown,
             last_params: p,
             tab: Tab::Simulation,
             plot_option: PlotOption::Average,
@@ -203,12 +229,14 @@ impl BuckSimApp {
     }
 
     fn from_defaults() -> Self {
-        Self::from_params(SimParams::default(), 0, 0, 0)
+        Self::from_params(SimParams::default(), SavedPresets::default())
     }
 
     fn to_settings(&self) -> SavedSettings {
         SavedSettings {
             params: self.current_params(),
+            hs_fet_preset_idx: self.hs_fet_preset_idx,
+            ls_fet_preset_idx: self.ls_fet_preset_idx,
             mcu_preset_idx: self.mcu_preset_idx,
             cs_preset_idx: self.cs_preset_idx,
             dac_preset_idx: self.dac_preset_idx,
@@ -223,7 +251,7 @@ impl BuckSimApp {
             l_uh: self.l_uh,
             c_out_uf: self.c_out_uf,
             r_esr_mohm: self.r_esr_mohm,
-            r_series_mohm: self.r_series_mohm,
+            dcr_mohm: self.dcr_mohm,
             max_current: self.max_current,
             crossover_khz: self.crossover_khz,
             cycles_per_tick: self.cycles_per_tick,
@@ -237,6 +265,8 @@ impl BuckSimApp {
             adc_sample_ns: self.adc_sample_ns,
             max_duty_pct: self.max_duty_pct,
             slope_overcomp: self.slope_overcomp,
+            hs_fet: self.hs_fet.clone(),
+            ls_fet: self.ls_fet.clone(),
             mcu: self.mcu.clone(),
             cs: self.cs.clone(),
             dac: self.dac.clone(),
@@ -395,7 +425,7 @@ impl eframe::App for BuckSimApp {
                             .color(Color32::GRAY),
                         );
                         ui.label(
-                            egui::RichText::new("L, R_series: per phase. C_out, R_ESR: total.")
+                            egui::RichText::new("L, DCR, FETs: per phase. C_out, R_ESR: total.")
                             .small()
                             .color(Color32::GRAY),
                         );
@@ -420,10 +450,18 @@ impl eframe::App for BuckSimApp {
                         .step_by(0.1),
                 ).on_hover_text("Total ESR of the shared output capacitor bank");
                 ui.add(
-                    egui::Slider::new(&mut self.r_series_mohm, 0.0..=500.0)
-                        .text("R_series [mΩ]")
-                        .step_by(1.0),
-                ).on_hover_text("Per-phase series path resistance: inductor DCR + switch Rds(on)");
+                    egui::Slider::new(&mut self.dcr_mohm, 0.0..=50.0)
+                        .text("DCR [mΩ]")
+                        .step_by(0.1),
+                ).on_hover_text("Per-phase inductor DC resistance");
+                {
+                    let r_path = computed_r_series_mohm(&self.current_params());
+                    ui.label(
+                        egui::RichText::new(format!("R_path: {:.1} mΩ (DCR + Rds weighted)", r_path))
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                }
 
                 ui.separator();
                 ui.label("Current sense").on_hover_text("Current measurement for peak current mode control");
@@ -491,6 +529,104 @@ impl eframe::App for BuckSimApp {
                 egui::CollapsingHeader::new("Hardware")
                     .default_open(false)
                     .show(ui, |ui| {
+                        // ── High-Side FET ────────────────────────────────
+                        ui.label("High-Side FET").on_hover_text("High-side switch parameters for loss estimation");
+                        {
+                            let presets = FetProfile::presets();
+                            let label = if self.hs_fet_preset_idx < presets.len() {
+                                presets[self.hs_fet_preset_idx].name.as_str()
+                            } else { "Custom" };
+                            egui::ComboBox::from_id_salt("hs_fet_preset")
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    for (i, p) in presets.iter().enumerate() {
+                                        if ui.selectable_value(
+                                            &mut self.hs_fet_preset_idx, i, &p.name,
+                                        ).clicked() {
+                                            self.hs_fet = presets[i].clone();
+                                        }
+                                    }
+                                    ui.selectable_value(
+                                        &mut self.hs_fet_preset_idx, usize::MAX, "Custom",
+                                    );
+                                });
+
+                            let before = self.hs_fet.clone();
+                            ui.add(egui::Slider::new(&mut self.hs_fet.rds_on_mohm, 0.0..=100.0)
+                                .text("Rds(on) [mΩ]").step_by(0.1))
+                                .on_hover_text("On-state drain-source resistance");
+                            ui.add(egui::Slider::new(&mut self.hs_fet.coss_pf, 0.0..=5000.0)
+                                .text("Coss [pF]").step_by(10.0))
+                                .on_hover_text("Output capacitance (for Eoss switching loss)");
+                            ui.add(egui::Slider::new(&mut self.hs_fet.qg_nc, 0.0..=100.0)
+                                .text("Qg [nC]").step_by(0.1))
+                                .on_hover_text("Total gate charge (for gate drive loss)");
+                            ui.add(egui::Slider::new(&mut self.hs_fet.vgs_v, 1.0..=20.0)
+                                .text("Vgs [V]").step_by(0.1))
+                                .on_hover_text("Gate drive voltage");
+                            ui.add(egui::Slider::new(&mut self.hs_fet.t_rise_ns, 0.0..=50.0)
+                                .text("t_rise [ns]").step_by(0.1))
+                                .on_hover_text("Current rise time (V×I overlap at turn-on)");
+                            ui.add(egui::Slider::new(&mut self.hs_fet.t_fall_ns, 0.0..=50.0)
+                                .text("t_fall [ns]").step_by(0.1))
+                                .on_hover_text("Current fall time (V×I overlap at turn-off)");
+
+                            if self.hs_fet != before && self.hs_fet_preset_idx != usize::MAX {
+                                self.hs_fet_preset_idx = usize::MAX;
+                            }
+                        }
+
+                        ui.separator();
+
+                        // ── Low-Side FET ─────────────────────────────────
+                        ui.label("Low-Side FET").on_hover_text("Low-side (synchronous) switch parameters");
+                        {
+                            let presets = FetProfile::presets();
+                            let label = if self.ls_fet_preset_idx < presets.len() {
+                                presets[self.ls_fet_preset_idx].name.as_str()
+                            } else { "Custom" };
+                            egui::ComboBox::from_id_salt("ls_fet_preset")
+                                .selected_text(label)
+                                .show_ui(ui, |ui| {
+                                    for (i, p) in presets.iter().enumerate() {
+                                        if ui.selectable_value(
+                                            &mut self.ls_fet_preset_idx, i, &p.name,
+                                        ).clicked() {
+                                            self.ls_fet = presets[i].clone();
+                                        }
+                                    }
+                                    ui.selectable_value(
+                                        &mut self.ls_fet_preset_idx, usize::MAX, "Custom",
+                                    );
+                                });
+
+                            let before = self.ls_fet.clone();
+                            ui.add(egui::Slider::new(&mut self.ls_fet.rds_on_mohm, 0.0..=100.0)
+                                .text("Rds(on) [mΩ]").step_by(0.1))
+                                .on_hover_text("On-state drain-source resistance");
+                            ui.add(egui::Slider::new(&mut self.ls_fet.coss_pf, 0.0..=5000.0)
+                                .text("Coss [pF]").step_by(10.0))
+                                .on_hover_text("Output capacitance (discharged through HS each cycle)");
+                            ui.add(egui::Slider::new(&mut self.ls_fet.qg_nc, 0.0..=100.0)
+                                .text("Qg [nC]").step_by(0.1))
+                                .on_hover_text("Total gate charge");
+                            ui.add(egui::Slider::new(&mut self.ls_fet.vgs_v, 1.0..=20.0)
+                                .text("Vgs [V]").step_by(0.1))
+                                .on_hover_text("Gate drive voltage");
+                            ui.add(egui::Slider::new(&mut self.ls_fet.t_rise_ns, 0.0..=50.0)
+                                .text("t_rise [ns]").step_by(0.1))
+                                .on_hover_text("Current rise time");
+                            ui.add(egui::Slider::new(&mut self.ls_fet.t_fall_ns, 0.0..=50.0)
+                                .text("t_fall [ns]").step_by(0.1))
+                                .on_hover_text("Current fall time");
+
+                            if self.ls_fet != before && self.ls_fet_preset_idx != usize::MAX {
+                                self.ls_fet_preset_idx = usize::MAX;
+                            }
+                        }
+
+                        ui.separator();
+
                         // ── MCU ───────────────────────────────────────────
                         ui.label("MCU").on_hover_text("Microcontroller timing parameters");
                         {
@@ -765,6 +901,37 @@ impl eframe::App for BuckSimApp {
                         .on_hover_text("Reconstructed per-phase triangular inductor current waveforms");
                 });
 
+                // ── Power Losses ─────────────────────────────────────────
+                ui.separator();
+                egui::CollapsingHeader::new("Power Losses")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if let Some(ref lb) = self.loss_breakdown {
+                            let fmt_mw = |w: f64| -> String {
+                                if w >= 1.0 {
+                                    format!("{:.2} W", w)
+                                } else {
+                                    format!("{:.1} mW", w * 1e3)
+                                }
+                            };
+                            ui.label("Conduction:");
+                            ui.label(egui::RichText::new(format!("  HS FET:    {}", fmt_mw(lb.hs_conduction_w))).small().monospace());
+                            ui.label(egui::RichText::new(format!("  LS FET:    {}", fmt_mw(lb.ls_conduction_w))).small().monospace());
+                            ui.label(egui::RichText::new(format!("  Inductor:  {}", fmt_mw(lb.inductor_dcr_w))).small().monospace());
+                            ui.label("Switching:");
+                            ui.label(egui::RichText::new(format!("  HS overlap: {}", fmt_mw(lb.hs_switching_w))).small().monospace());
+                            ui.label(egui::RichText::new(format!("  LS overlap: {}", fmt_mw(lb.ls_switching_w))).small().monospace());
+                            ui.label(egui::RichText::new(format!("  Eoss:       {}", fmt_mw(lb.hs_eoss_w))).small().monospace());
+                            ui.label(egui::RichText::new(format!("  Gate drive: {}", fmt_mw(lb.gate_drive_w))).small().monospace());
+                            ui.separator();
+                            ui.label(egui::RichText::new(format!("Total loss:   {}", fmt_mw(lb.total_loss_w))).monospace());
+                            ui.label(egui::RichText::new(format!("P_out:        {:.2} W", lb.p_out_w)).monospace());
+                            ui.label(egui::RichText::new(format!("Efficiency:   {:.1}%", lb.efficiency_pct)).monospace());
+                        } else {
+                            ui.label(egui::RichText::new("No data").small().color(Color32::GRAY));
+                        }
+                    });
+
                 ui.separator();
                 ui.label(
                     egui::RichText::new("Plot updates live as sliders move.")
@@ -785,6 +952,7 @@ impl eframe::App for BuckSimApp {
             let params = self.current_params();
             if params != self.last_params {
                 self.sim_data = run_simulation(&params);
+                self.loss_breakdown = self.sim_data.as_ref().ok().and_then(|d| compute_losses(&params, d));
                 self.bode_data = build_bode(&params);
                 self.last_params = params;
                 save_to_storage(&self.to_settings());
