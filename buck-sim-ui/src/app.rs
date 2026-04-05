@@ -823,7 +823,7 @@ impl eframe::App for BuckSimApp {
                         let p = self.v_out_target * i;
                         // Nominal load — always present, no remove button
                         ui.add(
-                            egui::Slider::new(&mut self.r_loads[0], 0.5..=1000.0)
+                            egui::Slider::new(&mut self.r_loads[0], 0.01..=1000.0)
                                 .text(format!("R_nom [Ω], {i:.1}A, {p:.1}W"))
                                 .logarithmic(true)
                                 .max_decimals(2),

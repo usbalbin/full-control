@@ -1006,6 +1006,39 @@ pub fn computed_r_series_mohm(p: &SimParams) -> f64 {
 mod tests {
     use super::*;
 
+    /// Same parameters as in "Microcontroller-based peak current mode control using digital slope compensation"
+    /// https://centaur.reading.ac.uk/31751/1/Microcontroller%20Based%20Peak%20Current%20Mode%20Control%20Using%20Digital%20Slope%20Compensation%20-%20Hallworth%202012.pdf
+    fn hallworth_params() -> SimParams {
+        SimParams {
+            v_in: 16.0,
+            v_out_target: 8.0,
+            f_sw_khz: 200.0,
+            l_uh: 22.0,
+            c_out_uf: 440.0,
+            r_esr_mohm: 31.0,
+            dcr_mohm: 0.0,
+            max_current: 10.0,
+            current_conduction: CurrentConduction::Diode,
+            load_kind: LoadKind::Steps,
+            r_loads: vec![4.0, 6.0, 4.0],
+            crossover_khz: 15.0,
+            cycles_per_tick: 1,
+            bat_v_init: 0.0, // Not used
+            bat_r_int_mohm: 0.0,// Not used
+            bat_c_mf: 0.0,// Not used
+            blanking_ns: 0.0,
+            adc_sample_ns: 0.0,
+            max_duty_pct: 100.0,
+            slope_overcomp: 1.0,
+            hs_fet: FetProfile::ideal(),
+            ls_fet: FetProfile::ideal(),
+            mcu: McuProfile::ideal(),
+            cs: CsProfile::ideal(),
+            dac: DacProfile::ideal(),
+            num_phases: 1,
+        }
+    }
+
     /// Default params for tests — a stable single-phase buck converter.
     fn test_params() -> SimParams {
         SimParams {
@@ -1065,6 +1098,14 @@ mod tests {
     #[test]
     fn single_phase_settles() {
         let p = test_params();
+        let data = run_simulation(&p).expect("simulation should succeed");
+        // After soft-start (1500 cycles) the converter should be settled.
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn single_phase_hallworth_settles() {
+        let p = hallworth_params();
         let data = run_simulation(&p).expect("simulation should succeed");
         // After soft-start (1500 cycles) the converter should be settled.
         assert_settled(&data, 500, p.v_out_target, 0.5);
