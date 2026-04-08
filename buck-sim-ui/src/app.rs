@@ -3,7 +3,7 @@ use egui_plot::{HLine, Line, Plot, PlotPoints};
 use full_control::control_2p2z::Topology as ControlTopology;
 
 use crate::bode::{BodeData, NonIdealParams, show_bode};
-use crate::sim::{CurrentConduction, FetProfile, McuProfile, CsProfile, DacProfile, LossBreakdown, LoadKind, SimParams, SimPoint, build_ctrl_params_multi, compute_losses, computed_r_series_mohm, run_simulation};
+use crate::sim::{CurrentConduction, FetProfile, McuProfile, CsProfile, DacProfile, LossBreakdown, LoadKind, SimParams, SimPoint, build_ctrl_params_multi, compute_losses, computed_r_series_mohm, run_simulation, SOFT_START_CYCLES, STEADY_STATE_CYCLES, LOAD_STEP_CYCLES};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
@@ -32,6 +32,10 @@ pub struct BuckSimApp {
     // ── Load configuration ───────────────────────────────────────────────────
     load_kind: LoadKind,
     r_loads: Vec<f64>,      // [Ω] per-phase load resistances (Steps mode)
+    c_load_uf: f64,         // [µF] extra load capacitance (plant-only)
+    r_in_mohm: f64,         // [mΩ] input cable resistance (plant-only)
+    l_in_nh: f64,           // [nH] input cable inductance (plant-only)
+    c_in_uf: f64,           // [µF] input decoupling capacitance (plant-only)
     bat_v_init: f64,        // [V]   battery initial OCV
     bat_r_int_mohm: f64,    // [mΩ]  battery internal resistance
     bat_c_mf: f64,          // [mF]  battery capacitance (controls charging speed)
@@ -202,6 +206,10 @@ impl BuckSimApp {
             current_conduction: p.current_conduction,
             load_kind: p.load_kind.clone(),
             r_loads: p.r_loads.clone(),
+            c_load_uf: p.c_load_uf,
+            r_in_mohm: p.r_in_mohm,
+            l_in_nh: p.l_in_nh,
+            c_in_uf: p.c_in_uf,
             bat_v_init: p.bat_v_init,
             bat_r_int_mohm: p.bat_r_int_mohm,
             bat_c_mf: p.bat_c_mf,
@@ -258,6 +266,10 @@ impl BuckSimApp {
             current_conduction: self.current_conduction,
             load_kind: self.load_kind.clone(),
             r_loads: self.r_loads.clone(),
+            c_load_uf: self.c_load_uf,
+            r_in_mohm: self.r_in_mohm,
+            l_in_nh: self.l_in_nh,
+            c_in_uf: self.c_in_uf,
             bat_v_init: self.bat_v_init,
             bat_r_int_mohm: self.bat_r_int_mohm,
             bat_c_mf: self.bat_c_mf,
@@ -349,6 +361,43 @@ impl eframe::App for BuckSimApp {
                 if self.v_out_target >= self.v_in {
                     self.v_out_target = self.v_in - 0.5;
                 }
+
+                ui.separator();
+                ui.label("Input Cable / Filter").on_hover_text(
+                    "Models the cable and decoupling capacitor between the power supply and the converter.\n\
+                     V_src --[R]--[L]--+--[converter]\n\
+                     \x20                  |\n\
+                     \x20                [C_in]\n\
+                     \x20                  |\n\
+                     \x20                 GND\n\n\
+                     Only affects plant simulation, NOT compensator design."
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.r_in_mohm, 0.0..=1000.0)
+                        .text("R_cable [m\u{2126}]")
+                        .step_by(1.0),
+                ).on_hover_text(
+                    "Cable + connector resistance between supply and input cap. \
+                     Only affects plant simulation, not compensator design."
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.l_in_nh, 0.0..=10000.0)
+                        .text("L_cable [nH]")
+                        .step_by(1.0),
+                ).on_hover_text(
+                    "Cable inductance (~2 nH/cm). 50 cm \u{2248} 100 nH, 1 m \u{2248} 200 nH. \
+                     Only affects plant simulation, not compensator design."
+                );
+                ui.add(
+                    egui::Slider::new(&mut self.c_in_uf, 0.0..=1000.0)
+                        .text("C_in [\u{00b5}F]")
+                        .logarithmic(true)
+                        .max_decimals(1),
+                ).on_hover_text(
+                    "Input decoupling capacitance on the converter PCB. \
+                     Set to 0 for an ideal stiff source. \
+                     Only affects plant simulation, not compensator design."
+                );
 
                 ui.separator();
                 ui.label("Output").on_hover_text("Desired regulated output");
@@ -884,6 +933,18 @@ impl eframe::App for BuckSimApp {
                     }
                 }
 
+                ui.add_space(2.0);
+                ui.add(
+                    egui::Slider::new(&mut self.c_load_uf, 0.0..=10000.0)
+                        .text("C_load [µF]")
+                        .logarithmic(true)
+                        .max_decimals(1),
+                ).on_hover_text(
+                    "Extra capacitance on the load side. Only affects the plant simulation, \
+                     NOT the compensator design. Use this to test how much extra capacitance \
+                     the control loop can tolerate."
+                );
+
                 ui.separator();
                 ui.label("Plot Options").on_hover_text("Select which inductor current trace to display");
                 ui.horizontal(|ui| {
@@ -927,6 +988,68 @@ impl eframe::App for BuckSimApp {
                             ui.label(egui::RichText::new(format!("Total loss:   {}", fmt_mw(lb.total_loss_w))).monospace());
                             ui.label(egui::RichText::new(format!("P_out:        {:.2} W", lb.p_out_w)).monospace());
                             ui.label(egui::RichText::new(format!("Efficiency:   {:.1}%", lb.efficiency_pct)).monospace());
+                        } else {
+                            ui.label(egui::RichText::new("No data").small().color(Color32::GRAY));
+                        }
+                    });
+
+                // ── Output Capacitor ───────────────────────────────────
+                ui.separator();
+                egui::CollapsingHeader::new("Output Capacitor")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        if let Ok(ref data) = self.sim_data {
+                            let settled_tail = STEADY_STATE_CYCLES / 4;
+                            let mut worst_pp: f32 = 0.0;
+                            let mut worst_load = 0.0_f64;
+
+                            match self.load_kind {
+                                LoadKind::Steps => {
+                                    // Steady-state segment at r_loads[0]
+                                    let mut segments: Vec<(usize, usize, f64)> = vec![
+                                        (SOFT_START_CYCLES, SOFT_START_CYCLES + STEADY_STATE_CYCLES, self.r_loads[0]),
+                                    ];
+                                    let mut offset = SOFT_START_CYCLES + STEADY_STATE_CYCLES;
+                                    for &r in &self.r_loads[1..] {
+                                        segments.push((offset, offset + LOAD_STEP_CYCLES, r));
+                                        offset += LOAD_STEP_CYCLES;
+                                    }
+                                    for &(start, end, r_load) in &segments {
+                                        let end = end.min(data.len());
+                                        let start = start.min(end);
+                                        let tail_n = settled_tail.min(end - start);
+                                        if tail_n == 0 { continue; }
+                                        let tail = &data[end - tail_n..end];
+                                        let pp: f32 = tail.iter()
+                                            .map(|p| p.i_total_max - p.i_total_min)
+                                            .fold(0.0_f32, f32::max);
+                                        if pp > worst_pp {
+                                            worst_pp = pp;
+                                            worst_load = r_load;
+                                        }
+                                    }
+                                }
+                                LoadKind::Battery => {
+                                    let n = settled_tail.min(data.len());
+                                    let tail = &data[data.len() - n..];
+                                    worst_pp = tail.iter()
+                                        .map(|p| p.i_total_max - p.i_total_min)
+                                        .fold(0.0_f32, f32::max);
+                                }
+                            }
+
+                            let rms = worst_pp as f64 / (2.0 * 3.0_f64.sqrt());
+                            ui.label(egui::RichText::new(
+                                format!("Ripple I_pp:  {:.2} A", worst_pp)
+                            ).monospace());
+                            ui.label(egui::RichText::new(
+                                format!("Ripple I_rms: {:.2} A", rms)
+                            ).monospace());
+                            if self.load_kind == LoadKind::Steps && worst_load > 0.0 {
+                                ui.label(egui::RichText::new(
+                                    format!("Worst load:   {:.1} \u{2126}", worst_load)
+                                ).small().monospace());
+                            }
                         } else {
                             ui.label(egui::RichText::new("No data").small().color(Color32::GRAY));
                         }
@@ -1059,6 +1182,16 @@ impl BuckSimApp {
                                 .color(Color32::from_rgb(255, 80, 80))
                                 .style(egui_plot::LineStyle::dashed_dense()),
                         );
+                        if self.c_in_uf > 0.0 {
+                            plot_ui.line(
+                                Line::new(
+                                    "V_in_cap [V]",
+                                    data.iter()
+                                        .map(|p| [p.t_ms as f64, p.v_in_cap as f64])
+                                        .collect::<PlotPoints>(),
+                                ).color(Color32::from_rgb(255, 160, 50)),
+                            );
+                        }
                     });
 
                 // Duty cycle plot

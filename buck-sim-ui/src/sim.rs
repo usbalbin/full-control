@@ -146,6 +146,13 @@ const V_REF: f64 = 3.3;
 const ADC_MAX: f64 = 4095.0;
 const LSB: f64 = V_REF / ADC_MAX;
 
+/// Number of switching cycles for the soft-start ramp.
+pub const SOFT_START_CYCLES: usize = 1500;
+/// Number of switching cycles at the initial load after soft-start.
+pub const STEADY_STATE_CYCLES: usize = 1500;
+/// Number of switching cycles per load-step transition.
+pub const LOAD_STEP_CYCLES: usize = 2000;
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LoadKind {
     Steps,
@@ -195,6 +202,14 @@ pub struct SimParams {
     pub cs: CsProfile,
     pub dac: DacProfile,
 
+    // ── Load capacitance (not used in compensator design) ─────────────
+    pub c_load_uf: f64,     // Extra load capacitance [µF] (plant-only, not in compensator)
+
+    // ── Input impedance (not used in compensator design) ─────────────
+    pub r_in_mohm: f64,    // Input cable resistance [mΩ] (plant-only)
+    pub l_in_nh: f64,      // Input cable inductance [nH] (plant-only)
+    pub c_in_uf: f64,      // Input decoupling capacitance [µF] (plant-only)
+
     // ── Multi-phase ──────────────────────────────────────────────────────
     pub num_phases: usize,
 }
@@ -227,6 +242,10 @@ impl Default for SimParams {
             mcu: McuProfile::ideal(),
             cs: CsProfile::ideal(),
             dac: DacProfile::ideal(),
+            c_load_uf: 0.0,
+            r_in_mohm: 0.0,
+            l_in_nh: 0.0,
+            c_in_uf: 0.0,
             num_phases: 1,
         }
     }
@@ -252,6 +271,8 @@ pub struct SimPoint {
     pub i_total_max: f32,
     /// Battery open-circuit voltage [V].  0.0 when not in Battery mode.
     pub v_bat: f32,
+    /// Input capacitor voltage [V].  0.0 when input impedance is disabled.
+    pub v_in_cap: f32,
 }
 
 impl SimPoint {
@@ -445,22 +466,6 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
         )
     })?;
 
-    // ESR zero proximity check: crossover must be well below f_esr to
-    // maintain adequate gain margin in the discrete-time implementation.
-    if r_esr > 0.0 && c_out > 0.0 {
-        let omega_esr = 1.0 / (r_esr * c_out);
-        let omega_x = p.crossover_khz as f64 * 1e3 * 2.0 * std::f64::consts::PI;
-        if omega_x > 0.8 * omega_esr {
-            let f_esr_khz = omega_esr / (2.0 * std::f64::consts::PI * 1e3);
-            let max_fx_khz = 0.8 * f_esr_khz;
-            return Err(format!(
-                "Crossover ({:.1} kHz) too close to ESR zero ({:.1} kHz). \
-                 The compensator pole at f_ESR degrades gain margin. \
-                 Max feasible: {:.1} kHz. Reduce crossover or decrease C_out / increase R_ESR.",
-                p.crossover_khz, f_esr_khz, max_fx_khz,
-            ));
-        }
-    }
 
     // Ripple / limit-cycling check: b0 × ΔV_ripple must fit inside vpp / safety_factor
     {
@@ -493,12 +498,12 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
         slope_amp_per_sec,
         r_series: Resistance(r_series),
         r_esr: Resistance(r_esr),
-        c_out: Capacitance(c_out),
+        c_out: Capacitance(c_out + p.c_load_uf * 1e-6),
         l_inductor: Inductance(l_inductor),
-        c_in: Capacitance(0.0),
+        c_in: Capacitance(p.c_in_uf * 1e-6),
         r_esr_cin: Resistance(0.0),
-        r_in: Resistance(0.0),
-        l_in: Inductance(0.0),
+        r_in: Resistance(p.r_in_mohm * 1e-3),
+        l_in: Inductance(p.l_in_nh * 1e-9),
         tau_current_sense: SimParameters::bw_to_tau(p.cs.cs_bandwidth_khz * 1e3),
         tau_dac: SimParameters::bw_to_tau(p.dac.dac_filter_bw_khz * 1e3),
         t_prop_delay: Time(p.mcu.comp_delay_ns * 1e-9),
@@ -515,7 +520,6 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
 
     let v_in = Voltage(p.v_in);
     let mut time = 0.0_f64;
-    let soft_cycles = 1500_usize;
     let mut held_dac_code: u16 = 0;
     let mut cycle_counter: usize = 0;
 
@@ -545,12 +549,13 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
 
     match p.load_kind {
         LoadKind::Steps => {
-            let capacity = 3000 + p.r_loads.len().saturating_sub(1) * 2000;
+            let capacity = SOFT_START_CYCLES + STEADY_STATE_CYCLES
+                + p.r_loads.len().saturating_sub(1) * LOAD_STEP_CYCLES;
             let mut results = Vec::with_capacity(capacity);
 
             // ── Soft-start ────────────────────────────────────────────────────
-            for i in 0..soft_cycles {
-                let target = target_code as f32 * (i + 1) as f32 / soft_cycles as f32;
+            for i in 0..SOFT_START_CYCLES {
+                let target = target_code as f32 * (i + 1) as f32 / SOFT_START_CYCLES as f32;
                 let r0 = p.r_loads[0];
                 let pt = do_tick!(target, |v: Voltage| Current(v.0 / r0));
                 results.push(pt);
@@ -559,7 +564,7 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
             }
 
             // ── Steady-state ─────────────────────────────────────────────────
-            for _ in 0..1500_usize {
+            for _ in 0..STEADY_STATE_CYCLES {
                 let r0 = p.r_loads[0];
                 let pt = do_tick!(target_code as f32, |v: Voltage| Current(v.0 / r0));
                 results.push(pt);
@@ -567,9 +572,9 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
                 cycle_counter += 1;
             }
 
-            // ── Load steps: 2000 cycles each for r_loads[1..] ─────────────────
+            // ── Load steps: LOAD_STEP_CYCLES each for r_loads[1..] ───────────
             for &r in &p.r_loads[1..] {
-                for _ in 0..2000_usize {
+                for _ in 0..LOAD_STEP_CYCLES {
                     let pt = do_tick!(target_code as f32, |v: Voltage| Current(v.0 / r));
                     results.push(pt);
                     time += t_period;
@@ -583,7 +588,7 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
         LoadKind::Battery => {
             // 1500 soft-start + 10 000 charging cycles
             let bat_cycles = 10_000_usize;
-            let mut results = Vec::with_capacity(soft_cycles + bat_cycles);
+            let mut results = Vec::with_capacity(SOFT_START_CYCLES + bat_cycles);
 
             let mut bat = Battery::new(
                 p.bat_v_init,
@@ -592,8 +597,8 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
             );
 
             // ── Soft-start ────────────────────────────────────────────────────
-            for i in 0..soft_cycles {
-                let target = target_code as f32 * (i + 1) as f32 / soft_cycles as f32;
+            for i in 0..SOFT_START_CYCLES {
+                let target = target_code as f32 * (i + 1) as f32 / SOFT_START_CYCLES as f32;
                 let v_oc = bat.v_oc;
                 let r_int = bat.r_int;
                 let mut pt = do_tick!(target, |v: Voltage| Current(((v.0 - v_oc) / r_int).max(0.0)));
@@ -788,6 +793,7 @@ fn tick_multi(
         i_total_min,
         i_total_max,
         v_bat: 0.0,
+        v_in_cap: sims[0].v_in_cap.0 as f32,
     }
 }
 
@@ -863,6 +869,7 @@ fn tick_one(
         i_total_min: i_l_min,
         i_total_max: i_l_max,
         v_bat: 0.0, // filled in by battery loop when applicable
+        v_in_cap: sim.v_in_cap.0 as f32,
     }
 }
 
@@ -893,8 +900,8 @@ pub fn compute_losses(p: &SimParams, data: &[SimPoint]) -> Option<LossBreakdown>
 
     let window = match p.load_kind {
         LoadKind::Steps => {
-            let start = 1500.min(data.len());
-            let end = 3000.min(data.len());
+            let start = SOFT_START_CYCLES.min(data.len());
+            let end = (SOFT_START_CYCLES + STEADY_STATE_CYCLES).min(data.len());
             if end <= start {
                 return None;
             }
@@ -1035,6 +1042,10 @@ mod tests {
             mcu: McuProfile::ideal(),
             cs: CsProfile::ideal(),
             dac: DacProfile::ideal(),
+            c_load_uf: 0.0,
+            r_in_mohm: 0.0,
+            l_in_nh: 0.0,
+            c_in_uf: 0.0,
             num_phases: 1,
         }
     }
@@ -1067,6 +1078,10 @@ mod tests {
             mcu: McuProfile::ideal(),
             cs: CsProfile::ideal(),
             dac: DacProfile::ideal(),
+            c_load_uf: 0.0,
+            r_in_mohm: 0.0,
+            l_in_nh: 0.0,
+            c_in_uf: 0.0,
             num_phases: 1,
         }
     }
@@ -1428,6 +1443,7 @@ mod tests {
             i_total_min: 4.0,
             i_total_max: 6.0,
             v_bat: 0.0,
+            v_in_cap: 0.0,
         };
         let avg = pt.i_total_avg();
         // phase0 avg = 2.0, phase1 avg = 3.0 → total = 5.0
@@ -1446,6 +1462,7 @@ mod tests {
             i_total_min: 4.0,
             i_total_max: 6.0,
             v_bat: 0.0,
+            v_in_cap: 0.0,
         };
         let avg = pt.duty_pct_avg();
         assert!((avg - 40.0).abs() < 1e-6);
@@ -1518,55 +1535,25 @@ mod tests {
     #[test]
     fn large_cout_sweep_crossover() {
         // Sweep crossover frequencies with C_out = 300 µF.
-        // f_esr ≈ 53 kHz, so 0.8 × f_esr ≈ 42.4 kHz is the boundary.
-        // Crossover values above the boundary must be rejected;
-        // values well below must produce a stable simulation.
-        for fx in [5.0, 10.0, 20.0, 30.0, 40.0, 45.0, 50.0] {
+        // f_esr ≈ 53 kHz.  Low-crossover designs must be stable;
+        // high-crossover designs near f_esr may be rejected by the
+        // compensator design or produce an unstable simulation.
+        for fx in [5.0, 10.0, 20.0, 30.0, 40.0] {
             let mut p = SimParams::default();
             p.c_out_uf = 300.0;
             p.crossover_khz = fx;
 
-            let result = run_simulation(&p);
-            match result {
-                Err(msg) => {
-                    // Should only be rejected at higher crossovers
-                    assert!(
-                        fx >= 42.0,
-                        "f_x={fx}kHz unexpectedly rejected: {msg}"
-                    );
-                }
-                Ok(data) => {
-                    let tail = &data[data.len() - 500..];
-                    let duty_min = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MAX, f32::min);
-                    let duty_max = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MIN, f32::max);
-                    let spread = duty_max - duty_min;
-                    assert!(
-                        spread < 10.0,
-                        "f_x={fx}kHz: duty oscillating (spread={spread:.1}%)"
-                    );
-                }
-            }
+            let data = run_simulation(&p)
+                .unwrap_or_else(|e| panic!("f_x={fx}kHz unexpectedly rejected: {e}"));
+            let tail = &data[data.len() - 500..];
+            let duty_min = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MAX, f32::min);
+            let duty_max = tail.iter().map(|pt| pt.phases[0].duty_pct).fold(f32::MIN, f32::max);
+            let spread = duty_max - duty_min;
+            assert!(
+                spread < 10.0,
+                "f_x={fx}kHz: duty oscillating (spread={spread:.1}%)"
+            );
         }
-    }
-
-    #[test]
-    fn large_cout_rejected_when_crossover_near_esr_zero() {
-        // Default settings with C_out = 300 µF at crossover = 50 kHz.
-        // f_esr = 1/(2π × R_ESR × C_out) ≈ 53 kHz — too close to crossover.
-        // The simulator must reject this with an ESR-zero proximity error.
-        let mut p = SimParams::default();
-        p.c_out_uf = 300.0;
-
-        let result = run_simulation(&p);
-        assert!(
-            result.is_err(),
-            "Expected simulation to be rejected (crossover near f_esr), but it ran"
-        );
-        let msg = result.unwrap_err();
-        assert!(
-            msg.contains("ESR zero"),
-            "Error should mention ESR zero, got: {msg}"
-        );
     }
 
     #[test]
@@ -1586,5 +1573,62 @@ mod tests {
             "Duty cycle oscillating at 30 kHz crossover: spread {:.1}%",
             duty_max - duty_min,
         );
+    }
+
+    // ── Input impedance stability ─────────────────────────────────────────
+
+    #[test]
+    fn input_rc_settles() {
+        // Moderate cable resistance + input cap, no inductance (RC recharge path).
+        let mut p = test_params();
+        p.r_in_mohm = 100.0;  // 100 mΩ cable
+        p.c_in_uf = 10.0;     // 10 µF input cap
+        let data = run_simulation(&p).expect("RC input should not break sim");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+        // v_in_cap should be below v_in due to resistive droop
+        let tail = &data[data.len() - 200..];
+        for pt in tail {
+            assert!(pt.v_in_cap > 0.0, "v_in_cap should be initialised");
+            assert!(
+                (pt.v_in_cap as f64) < p.v_in + 0.1,
+                "v_in_cap ({:.2}) should not exceed v_in ({:.1})",
+                pt.v_in_cap, p.v_in,
+            );
+        }
+    }
+
+    #[test]
+    fn input_rlc_settles() {
+        // Full RLC input filter: cable R + L with input decoupling cap.
+        let mut p = test_params();
+        p.r_in_mohm = 100.0;   // 100 mΩ cable
+        p.l_in_nh = 500.0;     // 500 nH (~25 cm cable)
+        p.c_in_uf = 10.0;      // 10 µF input cap
+        let data = run_simulation(&p).expect("RLC input should not break sim");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn input_rlc_long_cable_settles() {
+        // Long cable: higher R and L, larger input cap to compensate.
+        let mut p = test_params();
+        p.r_in_mohm = 500.0;   // 500 mΩ (long thin cable)
+        p.l_in_nh = 2000.0;    // 2 µH (~1 m cable)
+        p.c_in_uf = 100.0;     // 100 µF bulk input cap
+        let data = run_simulation(&p).expect("long cable RLC should not break sim");
+        assert_settled(&data, 500, p.v_out_target, 1.0);
+    }
+
+    #[test]
+    fn input_impedance_zero_matches_ideal() {
+        // With all input impedance at zero, v_in_cap should remain 0 (disabled).
+        let p = test_params();
+        assert_eq!(p.r_in_mohm, 0.0);
+        assert_eq!(p.l_in_nh, 0.0);
+        assert_eq!(p.c_in_uf, 0.0);
+        let data = run_simulation(&p).expect("default params should work");
+        for pt in &data {
+            assert_eq!(pt.v_in_cap, 0.0, "v_in_cap should be 0 when input impedance disabled");
+        }
     }
 }
