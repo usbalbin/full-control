@@ -242,7 +242,7 @@ impl CapTypeUi {
 }
 
 /// Convert a slice of UI cap types to SI cap types.
-fn to_cap_types(ui: &[CapTypeUi]) -> Vec<CapType> {
+pub fn to_cap_types(ui: &[CapTypeUi]) -> Vec<CapType> {
     ui.iter().map(CapTypeUi::to_cap_type).collect()
 }
 

@@ -145,6 +145,11 @@ pub struct BodeData {
     pub f_x_actual: f64,
     pub phase_margin_deg: f64,
     pub gain_margin_db: f64,
+
+    /// Open-loop output impedance |Z_out_open| [dBΩ].
+    pub z_out_open_db: Vec<f64>,
+    /// Closed-loop output impedance |Z_out_closed| [dBΩ].
+    pub z_out_closed_db: Vec<f64>,
 }
 
 /// Evaluate the plant transfer function H_plant(jω).
@@ -208,11 +213,20 @@ fn compensator(omega: f64, ds: &DesignSummary) -> C {
     c_mul(integrator, c_div(zero, pole))
 }
 
+/// Parameters for computing the open-loop output impedance.
+pub struct OutputImpedanceParams {
+    /// Nominal load resistance [Ohm] — Z_cap is paralleled with this.
+    pub r_load: f64,
+    /// Output capacitance [F] and ESR [Ohm] for the scalar (non-cap-bank) path.
+    pub c_out: f64,
+    pub r_esr: f64,
+}
+
 impl BodeData {
     /// Compute Bode data. When `cap_bank_caps` is Some, the plant uses composite
     /// impedance instead of a single ESR zero.
-    pub fn compute(ds: &DesignSummary, ni: &NonIdealParams) -> Self {
-        Self::compute_inner(ds, ni, None)
+    pub fn compute(ds: &DesignSummary, ni: &NonIdealParams, zi: &OutputImpedanceParams) -> Self {
+        Self::compute_inner(ds, ni, None, zi)
     }
 
     /// Compute Bode data with composite cap bank impedance in the plant.
@@ -220,15 +234,17 @@ impl BodeData {
         ds: &DesignSummary,
         ni: &NonIdealParams,
         caps: &[CapType],
+        zi: &OutputImpedanceParams,
     ) -> Self {
         let c_total = CapBank::total_capacitance(caps);
-        Self::compute_inner(ds, ni, Some((caps, c_total)))
+        Self::compute_inner(ds, ni, Some((caps, c_total)), zi)
     }
 
     fn compute_inner(
         ds: &DesignSummary,
         ni: &NonIdealParams,
         cap_bank: Option<(&[CapType], f64)>,
+        zi: &OutputImpedanceParams,
     ) -> Self {
         let f_min = 1.0_f64;
         let f_max = ds.f_sw;
@@ -242,6 +258,8 @@ impl BodeData {
         let mut comp_phase = Vec::with_capacity(N_POINTS);
         let mut loop_mag = Vec::with_capacity(N_POINTS);
         let mut loop_phase = Vec::with_capacity(N_POINTS);
+        let mut z_out_open_db = Vec::with_capacity(N_POINTS);
+        let mut z_out_closed_db = Vec::with_capacity(N_POINTS);
 
         for i in 0..N_POINTS {
             let t = i as f64 / (N_POINTS - 1) as f64;
@@ -256,6 +274,30 @@ impl BodeData {
             let hni = non_ideal(omega, ni);
             let ht = c_mul(c_mul(hp, hc), hni);
 
+            // ── Output impedance ─────────────────────────────────────
+            // Z_cap: cap bank impedance (or scalar R_ESR + 1/jωC).
+            // Z_out_open = Z_cap ∥ R_load  (PCMC inductor is a current source)
+            // Z_out_closed = Z_out_open / (1 + T)
+            let z_cap: C = match cap_bank {
+                Some((caps, _)) => {
+                    let (re, im) = CapBank::impedance_at(caps, omega);
+                    (re, im)
+                }
+                None => {
+                    // Z = R_ESR + 1/(jωC) = R_ESR - j/(ωC)
+                    (zi.r_esr, -1.0 / (omega * zi.c_out))
+                }
+            };
+            // Z_cap ∥ R_load = (Z_cap × R_load) / (Z_cap + R_load)
+            let r = zi.r_load;
+            let z_open = c_div(
+                c_mul(z_cap, (r, 0.0)),
+                (z_cap.0 + r, z_cap.1),
+            );
+            // Z_closed = Z_open / (1 + T)
+            let one_plus_t: C = (1.0 + ht.0, ht.1);
+            let z_closed = c_div(z_open, one_plus_t);
+
             freq.push(f);
             plant_mag.push(20.0 * c_mag(hp).log10());
             plant_phase.push(c_phase_deg(hp));
@@ -263,6 +305,8 @@ impl BodeData {
             comp_phase.push(c_phase_deg(hc));
             loop_mag.push(20.0 * c_mag(ht).log10());
             loop_phase.push(c_phase_deg(ht));
+            z_out_open_db.push(20.0 * c_mag(z_open).log10());
+            z_out_closed_db.push(20.0 * c_mag(z_closed).log10());
         }
 
         // Find actual crossover: first point where loop_mag crosses 0 dB downward.
@@ -315,6 +359,8 @@ impl BodeData {
             f_x_actual,
             phase_margin_deg,
             gain_margin_db,
+            z_out_open_db,
+            z_out_closed_db,
         }
     }
 }
@@ -340,12 +386,15 @@ fn fmt_freq(f: f64) -> String {
 const PLANT_COLOR: Color32 = Color32::from_rgb(80, 140, 255);
 const COMP_COLOR: Color32 = Color32::from_rgb(80, 200, 120);
 const LOOP_COLOR: Color32 = Color32::from_rgb(255, 160, 50);
+const ZOPEN_COLOR: Color32 = Color32::from_rgb(180, 180, 180);
+const ZCLOSED_COLOR: Color32 = Color32::from_rgb(255, 100, 100);
 
 /// Render the Bode plot into the given `Ui`.
 pub fn show_bode(ui: &mut egui::Ui, data: &BodeData) {
     let total_h = ui.available_height();
-    let mag_h = (total_h * 0.55).max(120.0);
-    let phase_h = (total_h * 0.40).max(80.0);
+    let mag_h = (total_h * 0.38).max(100.0);
+    let phase_h = (total_h * 0.28).max(80.0);
+    let zout_h = (total_h * 0.28).max(80.0);
 
     // Annotation lines at key frequencies (in log10 space).
     let mut markers: Vec<(f64, &str, Color32)> = vec![
@@ -471,6 +520,33 @@ pub fn show_bode(ui: &mut egui::Ui, data: &BodeData) {
                 );
             }
         });
+
+    // ── Output impedance plot ──────────────────────────────────────────
+    egui_plot::Plot::new("bode_zout")
+        .height(zout_h)
+        .y_axis_label("|Z_out| [dB\u{2126}]")
+        .x_axis_label("Frequency")
+        .link_axis("bode_freq", x_link)
+        .x_axis_formatter(log10_freq_formatter)
+        .label_formatter(zout_label_formatter)
+        .show(ui, |plot_ui| {
+            plot_ui.line(
+                Line::new("Z_out open", PlotPoints::new(to_log_points(&data.freq, &data.z_out_open_db)))
+                    .color(ZOPEN_COLOR),
+            );
+            plot_ui.line(
+                Line::new("Z_out closed", PlotPoints::new(to_log_points(&data.freq, &data.z_out_closed_db)))
+                    .color(ZCLOSED_COLOR)
+                    .width(2.0),
+            );
+            for &(f, label, color) in &markers {
+                plot_ui.vline(
+                    VLine::new(label, f.log10())
+                        .color(color)
+                        .style(egui_plot::LineStyle::dashed_dense()),
+                );
+            }
+        });
 }
 
 /// Format the x-axis (log10 of frequency) as human-readable Hz/kHz/MHz.
@@ -486,4 +562,16 @@ fn log10_freq_formatter(
 fn bode_label_formatter(name: &str, point: &egui_plot::PlotPoint) -> String {
     let f = 10.0_f64.powf(point.x);
     format!("{}\n{}\n{:.1}", name, fmt_freq(f), point.y)
+}
+
+/// Format cursor hover labels for impedance: show frequency + impedance in Ohms.
+fn zout_label_formatter(name: &str, point: &egui_plot::PlotPoint) -> String {
+    let f = 10.0_f64.powf(point.x);
+    let z_ohm = 10.0_f64.powf(point.y / 20.0);
+    let z_str = if z_ohm >= 1.0 {
+        format!("{:.2} \u{2126}", z_ohm)
+    } else {
+        format!("{:.2} m\u{2126}", z_ohm * 1e3)
+    };
+    format!("{}\n{}\n{} ({:.1} dB\u{2126})", name, fmt_freq(f), z_str, point.y)
 }

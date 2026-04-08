@@ -105,18 +105,34 @@ impl Default for BuckSimApp {
 }
 
 fn build_bode(p: &SimParams) -> Option<BodeData> {
+    use crate::bode::OutputImpedanceParams;
+    use crate::sim::to_cap_types;
     // Use multi-phase-aware parameters so the Bode plot reflects
     // the actual N-phase plant gain seen by the compensator.
     let ctrl = build_ctrl_params_multi(p)?;
     let (tf, _) = ctrl.to_transfer_function(p.v_in, ControlTopology::Buck);
     let ds = tf.design_summary();
     let ni = NonIdealParams::from_sim_params(p);
+
+    // Nominal load resistance for output impedance calculation.
+    let r_load = match p.load_kind {
+        LoadKind::Steps => p.r_loads.first().copied().unwrap_or(10.0),
+        LoadKind::Battery => p.bat_r_int_mohm * 1e-3,
+    };
+
     if !p.output_caps.is_empty() {
-        // Use composite impedance from the cap bank in the plant.
-        let si_caps: Vec<_> = p.output_caps.iter().map(|c| c.to_cap_type()).collect();
-        Some(BodeData::compute_with_cap_bank(&ds, &ni, &si_caps))
+        let si_caps = to_cap_types(&p.output_caps);
+        let c_total = electronics_sim::cap_bank::CapBank::total_capacitance(&si_caps);
+        let esr_eff = electronics_sim::cap_bank::CapBank::effective_esr(&si_caps, p.f_sw_khz * 1e3);
+        let zi = OutputImpedanceParams { r_load, c_out: c_total, r_esr: esr_eff };
+        Some(BodeData::compute_with_cap_bank(&ds, &ni, &si_caps, &zi))
     } else {
-        Some(BodeData::compute(&ds, &ni))
+        let zi = OutputImpedanceParams {
+            r_load,
+            c_out: p.c_out_uf * 1e-6,
+            r_esr: p.r_esr_mohm * 1e-3,
+        };
+        Some(BodeData::compute(&ds, &ni, &zi))
     }
 }
 
