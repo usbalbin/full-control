@@ -364,7 +364,8 @@ impl eframe::App for BuckSimApp {
                 let t_sw_us = 1000.0 / self.f_sw_khz;
                 ui.separator();
 
-                ui.label("Source").on_hover_text("Input power source configuration");
+                egui::ScrollArea::vertical().show(ui, |ui| {
+
                 ui.add(
                     egui::Slider::new(&mut self.v_in, 5.0..=60.0)
                         .text("V_in [V]")
@@ -374,17 +375,16 @@ impl eframe::App for BuckSimApp {
                 if self.v_out_target >= self.v_in {
                     self.v_out_target = self.v_in - 0.5;
                 }
+                let v_out_max = (self.v_in - 0.5).max(0.5);
+                ui.add(
+                    egui::Slider::new(&mut self.v_out_target, 0.5..=v_out_max)
+                        .text("V_out [V]")
+                        .step_by(0.1),
+                ).on_hover_text("Target regulated output voltage (must be below V_in for buck)");
 
-                ui.separator();
-                ui.label("Input Cable / Filter").on_hover_text(
-                    "Models the cable and decoupling capacitor between the power supply and the converter.\n\
-                     V_src --[R]--[L]--+--[converter]\n\
-                     \x20                  |\n\
-                     \x20                [C_in]\n\
-                     \x20                  |\n\
-                     \x20                 GND\n\n\
-                     Only affects plant simulation, NOT compensator design."
-                );
+                egui::CollapsingHeader::new("Input Cable / Filter")
+                    .default_open(false)
+                    .show(ui, |ui| {
                 ui.add(
                     egui::Slider::new(&mut self.r_in_mohm, 0.0..=1000.0)
                         .text("R_cable [m\u{2126}]")
@@ -411,23 +411,44 @@ impl eframe::App for BuckSimApp {
                      Set to 0 for an ideal stiff source. \
                      Only affects plant simulation, not compensator design."
                 );
+                });
 
                 ui.separator();
-                ui.label("Output").on_hover_text("Desired regulated output");
-                let v_out_max = (self.v_in - 0.5).max(0.5);
-                ui.add(
-                    egui::Slider::new(&mut self.v_out_target, 0.5..=v_out_max)
-                        .text("V_out [V]")
-                        .step_by(0.1),
-                ).on_hover_text("Target regulated output voltage (must be below V_in for buck)");
-
-                ui.separator();
-                ui.label("Switching").on_hover_text("PWM switching frequency and timing parameters");
                 ui.add(
                     egui::Slider::new(&mut self.f_sw_khz, 50.0..=2000.0)
                         .text("f_sw [kHz]")
                         .step_by(10.0),
                 ).on_hover_text("PWM switching frequency");
+                {
+                    let mut np = self.num_phases as f64;
+                    ui.add(
+                        egui::Slider::new(&mut np, 1.0..=6.0)
+                            .text("Phases")
+                            .step_by(1.0),
+                    ).on_hover_text("Number of interleaved power stages sharing the output capacitor");
+                    self.num_phases = np as usize;
+                    if self.num_phases > 1 {
+                        let eff_freq = self.f_sw_khz * self.num_phases as f64;
+                        let phase_offset = 360.0 / self.num_phases as f64;
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "Eff. ripple freq: {:.0} kHz, phase offset: {:.0}\u{00b0}",
+                                eff_freq, phase_offset,
+                            ))
+                            .small()
+                            .color(Color32::GRAY),
+                        );
+                        ui.label(
+                            egui::RichText::new("L, DCR, FETs: per phase. C_out, R_ESR: total.")
+                            .small()
+                            .color(Color32::GRAY),
+                        );
+                    }
+                }
+
+                egui::CollapsingHeader::new("Switching Timing")
+                    .default_open(false)
+                    .show(ui, |ui| {
                 ui.add(
                     egui::Slider::new(&mut self.blanking_ns, 0.0..=500.0)
                         .text("Blanking [ns]")
@@ -463,36 +484,7 @@ impl eframe::App for BuckSimApp {
                         .text("Max duty [%]")
                         .step_by(0.1),
                 ).on_hover_text("Maximum allowed duty cycle; limits on-time to ensure current sense sampling");
-
-                // ── Multi-phase ──────────────────────────────────────────
-                ui.separator();
-                ui.label("Multi-Phase").on_hover_text("Interleaved parallel power stages");
-                {
-                    let mut np = self.num_phases as f64;
-                    ui.add(
-                        egui::Slider::new(&mut np, 1.0..=6.0)
-                            .text("Phases")
-                            .step_by(1.0),
-                    ).on_hover_text("Number of interleaved power stages sharing the output capacitor");
-                    self.num_phases = np as usize;
-                    if self.num_phases > 1 {
-                        let eff_freq = self.f_sw_khz * self.num_phases as f64;
-                        let phase_offset = 360.0 / self.num_phases as f64;
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "Eff. ripple freq: {:.0} kHz, phase offset: {:.0}\u{00b0}",
-                                eff_freq, phase_offset,
-                            ))
-                            .small()
-                            .color(Color32::GRAY),
-                        );
-                        ui.label(
-                            egui::RichText::new("L, DCR, FETs: per phase. C_out, R_ESR: total.")
-                            .small()
-                            .color(Color32::GRAY),
-                        );
-                    }
-                }
+                });
 
                 ui.separator();
                 ui.label("Passive components").on_hover_text("Power stage inductor and output capacitor");
@@ -911,23 +903,25 @@ impl eframe::App for BuckSimApp {
                     });
 
                 ui.separator();
-                ui.label("Rectifier").on_hover_text("Low-side switch/rectifier configuration");
                 ui.horizontal(|ui| {
-                    ui.radio_value(
-                        &mut self.current_conduction,
-                        CurrentConduction::Diode,
-                        "Diode (DCM)",
-                    ).on_hover_text("Diode rectification: allows discontinuous conduction mode (DCM) at light load");
+                    ui.label("Rectifier:");
                     ui.radio_value(
                         &mut self.current_conduction,
                         CurrentConduction::Synchronous,
-                        "Synchronous",
+                        "Sync",
                     ).on_hover_text("Synchronous rectification: forced continuous conduction mode (CCM)");
+                    ui.radio_value(
+                        &mut self.current_conduction,
+                        CurrentConduction::Diode,
+                        "Diode",
+                    ).on_hover_text("Diode rectification: allows discontinuous conduction mode (DCM) at light load");
                 });
 
                 // ── Load section ─────────────────────────────────────────────
                 ui.separator();
-                ui.label("Load").on_hover_text("Load type and parameters for simulation");
+                egui::CollapsingHeader::new("Load")
+                    .default_open(true)
+                    .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut self.load_kind, LoadKind::Steps, "Load steps")
                         .on_hover_text("Stepped resistive load for transient response testing");
@@ -1014,6 +1008,7 @@ impl eframe::App for BuckSimApp {
                      NOT the compensator design. Use this to test how much extra capacitance \
                      the control loop can tolerate."
                 );
+                }); // Load
 
                 ui.separator();
                 ui.label("Plot Options").on_hover_text("Select which inductor current trace to display");
@@ -1183,6 +1178,7 @@ impl eframe::App for BuckSimApp {
                     clear_storage();
                     *self = Self::from_defaults();
                 }
+                }); // ScrollArea
             });
 
         // ── Central panel — plots ────────────────────────────────────────────
