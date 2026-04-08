@@ -1,3 +1,4 @@
+pub mod cap_bank;
 pub mod math;
 
 #[cfg(feature = "rerun")]
@@ -242,6 +243,12 @@ pub struct CurrentModeConverter {
     /// Output voltage at the ADC sample point.  Updated each `tick()`.
     /// When `t_adc_sample_point` is 0, equals `v_out` at start of cycle.
     pub v_out_at_adc: Voltage,
+
+    /// Minimum output voltage (including ESR) within the last switching cycle.
+    /// Computed during `tick()` from the charge-balance trajectory + R_esr.
+    pub v_out_min_cycle: Voltage,
+    /// Maximum output voltage (including ESR) within the last switching cycle.
+    pub v_out_max_cycle: Voltage,
 }
 
 impl CurrentModeConverter {
@@ -255,6 +262,13 @@ impl CurrentModeConverter {
     /// Pass the load current from the previous cycle's tick closure as `i_load`.
     pub fn v_sensed(&self, i_load: Current) -> Voltage {
         Voltage(self.v_out.0 + self.parameters.r_esr.0 * (self.i_inductor.0 - i_load.0))
+    }
+
+    /// Output voltage as sensed by the ADC when using a cap bank.
+    /// The cap bank's v_out already includes the ESR contributions from all
+    /// cap types, so we just return it directly (no separate ESR correction).
+    pub fn v_sensed_cap_bank(&self) -> Voltage {
+        self.v_out
     }
 
     pub fn new(parameters: Parameters, topology: Topology) -> Self {
@@ -272,6 +286,8 @@ impl CurrentModeConverter {
             i_cs_prev: Current(0.0),
             last_di_dt_on: 0.0,
             v_out_at_adc: Voltage(0.0),
+            v_out_min_cycle: Voltage(0.0),
+            v_out_max_cycle: Voltage(0.0),
         }
     }
 
@@ -459,6 +475,19 @@ impl CurrentModeConverter {
                     self.v_out_at_adc = self.v_out;
                 }
 
+                // ── Compute v_out min/max including ESR contribution ─────
+                // The actual output voltage at any instant is:
+                //   v_actual = v_cap + R_esr × (i_L - i_load)
+                // We evaluate at three key points: start of cycle (valley),
+                // end of ON phase (peak current), end of cycle (next valley).
+                let r_esr = self.parameters.r_esr.0;
+                let i_load_val = load_current.0;
+                let v_start = v_out_start.0 + r_esr * (self.i_inductor.0 - i_load_val);
+                let v_peak  = v_out_at_off.0 + r_esr * (i_max.0 - i_load_val);
+                let v_end   = self.v_out.0   + r_esr * (i_final.0 - i_load_val);
+                self.v_out_min_cycle = Voltage(v_start.min(v_peak).min(v_end));
+                self.v_out_max_cycle = Voltage(v_start.max(v_peak).max(v_end));
+
                 // Propagate the current-sense filter state across ON + OFF phases.
                 self.i_cs = propagate_cs_filter(
                     self.i_cs,
@@ -608,6 +637,19 @@ impl CurrentModeConverter {
                 // Simplified: use end-of-cycle v_out (full ADC sample model is Buck-only)
                 self.v_out_at_adc = self.v_out;
 
+                // Boost/BuckBoost: v_out min/max with ESR at key points.
+                // During ON the cap is decoupled from the inductor — only the
+                // load drains it, so v_out drops from its start-of-cycle value.
+                // During OFF the inductor dumps current into the cap.
+                let r_esr = self.parameters.r_esr.0;
+                let i_load_val = load_current.0;
+                let v_at_on_start = v_out_at_off.0 + Voltage(q_out_on / self.parameters.c_out.0).0
+                    + r_esr * (0.0 - i_load_val);
+                let v_at_off_start = v_out_at_off.0 + r_esr * (i_max.0 - i_load_val);
+                let v_end = self.v_out.0 + r_esr * (i_final.0 - i_load_val);
+                self.v_out_min_cycle = Voltage(v_at_on_start.min(v_at_off_start).min(v_end));
+                self.v_out_max_cycle = Voltage(v_at_on_start.max(v_at_off_start).max(v_end));
+
                 // Propagate the current-sense filter state across ON + OFF phases.
                 self.i_cs = propagate_cs_filter(
                     self.i_cs,
@@ -641,6 +683,186 @@ impl CurrentModeConverter {
                 (t_on, i_max)
             }
         }
+    }
+
+    /// Tick using a CapBank for output dynamics instead of the analytical RLC solver.
+    ///
+    /// This method handles the same control logic as `tick()` (slope compensation,
+    /// trip detection, blanking, propagation delay, current-sense filtering, input
+    /// cap) but delegates the inductor-current / output-voltage dynamics to the
+    /// CapBank's RK4 state-space solver.
+    ///
+    /// Only supports Buck topology.
+    ///
+    /// # Arguments
+    /// - `v_in` — external supply voltage
+    /// - `trip_current` — peak current reference from the controller
+    /// - `i_out` — load current closure (called once at start of cycle)
+    /// - `cap_bank` — the output capacitor bank solver (state is mutated)
+    ///
+    /// # Returns
+    /// `(t_on, i_max)` — on-time and peak inductor current, same as `tick()`.
+    pub fn tick_cap_bank(
+        &mut self,
+        v_in: Voltage,
+        trip_current: Current,
+        mut i_out: impl FnMut(Voltage) -> Current,
+        cap_bank: &mut cap_bank::CapBank,
+    ) -> (Time, Current) {
+        assert!(
+            matches!(self.topology, Topology::Buck),
+            "tick_cap_bank only supports Buck topology"
+        );
+
+        // ── Input voltage handling (same as tick()) ──────────────────────
+        if self.parameters.c_in.0 > 0.0 && self.v_in_cap.0 == 0.0 {
+            self.v_in_cap = v_in;
+        }
+        let v_eff = if self.parameters.c_in.0 > 0.0 {
+            self.v_in_cap
+        } else {
+            v_in
+        };
+
+        let tau_cs = self.parameters.tau_current_sense;
+        let tau_dac = self.parameters.tau_dac;
+        let t_dac_sample = self.parameters.t_dac_sample;
+        let r_series = self.parameters.r_series.0;
+        let l = self.parameters.l_inductor.0;
+
+        // Snapshot pre-tick state for current-sense filter and caller
+        self.i_inductor_prev = self.i_inductor;
+        self.i_cs_prev = self.i_cs;
+
+        // ── Compute initial di/dt for trip time estimation ───────────────
+        // The inductor ramp rate at the start of the ON phase. This uses the
+        // cap bank's v_out (which equals self.v_out since they track together).
+        let v_out_start = self.v_out;
+        let di_dt_on = (v_eff.0 - v_out_start.0) / l;
+        self.last_di_dt_on = di_dt_on;
+
+        // ── Trip time calculation ────────────────────────────────────────
+        // Uses the same analytical methods as tick(): these depend on the
+        // inductor current slope (di_dt_on) and control parameters, NOT on
+        // the detailed cap dynamics — so the linear ramp approximation is
+        // accurate enough for trip time detection.
+        let t_on_guess = Time(
+            (trip_current - self.i_inductor).0
+                / (di_dt_on - self.parameters.slope_amp_per_sec),
+        );
+
+        let t_on = if t_dac_sample.0 > 0.0 {
+            Time(staircase_trip_time(
+                self.i_inductor,
+                di_dt_on,
+                self.i_cs,
+                tau_cs,
+                trip_current,
+                self.parameters.slope_amp_per_sec,
+                tau_dac,
+                t_dac_sample,
+                self.parameters.period,
+            ))
+        } else if tau_cs.0 > 0.0 || tau_dac.0 > 0.0 {
+            Time(filtered_trip_time(
+                self.i_inductor,
+                di_dt_on,
+                self.i_cs,
+                tau_cs,
+                trip_current,
+                self.parameters.slope_amp_per_sec,
+                tau_dac,
+                t_on_guess,
+            ))
+        } else {
+            // Ideal trip: linear ramp intersects slope line.
+            // t = (I_trip - I_valley) / (di/dt - slope_rate)
+            let denom = di_dt_on - self.parameters.slope_amp_per_sec;
+            if denom.abs() < 1e-30 {
+                self.parameters.period
+            } else {
+                Time(((trip_current.0 - self.i_inductor.0) / denom).max(0.0))
+            }
+        };
+
+        // Blanking and propagation delay
+        let t_on = Time(t_on.0.max(self.parameters.t_blanking.0));
+        let t_on = t_on + self.parameters.t_prop_delay;
+        let t_on = Time(t_on.0.clamp(0.0, self.parameters.period.0 * self.parameters.max_duty));
+        let t_off = self.parameters.period - t_on;
+
+        // EMI estimate (before state update, same as tick())
+        let i_max_est = Current(self.i_inductor.0 + di_dt_on * t_on.0);
+        self.v_in_ripple_est = self.compute_v_in_ripple(i_max_est, t_on);
+
+        // ── Sample load current once ─────────────────────────────────────
+        let load_current = i_out(self.v_out);
+
+        // ── Synchronize cap bank state with this phase's inductor current ──
+        // In multi-phase operation each converter tracks its own i_inductor,
+        // but they all share one cap bank.  Before integrating we must set
+        // the cap bank's i_L to THIS phase's valley current so the RK4
+        // solver integrates the correct inductor.
+        cap_bank.set_i_l(self.i_inductor.0);
+
+        // ── ON phase: integrate cap bank with RK4 ────────────────────────
+        cap_bank.reset_v_out_minmax();
+        cap_bank.integrate_phase(t_on.0, v_eff.0, load_current.0, r_series, l, None);
+        let i_max = Current(cap_bank.i_l());
+
+        // ── OFF phase: integrate cap bank with v_applied = 0 ─────────────
+        cap_bank.integrate_phase(t_off.0, 0.0, load_current.0, r_series, l, None);
+        let i_final = Current(cap_bank.i_l());
+
+        // ── DCM: clamp to zero if diode mode and current went negative ───
+        let i_final = match self.parameters.current_conduction {
+            CurrentConduction::Synchronous => i_final,
+            CurrentConduction::Diode if i_final.0 < 0.0 && i_max.0 >= 0.0 => {
+                cap_bank.set_i_l(0.0);
+                Current(0.0)
+            }
+            CurrentConduction::Diode => i_final,
+        };
+
+        // ── Update converter state from cap bank ─────────────────────────
+        self.v_out = Voltage(cap_bank.v_out());
+        self.i_inductor = i_final;
+        self.v_out_min_cycle = Voltage(cap_bank.v_out_min());
+        self.v_out_max_cycle = Voltage(cap_bank.v_out_max());
+
+        // ── ADC sample point ─────────────────────────────────────────────
+        // For the cap bank path, approximate v_out_at_adc using linear interpolation.
+        // The exact trajectory would need sub-step cap bank queries, but for the
+        // ADC sample (used for control), the start-of-cycle voltage is typical.
+        let t_sample = self.parameters.t_adc_sample_point.0;
+        if t_sample <= 0.0 {
+            self.v_out_at_adc = v_out_start;
+        } else {
+            // Linearly interpolate between start and end of cycle
+            let frac = (t_sample / self.parameters.period.0).clamp(0.0, 1.0);
+            self.v_out_at_adc = Voltage(
+                v_out_start.0 * (1.0 - frac) + self.v_out.0 * frac,
+            );
+        }
+
+        // ── Current-sense filter propagation ─────────────────────────────
+        self.i_cs = propagate_cs_filter(
+            self.i_cs,
+            self.i_inductor_prev,
+            di_dt_on,
+            t_on,
+            i_max,
+            i_final,
+            t_off,
+            tau_cs,
+        );
+
+        // ── Input capacitor update ───────────────────────────────────────
+        // Approximate charge drawn during ON phase from the inductor current.
+        let q_on = (self.i_inductor_prev.0 + i_max.0) / 2.0 * t_on.0;
+        self.update_v_in_cap(v_in, q_on, t_on, t_off);
+
+        (t_on, i_max)
     }
 
     /// Estimate the peak-to-peak voltage ripple at the converter input terminals

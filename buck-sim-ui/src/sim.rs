@@ -1,6 +1,7 @@
 use electronics_sim::{
     Capacitance, Current, CurrentModeConverter, Inductance,
     Parameters as SimParameters, Resistance, Time, Voltage,
+    cap_bank::{CapBank, CapType},
 };
 pub use electronics_sim::CurrentConduction;
 use full_control::{
@@ -210,8 +211,39 @@ pub struct SimParams {
     pub l_in_nh: f64,      // Input cable inductance [nH] (plant-only)
     pub c_in_uf: f64,      // Input decoupling capacitance [µF] (plant-only)
 
+    // ── Output capacitor bank (overrides c_out_uf / r_esr_mohm when non-empty) ──
+    pub output_caps: Vec<CapTypeUi>,
+
     // ── Multi-phase ──────────────────────────────────────────────────────
     pub num_phases: usize,
+}
+
+/// UI-friendly capacitor type with user-facing units.
+/// When SimParams::output_caps is non-empty, these define the output cap bank
+/// and the scalar c_out_uf / r_esr_mohm fields are ignored.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CapTypeUi {
+    pub c_uf: f64,       // Capacitance per unit [µF]
+    pub count: usize,    // Number of units in parallel
+    pub esr_mohm: f64,   // ESR per unit [mΩ]
+    pub esl_nh: f64,     // ESL per unit [nH]
+}
+
+impl CapTypeUi {
+    /// Convert from UI-friendly units to SI units for the solver.
+    pub fn to_cap_type(&self) -> CapType {
+        CapType {
+            c: self.c_uf * 1e-6,
+            count: self.count,
+            esr: self.esr_mohm * 1e-3,
+            esl: self.esl_nh * 1e-9,
+        }
+    }
+}
+
+/// Convert a slice of UI cap types to SI cap types.
+fn to_cap_types(ui: &[CapTypeUi]) -> Vec<CapType> {
+    ui.iter().map(CapTypeUi::to_cap_type).collect()
 }
 
 impl Default for SimParams {
@@ -246,6 +278,7 @@ impl Default for SimParams {
             r_in_mohm: 0.0,
             l_in_nh: 0.0,
             c_in_uf: 0.0,
+            output_caps: Vec::new(),
             num_phases: 1,
         }
     }
@@ -269,6 +302,10 @@ pub struct SimPoint {
     /// Combined (interleaved) total current envelope — accounts for ripple cancellation.
     pub i_total_min: f32,
     pub i_total_max: f32,
+    /// Minimum output voltage (including ESR) within this switching cycle.
+    pub v_out_min: f32,
+    /// Maximum output voltage (including ESR) within this switching cycle.
+    pub v_out_max: f32,
     /// Battery open-circuit voltage [V].  0.0 when not in Battery mode.
     pub v_bat: f32,
     /// Input capacitor voltage [V].  0.0 when input impedance is disabled.
@@ -305,8 +342,16 @@ pub fn build_ctrl_params(p: &SimParams) -> Option<Parameters> {
     }
     let f_sw = p.f_sw_khz * 1e3;
     let l_inductor = p.l_uh * 1e-6;
-    let c_out = p.c_out_uf * 1e-6;
-    let r_esr = p.r_esr_mohm * 1e-3;
+    // When a cap bank is defined, use its aggregate C and ESR for compensator design.
+    // The Bode plot will show the actual composite impedance response.
+    let (c_out, r_esr) = if !p.output_caps.is_empty() {
+        let si_caps = to_cap_types(&p.output_caps);
+        let c_total = CapBank::total_capacitance(&si_caps);
+        let esr_eff = CapBank::effective_esr(&si_caps, f_sw);
+        (c_total, esr_eff)
+    } else {
+        (p.c_out_uf * 1e-6, p.r_esr_mohm * 1e-3)
+    };
     let cs_gain = p.cs.cs_gain_mv_a * 1e-3;
     let nominal_r = match p.load_kind {
         LoadKind::Steps => p.r_loads[0],
@@ -414,8 +459,14 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
     let f_sw = p.f_sw_khz * 1e3;
     let t_period = 1.0 / f_sw;
     let l_inductor = p.l_uh * 1e-6;
-    let c_out = p.c_out_uf * 1e-6;
-    let r_esr = p.r_esr_mohm * 1e-3;
+    // When cap bank is active, use aggregate C and ESR for checks and the
+    // analytical fallback sim (the cap bank path overrides the L-C dynamics).
+    let (c_out, r_esr) = if !p.output_caps.is_empty() {
+        let si_caps = to_cap_types(&p.output_caps);
+        (CapBank::total_capacitance(&si_caps), CapBank::effective_esr(&si_caps, f_sw))
+    } else {
+        (p.c_out_uf * 1e-6, p.r_esr_mohm * 1e-3)
+    };
     let d_nom = (p.v_out_target / p.v_in).clamp(0.01, 0.99);
     let r_series = (p.dcr_mohm
         + d_nom * p.hs_fet.rds_on_mohm
@@ -518,31 +569,114 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
         .map(|_| CurrentModeConverter::new(sim_params, Mode::Buck))
         .collect();
 
+    // Create cap bank if output_caps is non-empty.
+    // The cap bank handles the output L-C dynamics via state-space RK4,
+    // correctly modelling frequency-dependent impedance of mixed cap types.
+    let use_cap_bank = !p.output_caps.is_empty();
+    let mut cap_bank_opt = if use_cap_bank {
+        let mut si_caps = to_cap_types(&p.output_caps);
+        // Add load capacitance as an extra no-ESR, no-ESL cap type if present.
+        if p.c_load_uf > 0.0 {
+            si_caps.push(CapType {
+                c: p.c_load_uf * 1e-6,
+                count: 1,
+                esr: 1e-3, // small but nonzero ESR to avoid division by zero
+                esl: 0.0,
+            });
+        }
+        let bank = CapBank::new(si_caps, 0.0, 0.0);
+
+        // ── Budget check: estimate total RK4 work and reject if too expensive ──
+        // This prevents the UI from freezing when caps have very fast RC time
+        // constants (e.g. 1µF @ 0.1mΩ → τ=0.1ns → thousands of steps/phase).
+        let total_cycles = match p.load_kind {
+            LoadKind::Steps => {
+                SOFT_START_CYCLES + STEADY_STATE_CYCLES
+                    + p.r_loads.len().saturating_sub(1) * LOAD_STEP_CYCLES
+            }
+            LoadKind::Battery => SOFT_START_CYCLES + STEADY_STATE_CYCLES + 5000,
+        };
+        let phases_per_cycle = 2 * p.num_phases;
+        let steps_per_phase = bank.steps_for_phase(t_period / 2.0);
+        let total_steps = total_cycles * phases_per_cycle * steps_per_phase;
+        const MAX_TOTAL_STEPS: usize = 20_000_000;
+        if total_steps > MAX_TOTAL_STEPS {
+            // Find the bottleneck cap for the error message.
+            let worst = p.output_caps.iter()
+                .filter(|c| c.esl_nh == 0.0)
+                .min_by(|a, b| {
+                    let ta = a.esr_mohm * a.c_uf;
+                    let tb = b.esr_mohm * b.c_uf;
+                    ta.partial_cmp(&tb).unwrap()
+                });
+            let hint = if let Some(w) = worst {
+                format!(
+                    " Bottleneck: {:.1} µF @ {:.1} mΩ (τ = {:.1} ns, need {} steps/phase). \
+                     Increase ESR or capacitance to speed up.",
+                    w.c_uf, w.esr_mohm,
+                    w.esr_mohm * w.c_uf, // mΩ × µF = ns
+                    steps_per_phase,
+                )
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "Cap bank simulation too expensive (~{:.0}M RK4 steps).{hint}",
+                total_steps as f64 / 1e6,
+            ));
+        }
+
+        Some(bank)
+    } else {
+        None
+    };
+
     let v_in = Voltage(p.v_in);
     let mut time = 0.0_f64;
     let mut held_dac_code: u16 = 0;
     let mut cycle_counter: usize = 0;
 
-    // Helper: tick using multi-phase or single-phase path
+    // Helper: tick using multi-phase or single-phase path,
+    // with cap bank or analytical solver depending on configuration.
     macro_rules! do_tick {
         ($target:expr, $load:expr) => {{
             let ctrl_update = cycle_counter % p.cycles_per_tick == 0;
-            if num_phases > 1 {
-                tick_multi(
-                    &mut ctrl, &mut sims, v_in, $target,
-                    $load,
-                    divider_ratio, dac_max_code, &ctrl_params, p.max_current,
-                    time, ctrl_update, &mut held_dac_code, slope_step_size_a,
-                    p.slope_overcomp,
-                )
+            if let Some(ref mut cap_bank) = cap_bank_opt {
+                if num_phases > 1 {
+                    tick_multi_cap_bank(
+                        &mut ctrl, &mut sims, cap_bank, v_in, $target,
+                        $load,
+                        divider_ratio, dac_max_code, &ctrl_params, p.max_current,
+                        time, ctrl_update, &mut held_dac_code, slope_step_size_a,
+                        p.slope_overcomp,
+                    )
+                } else {
+                    tick_one_cap_bank(
+                        &mut ctrl, &mut sims[0], cap_bank, v_in, $target,
+                        $load,
+                        divider_ratio, dac_max_code, &ctrl_params, p.max_current,
+                        time, ctrl_update, &mut held_dac_code, slope_step_size_a,
+                        p.slope_overcomp,
+                    )
+                }
             } else {
-                tick_one(
-                    &mut ctrl, &mut sims[0], v_in, $target,
-                    $load,
-                    divider_ratio, dac_max_code, &ctrl_params, p.max_current,
-                    time, ctrl_update, &mut held_dac_code, slope_step_size_a,
-                    p.slope_overcomp,
-                )
+                if num_phases > 1 {
+                    tick_multi(
+                        &mut ctrl, &mut sims, v_in, $target,
+                        $load,
+                        divider_ratio, dac_max_code, &ctrl_params, p.max_current,
+                        time, ctrl_update, &mut held_dac_code, slope_step_size_a,
+                        p.slope_overcomp,
+                    )
+                } else {
+                    tick_one(
+                        &mut ctrl, &mut sims[0], v_in, $target,
+                        $load,
+                        divider_ratio, dac_max_code, &ctrl_params, p.max_current,
+                        time, ctrl_update, &mut held_dac_code, slope_step_size_a,
+                        p.slope_overcomp,
+                    )
+                }
             }
         }};
     }
@@ -786,12 +920,18 @@ fn tick_multi(
     // Compute interleaved envelope
     let (i_total_min, i_total_max) = interleaved_envelope(&phase_points, period as f32);
 
+    // v_out min/max across all phase ticks
+    let v_out_min = sims.iter().map(|s| s.v_out_min_cycle.0 as f32).fold(f32::INFINITY, f32::min);
+    let v_out_max = sims.iter().map(|s| s.v_out_max_cycle.0 as f32).fold(f32::NEG_INFINITY, f32::max);
+
     SimPoint {
         t_ms: (time * 1e3) as f32,
         v_out: v_out_final as f32,
         phases: phase_points,
         i_total_min,
         i_total_max,
+        v_out_min,
+        v_out_max,
         v_bat: 0.0,
         v_in_cap: sims[0].v_in_cap.0 as f32,
     }
@@ -868,8 +1008,192 @@ fn tick_one(
         phases: vec![phase],
         i_total_min: i_l_min,
         i_total_max: i_l_max,
+        v_out_min: sim.v_out_min_cycle.0 as f32,
+        v_out_max: sim.v_out_max_cycle.0 as f32,
         v_bat: 0.0, // filled in by battery loop when applicable
         v_in_cap: sim.v_in_cap.0 as f32,
+    }
+}
+
+fn tick_one_cap_bank(
+    ctrl: &mut full_control::control_2p2z::TwoPoleTwoZero<f32>,
+    sim: &mut CurrentModeConverter,
+    cap_bank: &mut CapBank,
+    v_in: Voltage,
+    target_code: f32,
+    load: impl FnMut(Voltage) -> Current,
+    divider_ratio: f64,
+    dac_max_code: f64,
+    ctrl_params: &Parameters,
+    max_current: f64,
+    time: f64,
+    ctrl_update: bool,
+    held_dac_code: &mut u16,
+    slope_step_size_a: f64,
+    slope_overcomp: f64,
+) -> SimPoint {
+    let cs_gain = ctrl_params.current_sense_gain;
+    let f_sw = ctrl_params.f_sw;
+
+    // Control logic is identical to tick_one
+    let dac_code = if ctrl_update {
+        let adc_code = {
+            let v_adc = sim.v_out_at_adc.0 * divider_ratio;
+            (v_adc / LSB).round().clamp(0.0, ADC_MAX) as u16
+        };
+        let error = target_code - adc_code as f32;
+
+        let v_target_eff = target_code as f64 * LSB / divider_ratio;
+        let dac = ctrl_params.dac_settings_at(
+            v_in.0, v_target_eff, ControlTopology::Buck, slope_overcomp,
+        );
+        let d = (v_target_eff / v_in.0).clamp(0.01, 0.99);
+        let slope_offset = dac.slope_offset_codes(d, LSB);
+
+        let dynamic_limit = (dac_max_code + slope_offset) as f32;
+        let output = ctrl.update_clamped(error, 0.0_f32, dynamic_limit);
+
+        let code = (output.round() as i32).clamp(0, i32::MAX) as u16;
+        *held_dac_code = code;
+        code
+    } else {
+        *held_dac_code
+    };
+
+    let trip_limit = max_current * 2.0;
+    let mut trip = Current((dac_code as f64 * LSB / cs_gain).clamp(0.0, trip_limit));
+
+    if slope_step_size_a > 0.0 {
+        trip = Current((trip.0 / slope_step_size_a).round() * slope_step_size_a);
+        trip = Current(trip.0.clamp(0.0, trip_limit));
+    }
+
+    let i_l_min = sim.i_inductor.0 as f32;
+    // Use tick_cap_bank instead of tick — cap bank handles L-C dynamics
+    let (t_on, i_l_max) = sim.tick_cap_bank(v_in, trip, load, cap_bank);
+    let i_l_max = i_l_max.0 as f32;
+
+    let phase = PhasePoint {
+        t_on: t_on.0 as f32,
+        duty_pct: (t_on.0 * f_sw * 100.0) as f32,
+        i_l_min,
+        i_l_max,
+    };
+
+    SimPoint {
+        t_ms: (time * 1e3) as f32,
+        v_out: sim.v_out.0 as f32,
+        phases: vec![phase],
+        i_total_min: i_l_min,
+        i_total_max: i_l_max,
+        v_out_min: cap_bank.v_out_min() as f32,
+        v_out_max: cap_bank.v_out_max() as f32,
+        v_bat: 0.0,
+        v_in_cap: sim.v_in_cap.0 as f32,
+    }
+}
+
+fn tick_multi_cap_bank(
+    ctrl: &mut full_control::control_2p2z::TwoPoleTwoZero<f32>,
+    sims: &mut [CurrentModeConverter],
+    cap_bank: &mut CapBank,
+    v_in: Voltage,
+    target_code: f32,
+    load: impl FnMut(Voltage) -> Current + Clone,
+    divider_ratio: f64,
+    dac_max_code: f64,
+    ctrl_params: &Parameters,
+    max_current: f64,
+    time: f64,
+    ctrl_update: bool,
+    held_dac_code: &mut u16,
+    slope_step_size_a: f64,
+    slope_overcomp: f64,
+) -> SimPoint {
+    let cs_gain = ctrl_params.current_sense_gain;
+    let f_sw = ctrl_params.f_sw;
+    let n = sims.len();
+    let period = 1.0 / f_sw;
+
+    // Control logic identical to tick_multi
+    let dac_code = if ctrl_update {
+        let adc_code = {
+            let v_adc = sims[0].v_out_at_adc.0 * divider_ratio;
+            (v_adc / LSB).round().clamp(0.0, ADC_MAX) as u16
+        };
+        let error = target_code - adc_code as f32;
+
+        let v_target_eff = target_code as f64 * LSB / divider_ratio;
+        let dac = ctrl_params.dac_settings_at(
+            v_in.0, v_target_eff, ControlTopology::Buck, slope_overcomp,
+        );
+        let d = (v_target_eff / v_in.0).clamp(0.01, 0.99);
+        let slope_offset = dac.slope_offset_codes(d, LSB);
+
+        let dynamic_limit = (dac_max_code + slope_offset) as f32;
+        let output = ctrl.update_clamped(error, 0.0_f32, dynamic_limit);
+
+        let code = (output.round() as i32).clamp(0, i32::MAX) as u16;
+        *held_dac_code = code;
+        code
+    } else {
+        *held_dac_code
+    };
+
+    let trip_limit = max_current * 2.0;
+    let mut trip = Current((dac_code as f64 * LSB / cs_gain).clamp(0.0, trip_limit));
+
+    if slope_step_size_a > 0.0 {
+        trip = Current((trip.0 / slope_step_size_a).round() * slope_step_size_a);
+        trip = Current(trip.0.clamp(0.0, trip_limit));
+    }
+
+    // All phases share the single cap bank (output caps are shared).
+    // Each phase ticks sequentially — the cap bank state carries forward.
+    let mut phase_points = Vec::with_capacity(n);
+
+    for k in 0..n {
+        if k > 0 {
+            // Propagate v_out from cap bank to this phase's sim
+            sims[k].v_out = Voltage(cap_bank.v_out());
+        }
+        let i_l_min = sims[k].i_inductor.0 as f32;
+        let mut phase_load = load.clone();
+        let (t_on, i_l_max_val) = sims[k].tick_cap_bank(v_in, trip, |v| {
+            let full = phase_load(v);
+            Current(full.0 / n as f64)
+        }, cap_bank);
+        let i_l_max = i_l_max_val.0 as f32;
+
+        phase_points.push(PhasePoint {
+            t_on: t_on.0 as f32,
+            duty_pct: (t_on.0 * f_sw * 100.0) as f32,
+            i_l_min,
+            i_l_max,
+        });
+    }
+
+    // Final v_out from cap bank
+    let v_out_final = cap_bank.v_out();
+    let adc_reading = sims[0].v_out_at_adc;
+    for sim in sims.iter_mut() {
+        sim.v_out = Voltage(v_out_final);
+        sim.v_out_at_adc = Voltage(v_out_final);
+    }
+    sims[0].v_out_at_adc = adc_reading;
+
+    let (i_total_min, i_total_max) = interleaved_envelope(&phase_points, period as f32);
+
+    SimPoint {
+        t_ms: (time * 1e3) as f32,
+        v_out: v_out_final as f32,
+        phases: phase_points,
+        i_total_min,
+        i_total_max,
+        v_out_min: cap_bank.v_out_min() as f32,
+        v_out_max: cap_bank.v_out_max() as f32,
+        v_bat: 0.0,
+        v_in_cap: sims[0].v_in_cap.0 as f32,
     }
 }
 
@@ -1046,6 +1370,7 @@ mod tests {
             r_in_mohm: 0.0,
             l_in_nh: 0.0,
             c_in_uf: 0.0,
+            output_caps: Vec::new(),
             num_phases: 1,
         }
     }
@@ -1082,6 +1407,7 @@ mod tests {
             r_in_mohm: 0.0,
             l_in_nh: 0.0,
             c_in_uf: 0.0,
+            output_caps: Vec::new(),
             num_phases: 1,
         }
     }
@@ -1442,6 +1768,8 @@ mod tests {
             ],
             i_total_min: 4.0,
             i_total_max: 6.0,
+            v_out_min: 11.9,
+            v_out_max: 12.1,
             v_bat: 0.0,
             v_in_cap: 0.0,
         };
@@ -1461,6 +1789,8 @@ mod tests {
             ],
             i_total_min: 4.0,
             i_total_max: 6.0,
+            v_out_min: 11.9,
+            v_out_max: 12.1,
             v_bat: 0.0,
             v_in_cap: 0.0,
         };
@@ -1630,5 +1960,394 @@ mod tests {
         for pt in &data {
             assert_eq!(pt.v_in_cap, 0.0, "v_in_cap should be 0 when input impedance disabled");
         }
+    }
+
+    // ── Cap bank tests ──────────────────────────────────────────────────────
+
+    /// Helper: test_params but using a cap bank instead of scalar C/ESR.
+    /// The bank is configured to match the scalar params exactly:
+    /// one cap type with the same total C and ESR.
+    fn test_params_single_cap_bank() -> SimParams {
+        let mut p = test_params();
+        p.output_caps = vec![CapTypeUi {
+            c_uf: p.c_out_uf,
+            count: 1,
+            esr_mohm: p.r_esr_mohm,
+            esl_nh: 0.0,
+        }];
+        p
+    }
+
+    /// Helper: test_params with a mixed ceramic + electrolytic cap bank.
+    fn test_params_mixed_bank() -> SimParams {
+        let mut p = test_params();
+        p.output_caps = vec![
+            // 6x 10µF ceramic, ESR = 3 mΩ, no ESL
+            CapTypeUi { c_uf: 10.0, count: 6, esr_mohm: 3.0, esl_nh: 0.0 },
+            // 2x 220µF electrolytic, ESR = 30 mΩ, ESL = 5 nH
+            CapTypeUi { c_uf: 220.0, count: 2, esr_mohm: 30.0, esl_nh: 5.0 },
+        ];
+        // Use a lower crossover since the effective ESR is very low for ceramics
+        p.crossover_khz = 20.0;
+        p
+    }
+
+    #[test]
+    fn cap_bank_single_type_settles() {
+        // A single-cap-type bank should settle to the target voltage,
+        // just like the scalar path does.
+        let p = test_params_single_cap_bank();
+        let data = run_simulation(&p).expect("single cap bank should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_single_type_handles_load_step() {
+        // Load step with single cap bank should recover cleanly.
+        let p = test_params_single_cap_bank();
+        let data = run_simulation(&p).expect("single cap bank load step should work");
+        // After initial settling (1500 soft-start + 1500 steady + 2000 step),
+        // v_out should be near target.
+        let last = data.last().unwrap();
+        assert!(
+            (last.v_out as f64 - p.v_out_target).abs() < 1.0,
+            "v_out={}, expected ~{}", last.v_out, p.v_out_target
+        );
+    }
+
+    #[test]
+    fn cap_bank_mixed_ceramics_and_electrolytic_settles() {
+        // Mixed bank: ceramics (low ESR, low C) + electrolytics (high ESR, high C, ESL).
+        // This is the primary use case for the cap bank feature.
+        let p = test_params_mixed_bank();
+        let data = run_simulation(&p).expect("mixed cap bank should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_mixed_handles_load_step() {
+        // Mixed bank should handle a load step without diverging.
+        let p = test_params_mixed_bank();
+        let data = run_simulation(&p).expect("mixed bank load step should work");
+        let last = data.last().unwrap();
+        assert!(
+            (last.v_out as f64 - p.v_out_target).abs() < 1.0,
+            "v_out={}, expected ~{}", last.v_out, p.v_out_target
+        );
+    }
+
+    #[test]
+    fn cap_bank_ceramics_only_settles() {
+        // Pure ceramic bank (multiple caps, no ESL).
+        let mut p = test_params();
+        p.output_caps = vec![
+            CapTypeUi { c_uf: 10.0, count: 6, esr_mohm: 3.0, esl_nh: 0.0 },
+        ];
+        p.crossover_khz = 20.0;
+        let data = run_simulation(&p).expect("ceramics-only bank should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_many_types_settles() {
+        // Three different cap types in parallel.
+        let mut p = test_params();
+        p.output_caps = vec![
+            CapTypeUi { c_uf: 10.0, count: 6, esr_mohm: 3.0, esl_nh: 0.0 },
+            CapTypeUi { c_uf: 100.0, count: 2, esr_mohm: 20.0, esl_nh: 3.0 },
+            CapTypeUi { c_uf: 470.0, count: 1, esr_mohm: 50.0, esl_nh: 10.0 },
+        ];
+        p.crossover_khz = 15.0;
+        let data = run_simulation(&p).expect("3-type bank should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_with_load_capacitance() {
+        // Cap bank + extra load capacitance should still settle.
+        let mut p = test_params_mixed_bank();
+        p.c_load_uf = 100.0; // 100 µF extra load cap
+        let data = run_simulation(&p).expect("cap bank + load cap should work");
+        assert_settled(&data, 1000, p.v_out_target, 1.0);
+    }
+
+    #[test]
+    fn cap_bank_with_input_impedance() {
+        // Cap bank + input RC filter.
+        let mut p = test_params_mixed_bank();
+        p.r_in_mohm = 50.0;
+        p.c_in_uf = 100.0;
+        let data = run_simulation(&p).expect("cap bank + input impedance should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_multi_phase_settles() {
+        // 2-phase converter with cap bank.
+        let mut p = test_params_mixed_bank();
+        p.num_phases = 2;
+        let data = run_simulation(&p).expect("2-phase cap bank should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_multi_phase_three_settles() {
+        // 3-phase converter with cap bank.
+        let mut p = test_params_mixed_bank();
+        p.num_phases = 3;
+        let data = run_simulation(&p).expect("3-phase cap bank should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_effective_params_used_for_compensator() {
+        // Verify that build_ctrl_params uses the cap bank's aggregate C and ESR
+        // when output_caps is non-empty.
+        let p = test_params_mixed_bank();
+        let params = build_ctrl_params(&p).unwrap();
+
+        // Expected total C: 6*10µF + 2*220µF = 500µF
+        let expected_c = (6.0 * 10.0 + 2.0 * 220.0) * 1e-6;
+        assert!(
+            (params.c_out - expected_c).abs() / expected_c < 0.01,
+            "c_out={}, expected={}", params.c_out, expected_c
+        );
+
+        // ESR should be the effective ESR at f_sw (not zero, not the scalar value).
+        assert!(
+            params.r_esr_out_cap > 0.0,
+            "r_esr_out_cap should be positive, got {}", params.r_esr_out_cap
+        );
+        assert!(
+            params.r_esr_out_cap < 0.01, // Should be in the mΩ range
+            "r_esr_out_cap should be small (mΩ), got {} Ω", params.r_esr_out_cap
+        );
+    }
+
+    #[test]
+    fn cap_bank_diode_mode_dcm() {
+        // Cap bank with diode mode should handle DCM correctly.
+        let mut p = test_params_single_cap_bank();
+        p.current_conduction = CurrentConduction::Diode;
+        p.r_loads = vec![100.0]; // Light load → DCM likely
+        let data = run_simulation(&p).expect("cap bank DCM should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_empty_uses_scalar_path() {
+        // When output_caps is empty, the scalar c_out/r_esr path should be used
+        // (identical to the existing behavior).
+        let p = test_params();
+        assert!(p.output_caps.is_empty());
+        let data = run_simulation(&p).expect("scalar path should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_hallworth_params() {
+        // Hallworth parameters with a cap bank matching the scalar values.
+        let mut p = hallworth_params();
+        p.output_caps = vec![CapTypeUi {
+            c_uf: p.c_out_uf,
+            count: 1,
+            esr_mohm: p.r_esr_mohm,
+            esl_nh: 0.0,
+        }];
+        let data = run_simulation(&p).expect("Hallworth cap bank should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_with_app_defaults() {
+        // Reproduce: cap bank mode ON with the app's default SimParams.
+        // The GUI seeds one cap type from the existing c_out/r_esr sliders.
+        let mut p = SimParams::default();
+        p.output_caps = vec![CapTypeUi {
+            c_uf: p.c_out_uf,
+            count: 1,
+            esr_mohm: p.r_esr_mohm,
+            esl_nh: 0.0,
+        }];
+        let data = run_simulation(&p).expect("cap bank with app defaults should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+
+        // Compare cap bank vs scalar path — they should agree closely
+        // since the cap bank has a single type matching the scalar params.
+        let mut p_scalar = SimParams::default();
+        p_scalar.output_caps.clear();
+        let data_scalar = run_simulation(&p_scalar).expect("scalar defaults should work");
+        // Steady-state v_out should match within a few percent
+        let v_cb = data[SOFT_START_CYCLES + STEADY_STATE_CYCLES - 1].v_out;
+        let v_sc = data_scalar[SOFT_START_CYCLES + STEADY_STATE_CYCLES - 1].v_out;
+        assert!(
+            (v_cb as f64 - v_sc as f64).abs() < 0.3,
+            "cap bank v_out={v_cb:.3} vs scalar v_out={v_sc:.3} differ too much"
+        );
+    }
+
+    #[test]
+    #[ignore] // Run with --ignored to see diagnostic output
+    fn cap_bank_vs_scalar_trajectory() {
+        // Print side-by-side v_out for cap bank vs scalar at key points.
+        let mut p_cb = SimParams::default();
+        p_cb.output_caps = vec![CapTypeUi {
+            c_uf: p_cb.c_out_uf,
+            count: 1,
+            esr_mohm: p_cb.r_esr_mohm,
+            esl_nh: 0.0,
+        }];
+        let data_cb = run_simulation(&p_cb).expect("cap bank");
+
+        let p_sc = SimParams::default();
+        let data_sc = run_simulation(&p_sc).expect("scalar");
+
+        eprintln!("\n{:>8} {:>10} {:>10} {:>10}", "cycle", "v_cb", "v_sc", "diff");
+        for i in (0..data_cb.len()).step_by(100) {
+            let v_cb = data_cb[i].v_out;
+            let v_sc = data_sc[i].v_out;
+            let diff = v_cb - v_sc;
+            eprintln!("{:>8} {:>10.4} {:>10.4} {:>10.4}", i, v_cb, v_sc, diff);
+        }
+
+        // Check last 200 cycles: ripple should be similar magnitude
+        let tail = 200;
+        let cb_ripple: f32 = data_cb[data_cb.len()-tail..].iter()
+            .map(|p| p.i_total_max - p.i_total_min)
+            .fold(0.0_f32, f32::max);
+        let sc_ripple: f32 = data_sc[data_sc.len()-tail..].iter()
+            .map(|p| p.i_total_max - p.i_total_min)
+            .fold(0.0_f32, f32::max);
+        eprintln!("\nCap bank ripple I_pp: {cb_ripple:.4} A");
+        eprintln!("Scalar   ripple I_pp: {sc_ripple:.4} A");
+    }
+
+    #[test]
+    fn cap_bank_with_app_defaults_2phase() {
+        let mut p = SimParams::default();
+        p.num_phases = 2;
+        p.output_caps = vec![CapTypeUi {
+            c_uf: p.c_out_uf,
+            count: 1,
+            esr_mohm: p.r_esr_mohm,
+            esl_nh: 0.0,
+        }];
+        let data = run_simulation(&p).expect("cap bank 2-phase defaults should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_hw_params_single_phase() {
+        // Test with realistic hardware params from CLAUDE.md:
+        // 6× GRM188R60J106ME47D, 7.7µF@12V each, ESR=3mΩ
+        let mut p = SimParams::default();
+        p.output_caps = vec![CapTypeUi {
+            c_uf: 7.7,
+            count: 6,
+            esr_mohm: 3.0,
+            esl_nh: 0.0,
+        }];
+        let data = run_simulation(&p).expect("hw cap bank 1-phase should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_hw_params_two_phase() {
+        let mut p = SimParams::default();
+        p.num_phases = 2;
+        p.output_caps = vec![CapTypeUi {
+            c_uf: 7.7,
+            count: 6,
+            esr_mohm: 3.0,
+            esl_nh: 0.0,
+        }];
+        let data = run_simulation(&p).expect("hw cap bank 2-phase should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_low_esr_ceramics() {
+        // Very low ESR ceramics — minimal damping, tests numerical stability.
+        let mut p = SimParams::default();
+        p.output_caps = vec![CapTypeUi {
+            c_uf: 10.0,
+            count: 10,
+            esr_mohm: 1.0, // 1mΩ per unit → 0.1mΩ parallel
+            esl_nh: 0.0,
+        }];
+        p.crossover_khz = 30.0; // lower crossover for low-ESR stability
+        let data = run_simulation(&p).expect("low ESR cap bank should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn voltage_ripple_scalar_path() {
+        // Verify v_out_min/v_out_max are sensible in the scalar path.
+        let p = SimParams::default();
+        let data = run_simulation(&p).expect("scalar sim");
+        // Check settled cycles
+        let tail = &data[data.len() - 200..];
+        for pt in tail {
+            assert!(pt.v_out_max >= pt.v_out_min,
+                "v_out_max ({}) < v_out_min ({})", pt.v_out_max, pt.v_out_min);
+            let vpp = pt.v_out_max - pt.v_out_min;
+            assert!(vpp > 0.0, "voltage ripple should be non-zero at steady state");
+            assert!(vpp < 1.0, "voltage ripple should be well under 1V, got {:.4}", vpp);
+        }
+        let worst_vpp: f32 = tail.iter()
+            .map(|p| p.v_out_max - p.v_out_min)
+            .fold(0.0_f32, f32::max);
+        eprintln!("Scalar voltage ripple V_pp: {:.2} mV", worst_vpp * 1e3);
+    }
+
+    #[test]
+    fn voltage_ripple_cap_bank_path() {
+        // Verify v_out_min/v_out_max are sensible in the cap bank path.
+        let mut p = SimParams::default();
+        p.output_caps = vec![CapTypeUi {
+            c_uf: p.c_out_uf,
+            count: 1,
+            esr_mohm: p.r_esr_mohm,
+            esl_nh: 0.0,
+        }];
+        let data = run_simulation(&p).expect("cap bank sim");
+        let tail = &data[data.len() - 200..];
+        for pt in tail {
+            assert!(pt.v_out_max >= pt.v_out_min,
+                "v_out_max ({}) < v_out_min ({})", pt.v_out_max, pt.v_out_min);
+            let vpp = pt.v_out_max - pt.v_out_min;
+            assert!(vpp > 0.0, "voltage ripple should be non-zero at steady state");
+            assert!(vpp < 1.0, "voltage ripple should be well under 1V, got {:.4}", vpp);
+        }
+        let worst_vpp: f32 = tail.iter()
+            .map(|p| p.v_out_max - p.v_out_min)
+            .fold(0.0_f32, f32::max);
+        eprintln!("Cap bank voltage ripple V_pp: {:.2} mV", worst_vpp * 1e3);
+    }
+
+    #[test]
+    fn cap_bank_three_mixed_types() {
+        // Repro: default settings + cap bank with 3 types → was producing all zeros
+        let mut p = SimParams::default();
+        p.output_caps = vec![
+            CapTypeUi { c_uf: 47.0, count: 1, esr_mohm: 10.0, esl_nh: 0.0 },
+            CapTypeUi { c_uf: 1.0,  count: 1, esr_mohm: 1.0,  esl_nh: 0.0 },
+            CapTypeUi { c_uf: 10.0, count: 1, esr_mohm: 3.0,  esl_nh: 0.0 },
+        ];
+        let data = run_simulation(&p).expect("three-type cap bank should work");
+        assert_settled(&data, 500, p.v_out_target, 0.5);
+    }
+
+    #[test]
+    fn cap_bank_extreme_fast_tau_rejected() {
+        // A cap with τ = ESR×C = 0.1mΩ × 0.1µF = 0.01ns would need ~100k steps/phase.
+        // The budget check should reject this before running.
+        let mut p = SimParams::default();
+        p.output_caps = vec![
+            CapTypeUi { c_uf: 47.0, count: 1, esr_mohm: 10.0, esl_nh: 0.0 },
+            CapTypeUi { c_uf: 0.1,  count: 1, esr_mohm: 0.1,  esl_nh: 0.0 },
+        ];
+        let err = run_simulation(&p).unwrap_err();
+        assert!(err.contains("too expensive"), "expected budget error, got: {err}");
     }
 }

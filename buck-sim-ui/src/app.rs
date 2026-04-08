@@ -3,7 +3,7 @@ use egui_plot::{HLine, Line, Plot, PlotPoints};
 use full_control::control_2p2z::Topology as ControlTopology;
 
 use crate::bode::{BodeData, NonIdealParams, show_bode};
-use crate::sim::{CurrentConduction, FetProfile, McuProfile, CsProfile, DacProfile, LossBreakdown, LoadKind, SimParams, SimPoint, build_ctrl_params_multi, compute_losses, computed_r_series_mohm, run_simulation, SOFT_START_CYCLES, STEADY_STATE_CYCLES, LOAD_STEP_CYCLES};
+use crate::sim::{CapTypeUi, CurrentConduction, FetProfile, McuProfile, CsProfile, DacProfile, LossBreakdown, LoadKind, SimParams, SimPoint, build_ctrl_params_multi, compute_losses, computed_r_series_mohm, run_simulation, SOFT_START_CYCLES, STEADY_STATE_CYCLES, LOAD_STEP_CYCLES};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
@@ -60,6 +60,10 @@ pub struct BuckSimApp {
     dac: DacProfile,
     dac_preset_idx: usize,
 
+    // ── Output capacitor bank ─────────────────────────────────────────────
+    output_caps: Vec<CapTypeUi>,
+    use_cap_bank: bool,  // UI toggle: when false, use scalar c_out/r_esr
+
     // ── Multi-phase ──────────────────────────────────────────────────────────
     num_phases: usize,
 
@@ -107,7 +111,13 @@ fn build_bode(p: &SimParams) -> Option<BodeData> {
     let (tf, _) = ctrl.to_transfer_function(p.v_in, ControlTopology::Buck);
     let ds = tf.design_summary();
     let ni = NonIdealParams::from_sim_params(p);
-    Some(BodeData::compute(&ds, &ni))
+    if !p.output_caps.is_empty() {
+        // Use composite impedance from the cap bank in the plant.
+        let si_caps: Vec<_> = p.output_caps.iter().map(|c| c.to_cap_type()).collect();
+        Some(BodeData::compute_with_cap_bank(&ds, &ni, &si_caps))
+    } else {
+        Some(BodeData::compute(&ds, &ni))
+    }
 }
 
 // ── Settings persistence via localStorage (wasm) ─────────────────────────────
@@ -226,6 +236,8 @@ impl BuckSimApp {
             cs_preset_idx: presets.cs_preset_idx,
             dac: p.dac.clone(),
             dac_preset_idx: presets.dac_preset_idx,
+            use_cap_bank: !p.output_caps.is_empty(),
+            output_caps: p.output_caps.clone(),
             num_phases: p.num_phases,
             sim_data,
             bode_data,
@@ -282,6 +294,7 @@ impl BuckSimApp {
             mcu: self.mcu.clone(),
             cs: self.cs.clone(),
             dac: self.dac.clone(),
+            output_caps: self.output_caps.clone(),
             num_phases: self.num_phases,
         }
     }
@@ -488,16 +501,73 @@ impl eframe::App for BuckSimApp {
                         .text("L [µH]")
                         .step_by(0.5),
                 ).on_hover_text("Per-phase inductor value (each phase has its own inductor)");
-                ui.add(
-                    egui::Slider::new(&mut self.c_out_uf, 1.0..=5000.0)
-                        .text("C_out [µF]")
-                        .step_by(1.0),
-                ).on_hover_text("Total output capacitance (shared across all phases)");
-                ui.add(
-                    egui::Slider::new(&mut self.r_esr_mohm, 0.0..=500.0)
-                        .text("R_ESR [mΩ]")
-                        .step_by(0.1),
-                ).on_hover_text("Total ESR of the shared output capacitor bank");
+                ui.checkbox(&mut self.use_cap_bank, "Cap bank mode")
+                    .on_hover_text("Toggle between simple C+ESR and per-type capacitor bank.\n\
+                                    Cap bank mode models frequency-dependent impedance of mixed cap types.");
+                if self.use_cap_bank {
+                    // ── Cap bank table ──────────────────────────────
+                    // If switching from simple to bank for the first time, seed with one entry
+                    if self.output_caps.is_empty() {
+                        self.output_caps.push(CapTypeUi {
+                            c_uf: self.c_out_uf,
+                            count: 1,
+                            esr_mohm: self.r_esr_mohm,
+                            esl_nh: 0.0,
+                        });
+                    }
+
+                    let mut remove_idx = None;
+                    let n_caps = self.output_caps.len();
+                    for i in 0..n_caps {
+                        ui.horizontal(|ui| {
+                            ui.label(format!("#{}", i + 1));
+                            let cap = &mut self.output_caps[i];
+                            ui.add(egui::DragValue::new(&mut cap.c_uf)
+                                .range(0.1..=10000.0).speed(1.0).suffix(" µF"));
+                            ui.add(egui::DragValue::new(&mut cap.count)
+                                .range(1..=100_usize).speed(0.1).suffix("x"));
+                            ui.add(egui::DragValue::new(&mut cap.esr_mohm)
+                                .range(0.1..=1000.0).speed(0.1).suffix(" mΩ"));
+                            ui.add(egui::DragValue::new(&mut cap.esl_nh)
+                                .range(0.0..=1000.0).speed(0.1).suffix(" nH"));
+                            if n_caps > 1 && ui.small_button("\u{2212}").clicked() {
+                                remove_idx = Some(i);
+                            }
+                        });
+                    }
+                    if let Some(idx) = remove_idx {
+                        self.output_caps.remove(idx);
+                    }
+                    if ui.small_button("+ Add cap type").clicked() {
+                        self.output_caps.push(CapTypeUi {
+                            c_uf: 10.0, count: 1, esr_mohm: 3.0, esl_nh: 0.0,
+                        });
+                    }
+
+                    // Show computed totals
+                    let si_caps: Vec<_> = self.output_caps.iter().map(|c| c.to_cap_type()).collect();
+                    let c_total_uf = electronics_sim::cap_bank::CapBank::total_capacitance(&si_caps) * 1e6;
+                    let esr_eff = electronics_sim::cap_bank::CapBank::effective_esr(&si_caps, self.f_sw_khz * 1e3);
+                    ui.label(egui::RichText::new(
+                        format!("C_total: {:.1} µF, ESR_eff @ f_sw: {:.2} mΩ", c_total_uf, esr_eff * 1e3)
+                    ).small().color(Color32::GRAY));
+                    ui.label(egui::RichText::new(
+                        format!("(Compensator designed for C={:.1}µF, ESR={:.2}mΩ)", c_total_uf, esr_eff * 1e3)
+                    ).small().color(Color32::LIGHT_YELLOW));
+                } else {
+                    // Clear cap bank when switching back to simple mode
+                    self.output_caps.clear();
+                    ui.add(
+                        egui::Slider::new(&mut self.c_out_uf, 1.0..=5000.0)
+                            .text("C_out [µF]")
+                            .step_by(1.0),
+                    ).on_hover_text("Total output capacitance (shared across all phases)");
+                    ui.add(
+                        egui::Slider::new(&mut self.r_esr_mohm, 0.0..=500.0)
+                            .text("R_ESR [mΩ]")
+                            .step_by(0.1),
+                    ).on_hover_text("Total ESR of the shared output capacitor bank");
+                }
                 ui.add(
                     egui::Slider::new(&mut self.dcr_mohm, 0.0..=50.0)
                         .text("DCR [mΩ]")
@@ -1048,6 +1118,52 @@ impl eframe::App for BuckSimApp {
                             if self.load_kind == LoadKind::Steps && worst_load > 0.0 {
                                 ui.label(egui::RichText::new(
                                     format!("Worst load:   {:.1} \u{2126}", worst_load)
+                                ).small().monospace());
+                            }
+
+                            // ── Voltage ripple (same logic: worst-case from settled tails) ──
+                            ui.separator();
+                            let mut worst_v_pp: f32 = 0.0;
+                            let mut worst_v_load = 0.0_f64;
+                            match self.load_kind {
+                                LoadKind::Steps => {
+                                    let mut segments: Vec<(usize, usize, f64)> = vec![
+                                        (SOFT_START_CYCLES, SOFT_START_CYCLES + STEADY_STATE_CYCLES, self.r_loads[0]),
+                                    ];
+                                    let mut offset = SOFT_START_CYCLES + STEADY_STATE_CYCLES;
+                                    for &r in &self.r_loads[1..] {
+                                        segments.push((offset, offset + LOAD_STEP_CYCLES, r));
+                                        offset += LOAD_STEP_CYCLES;
+                                    }
+                                    for &(start, end, r_load) in &segments {
+                                        let end = end.min(data.len());
+                                        let start = start.min(end);
+                                        let tail_n = settled_tail.min(end - start);
+                                        if tail_n == 0 { continue; }
+                                        let tail = &data[end - tail_n..end];
+                                        let vpp: f32 = tail.iter()
+                                            .map(|p| p.v_out_max - p.v_out_min)
+                                            .fold(0.0_f32, f32::max);
+                                        if vpp > worst_v_pp {
+                                            worst_v_pp = vpp;
+                                            worst_v_load = r_load;
+                                        }
+                                    }
+                                }
+                                LoadKind::Battery => {
+                                    let n = settled_tail.min(data.len());
+                                    let tail = &data[data.len() - n..];
+                                    worst_v_pp = tail.iter()
+                                        .map(|p| p.v_out_max - p.v_out_min)
+                                        .fold(0.0_f32, f32::max);
+                                }
+                            }
+                            ui.label(egui::RichText::new(
+                                format!("Ripple V_pp:  {:.1} mV", worst_v_pp * 1e3)
+                            ).monospace());
+                            if self.load_kind == LoadKind::Steps && worst_v_load > 0.0 {
+                                ui.label(egui::RichText::new(
+                                    format!("Worst load:   {:.1} \u{2126}", worst_v_load)
                                 ).small().monospace());
                             }
                         } else {

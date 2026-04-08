@@ -2,6 +2,7 @@ use std::f64::consts::PI;
 
 use egui::Color32;
 use egui_plot::{HLine, Line, PlotPoints, VLine};
+use electronics_sim::cap_bank::{CapBank, CapType};
 use full_control::control_2p2z::DesignSummary;
 
 use crate::sim::{SimParams, has_transport_delays};
@@ -128,7 +129,11 @@ pub struct BodeData {
     pub f_p1: f64,
     pub f_esr: f64,
     pub f_cz1: f64,
+    pub f_cp1: f64,
+    pub f_n: f64,
+    pub f_sw: f64,
     pub f_x_design: f64,
+    pub h_dc: f64,
 
     // Non-ideal annotation frequencies [Hz] for vertical markers.
     pub f_cs: Option<f64>,
@@ -159,6 +164,39 @@ fn plant(omega: f64, ds: &DesignSummary) -> C {
     c_div(num, den)
 }
 
+/// Evaluate the plant transfer function using composite cap bank impedance.
+///
+/// Instead of a single ESR zero `(1 + jω/ω_esr)`, we use the actual impedance
+/// of the parallel cap bank:
+///
+///   Z_out_normalized(jω) = Z_out(jω) × jω × C_total
+///
+/// This equals 1 at DC (pure capacitive) and shows the real ESR/ESL behavior
+/// at higher frequencies, including resonances and anti-resonances from mixed
+/// cap types.
+fn plant_cap_bank(omega: f64, ds: &DesignSummary, caps: &[CapType], c_total: f64) -> C {
+    // Compute composite impedance of the cap bank at this frequency.
+    let (z_re, z_im) = CapBank::impedance_at(caps, omega);
+
+    // Normalize: multiply by jω × C_total.
+    // This makes the impedance transfer function dimensionless and equal to 1 at DC.
+    //   Z_norm = Z_out × jω × C_total
+    //          = (z_re + j·z_im) × (0 + j·ω·C_total)
+    //          = (-z_im·ω·C_total) + j·(z_re·ω·C_total)
+    let wc = omega * c_total;
+    let z_norm: C = (-z_im * wc, z_re * wc);
+
+    // Rest of the plant: H_dc / [(1 + jω/ω_p1) × double_pole]
+    // The ESR zero is now replaced by z_norm above.
+    let jw_over_p1: C = (1.0, omega / ds.omega_p1);
+    let r = omega / ds.omega_n;
+    let double_pole: C = (1.0 - r * r, r);
+
+    let num = c_mul((ds.h_dc, 0.0), z_norm);
+    let den = c_mul(jw_over_p1, double_pole);
+    c_div(num, den)
+}
+
 /// Evaluate the compensator transfer function H_c(jω).
 ///
 /// H_c = ω_cp0/(jω) × (1 + jω/ω_cz1) / (1 + jω/ω_cp1)
@@ -171,7 +209,27 @@ fn compensator(omega: f64, ds: &DesignSummary) -> C {
 }
 
 impl BodeData {
+    /// Compute Bode data. When `cap_bank_caps` is Some, the plant uses composite
+    /// impedance instead of a single ESR zero.
     pub fn compute(ds: &DesignSummary, ni: &NonIdealParams) -> Self {
+        Self::compute_inner(ds, ni, None)
+    }
+
+    /// Compute Bode data with composite cap bank impedance in the plant.
+    pub fn compute_with_cap_bank(
+        ds: &DesignSummary,
+        ni: &NonIdealParams,
+        caps: &[CapType],
+    ) -> Self {
+        let c_total = CapBank::total_capacitance(caps);
+        Self::compute_inner(ds, ni, Some((caps, c_total)))
+    }
+
+    fn compute_inner(
+        ds: &DesignSummary,
+        ni: &NonIdealParams,
+        cap_bank: Option<(&[CapType], f64)>,
+    ) -> Self {
         let f_min = 1.0_f64;
         let f_max = ds.f_sw;
         let log_min = f_min.log10();
@@ -190,7 +248,10 @@ impl BodeData {
             let f = 10.0_f64.powf(log_min + t * (log_max - log_min));
             let omega = 2.0 * PI * f;
 
-            let hp = plant(omega, ds);
+            let hp = match cap_bank {
+                Some((caps, c_total)) => plant_cap_bank(omega, ds, caps, c_total),
+                None => plant(omega, ds),
+            };
             let hc = compensator(omega, ds);
             let hni = non_ideal(omega, ni);
             let ht = c_mul(c_mul(hp, hc), hni);
@@ -243,7 +304,11 @@ impl BodeData {
             f_p1: ds.omega_p1 / (2.0 * PI),
             f_esr: ds.omega_esr / (2.0 * PI),
             f_cz1: ds.omega_cz1 / (2.0 * PI),
+            f_cp1: ds.omega_cp1 / (2.0 * PI),
+            f_n: ds.omega_n / (2.0 * PI),
+            f_sw: ds.f_sw,
             f_x_design: ds.omega_x / (2.0 * PI),
+            h_dc: ds.h_dc,
             f_cs,
             f_dac_filter,
             tau_delay_us: ni.tau_delay * 1e6,
@@ -309,6 +374,28 @@ pub fn show_bode(ui: &mut egui::Ui, data: &BodeData) {
         }
         ui.label(egui::RichText::new(text).strong());
     });
+
+    // Pole/zero table
+    egui::CollapsingHeader::new("Poles & Zeros")
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!(
+                    "Plant:  pole {}, double-pole {}, zero {} (ESR), H_dc = {:.1} dB",
+                    fmt_freq(data.f_p1),
+                    fmt_freq(data.f_n),
+                    fmt_freq(data.f_esr),
+                    20.0 * data.h_dc.log10(),
+                )).small().monospace());
+            });
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(format!(
+                    "Comp:   zero {}, pole {} (cancels ESR zero)",
+                    fmt_freq(data.f_cz1),
+                    fmt_freq(data.f_cp1),
+                )).small().monospace());
+            });
+        });
     ui.add_space(2.0);
 
     let x_link = egui::Vec2b::new(true, false);
