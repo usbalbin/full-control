@@ -139,6 +139,9 @@ struct PfcState {
     topology: PfcTopology,
     slope_overcomp: f64,
 
+    // AC phases (1 = single-phase, 3 = three-phase)
+    ac_phases: usize,
+
     // Cap bank (empty = scalar mode)
     output_caps: Vec<CapTypeUi>,
 
@@ -197,6 +200,7 @@ impl PfcState {
             control_mode: p.control_mode,
             topology: p.topology,
             slope_overcomp: p.slope_overcomp,
+            ac_phases: p.ac_phases,
             output_caps: p.output_caps.clone(),
             sim_data,
             metrics,
@@ -232,20 +236,21 @@ impl PfcState {
             control_mode: self.control_mode,
             topology: self.topology,
             slope_overcomp: self.slope_overcomp,
+            ac_phases: self.ac_phases,
             output_caps: self.output_caps.clone(),
         }
     }
 
-    /// Reconstruct per-phase triangular inductor current waveform.
-    fn pfc_phase_waveform(&self, data: &[PfcSimPoint], phase_idx: usize) -> Vec<[f64; 2]> {
+    /// Reconstruct per-stage triangular inductor current waveform.
+    fn pfc_phase_waveform(&self, data: &[PfcSimPoint], stage_idx: usize) -> Vec<[f64; 2]> {
         let n = self.num_phases.max(1);
         let mut pts = Vec::with_capacity(data.len() * 4);
         for p in data {
-            if phase_idx >= p.phases.len() { continue; }
-            let ph = &p.phases[phase_idx];
+            if stage_idx >= p.phases.len() { continue; }
+            let ph = &p.phases[stage_idx];
             // Use per-point t_sw_us (varies in CrCM) instead of global f_sw_khz
             let t_sw_ms = p.t_sw_us as f64 / 1000.0;
-            let offset_ms = phase_idx as f64 * t_sw_ms / n as f64;
+            let offset_ms = stage_idx as f64 * t_sw_ms / n as f64;
             let t0 = p.t_us as f64 / 1000.0 + offset_ms; // ms
             let t_on_ms = ph.duty as f64 * t_sw_ms;
             let t_off_ms = t_sw_ms - t_on_ms;
@@ -521,21 +526,21 @@ impl BuckSimApp {
     }
 
     /// Reconstruct the actual triangular inductor current waveform for a single
-    /// phase within each switching cycle.
+    /// interleaved stage within each switching cycle.
     ///
     /// Each cycle: current ramps from `i_l_min` → `i_l_max` over `t_on`,
     /// then from `i_l_max` → `i_l_min` over `T - t_on`.
-    /// Phase `k` is offset by `k × T / N` from the cycle start.
-    fn phase_waveform(&self, data: &[SimPoint], phase_idx: usize) -> Vec<[f64; 2]> {
+    /// Stage `k` is offset by `k × T / N` from the cycle start.
+    fn phase_waveform(&self, data: &[SimPoint], stage_idx: usize) -> Vec<[f64; 2]> {
         let n = self.num_phases.max(1);
         let t_sw_ms = 1.0 / self.f_sw_khz; // switching period in ms
-        let offset_ms = phase_idx as f64 * t_sw_ms / n as f64;
+        let offset_ms = stage_idx as f64 * t_sw_ms / n as f64;
         let mut pts = Vec::with_capacity(data.len() * 3);
         for p in data {
-            if phase_idx >= p.phases.len() {
+            if stage_idx >= p.phases.len() {
                 continue;
             }
-            let ph = &p.phases[phase_idx];
+            let ph = &p.phases[stage_idx];
             let t_on_ms = ph.t_on as f64 * 1e3;
             let t0 = p.t_ms as f64 + offset_ms;
             // Start of this phase's cycle: i_l_min
@@ -1464,14 +1469,38 @@ impl BuckSimApp {
                 ui.radio_value(&mut self.pfc.topology, PfcTopology::BridgedBoost, "Bridged")
                     .on_hover_text("Diode bridge rectifier + boost stage");
                 ui.radio_value(&mut self.pfc.topology, PfcTopology::TotemPole, "Totem-pole")
-                    .on_hover_text("Bridgeless totem-pole — no bridge diode loss, inherently synchronous. Higher efficiency.");
+                    .on_hover_text("Bridgeless totem-pole — no bridge diode loss, inherently synchronous.");
+                ui.radio_value(&mut self.pfc.topology, PfcTopology::Vienna, "Vienna")
+                    .on_hover_text("3-level Vienna rectifier — split DC bus, 3-phase only.");
+                ui.radio_value(&mut self.pfc.topology, PfcTopology::ActiveBridge, "6-switch")
+                    .on_hover_text("6-switch active bridge (B6 VSR) — d-q control, 3-phase only.");
+            });
+
+            // Force 3-phase for Vienna and ActiveBridge
+            if matches!(self.pfc.topology, PfcTopology::Vienna | PfcTopology::ActiveBridge) {
+                self.pfc.ac_phases = 3;
+            }
+
+            // AC phases
+            ui.horizontal(|ui| {
+                ui.label("AC Phases:");
+                let three_phase_only = matches!(
+                    self.pfc.topology,
+                    PfcTopology::Vienna | PfcTopology::ActiveBridge
+                );
+                if !three_phase_only {
+                    ui.selectable_value(&mut self.pfc.ac_phases, 1, "1-phase");
+                    ui.selectable_value(&mut self.pfc.ac_phases, 3, "3-phase");
+                } else {
+                    ui.label("3-phase (required)");
+                }
             });
 
             ui.separator();
 
             ui.add(egui::Slider::new(&mut self.pfc.v_in_rms, 85.0..=265.0)
                 .text("V_in RMS [V]").step_by(1.0))
-                .on_hover_text("AC mains RMS voltage");
+                .on_hover_text("AC mains RMS voltage (line-to-neutral for 3-phase)");
 
             ui.horizontal(|ui| {
                 ui.label("f_line:");

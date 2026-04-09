@@ -6,6 +6,9 @@ pub mod fmac;
 pub(crate) mod math;
 pub mod buck_boost;
 pub mod pfc_runtime;
+pub mod transforms;
+pub mod pll;
+pub mod dq_controller;
 
 #[cfg(test)]
 mod tests {

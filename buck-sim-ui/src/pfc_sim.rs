@@ -1,6 +1,11 @@
+use electronics_sim::ac_source::AcSource;
+use electronics_sim::active_bridge::ActiveBridgeSim;
 use electronics_sim::pfc_boost::PfcBoostSim;
+use electronics_sim::vienna::ViennaRectifierSim;
 use electronics_sim::CurrentConduction;
 use full_control::control_pfc::{PfcDesignSummary, PfcParameters};
+use full_control::dq_controller::DqCurrentController;
+use full_control::pll::SrfPll;
 
 use std::f64::consts::PI;
 
@@ -22,6 +27,11 @@ pub enum PfcTopology {
     BridgedBoost,
     /// Totem-pole bridgeless — no bridge diode loss, inherently synchronous.
     TotemPole,
+    /// Vienna rectifier — 3-level, split DC bus, 3-phase only.
+    Vienna,
+    /// 6-switch active bridge (B6 VSR) — fully controlled, 3-phase only.
+    /// Uses d-q synchronous frame current control.
+    ActiveBridge,
 }
 
 /// Number of half-cycles for soft-start (voltage ramp).
@@ -63,6 +73,9 @@ pub struct PfcSimParams {
     /// Slope over-compensation factor for PCMC (1.0 = exact, 1.5 = 50% extra).
     pub slope_overcomp: f64,
 
+    /// Number of AC input phases (1 = single-phase, 3 = three-phase).
+    pub ac_phases: usize,
+
     // Cap bank (empty = use scalar c_out_uf/r_esr_mohm)
     pub output_caps: Vec<CapTypeUi>,
 }
@@ -91,6 +104,7 @@ impl Default for PfcSimParams {
             control_mode: PfcControlMode::Acm,
             topology: PfcTopology::BridgedBoost,
             slope_overcomp: 1.5,
+            ac_phases: 1,
             output_caps: Vec::new(),
         }
     }
@@ -196,6 +210,12 @@ pub fn build_pfc_design(p: &PfcSimParams) -> PfcParameters {
 pub fn run_pfc_simulation(
     p: &PfcSimParams,
 ) -> Result<(Vec<PfcSimPoint>, PfcMetrics, PfcDesignSummary), String> {
+    match p.topology {
+        PfcTopology::ActiveBridge => return run_active_bridge_simulation(p),
+        PfcTopology::Vienna => return run_vienna_simulation(p),
+        _ => {}
+    }
+
     // ── Validate ──────────────────────────────────────────────
     if p.v_in_rms <= 0.0 {
         return Err("V_in RMS must be positive".into());
@@ -216,16 +236,19 @@ pub fn run_pfc_simulation(
             p.voltage_crossover_hz, p.f_line_hz / 3.0
         ));
     }
-    let num_phases = p.num_phases.max(1);
+    let num_phases = p.num_phases.max(1); // interleaved phases per AC phase
+    let ac_phases = p.ac_phases.max(1);
 
     // ── Topology overrides ───────────────────────────────────
     let effective_v_diode = match p.topology {
         PfcTopology::BridgedBoost => p.v_diode,
         PfcTopology::TotemPole => 0.0,
+        PfcTopology::Vienna | PfcTopology::ActiveBridge => unreachable!(),
     };
     let effective_conduction = match p.topology {
         PfcTopology::BridgedBoost => p.current_conduction,
         PfcTopology::TotemPole => CurrentConduction::Synchronous,
+        PfcTopology::Vienna | PfcTopology::ActiveBridge => unreachable!(),
     };
 
     // ── Compensator design ────────────────────────────────────
@@ -242,225 +265,247 @@ pub fn run_pfc_simulation(
 
     // ── Create controllers ────────────────────────────────────
     // ACM uses both current + voltage loops; CrCM/PCMC use voltage loop only.
-    let mut current_ctrl = design.inner.to_controller(0.0_f32, 0.95);
-    // Voltage loop output limit (k_max). The voltage loop output k represents
-    // the peak of the sinusoidal average-current reference: i_avg(θ) = k×sin(θ).
-    // Nominal k = P×√2/V_rms ≈ P/(V_rms×0.5). PCMC needs extra headroom because
-    // the DCM-corrected reference converts k into a larger comparator reference,
-    // and the voltage loop may overshoot k during load transients.
+    // For multi-AC-phase: one current controller per AC phase (ACM only).
+    let mut current_ctrls: Vec<_> = (0..ac_phases)
+        .map(|_| design.inner.to_controller(0.0_f32, 0.95))
+        .collect();
+    // Voltage loop output limit (k_max). k represents peak current amplitude
+    // PER AC PHASE: i_avg(θ) = k×sin(θ). For N AC phases, total power = N × per-phase.
+    let p_per_ac_phase = p.p_load_w() / ac_phases as f64;
     let i_max_ref = match p.control_mode {
         PfcControlMode::Pcmc => {
-            (p.p_load_w() / (p.v_in_rms * 0.5) * 2.0) as f32
+            (p_per_ac_phase / (p.v_in_rms * 0.5) * 2.0) as f32
         }
-        _ => (p.p_load_w() / (p.v_in_rms * 0.5)) as f32,
+        _ => (p_per_ac_phase / (p.v_in_rms * 0.5)) as f32,
     };
     let mut voltage_ctrl = design.outer.to_controller(0.0_f32, i_max_ref);
 
     // ── Create simulator(s) ──────────────────────────────────
-    let mut sims: Vec<PfcBoostSim> = (0..num_phases)
-        .map(|_| {
-            PfcBoostSim::new(
-                l,
-                p.c_out_uf * 1e-6,
-                p.r_esr_mohm * 1e-3,
-                r_series,
-                effective_v_diode,
-                f_sw,
-                p.v_out,
-                effective_conduction,
-            )
-        })
+    // For 3-phase: ac_phases groups of num_phases interleaved stages, all sharing v_out.
+    // sims_per_ac[ac_idx] = Vec of interleaved boost stages for that AC phase.
+    let ac = AcSource::new(p.v_in_rms, p.f_line_hz, ac_phases);
+    let make_sim = || PfcBoostSim::new(
+        l,
+        p.c_out_uf * 1e-6,
+        p.r_esr_mohm * 1e-3,
+        r_series,
+        effective_v_diode,
+        f_sw,
+        p.v_out,
+        effective_conduction,
+    );
+    let mut sims_per_ac: Vec<Vec<PfcBoostSim>> = (0..ac_phases)
+        .map(|_| (0..num_phases).map(|_| make_sim()).collect())
         .collect();
 
-    // ── Simulation loop ───────────────────────────────────────
-    let t_half_cycle = 1.0 / (2.0 * p.f_line_hz);
-    let cycles_per_half = (f_sw * t_half_cycle).round() as usize;
+    // ── Simulation loop (continuous time) ────────────────────
+    let t_half = 1.0 / (2.0 * p.f_line_hz);
     let mut points = Vec::new();
     let p_load_nom = p.p_load_w();
     let i_load_nom = p_load_nom / p.v_out;
 
     let mut t = 0.0_f64;
 
-    // Prime voltage controller
-    let k_init = i_load_nom / (1.0 - v_in_pk / p.v_out);
+    // Prime voltage controller (k is per-AC-phase amplitude)
+    let k_init = (i_load_nom / ac_phases as f64) / (1.0 - v_in_pk / p.v_out);
     voltage_ctrl.prime(k_init as f32, 0.0);
 
-    // Prime current controller (ACM only, but no harm priming it)
+    // Prime current controllers (ACM only, but no harm priming them)
     let d_init = 1.0 - v_in_pk / p.v_out;
-    current_ctrl.prime(d_init as f32, 0.0);
+    for ctrl in &mut current_ctrls {
+        ctrl.prime(d_init as f32, 0.0);
+    }
 
     #[allow(unused_assignments)]
     let mut k = k_init as f32;
-    let mut i_avg_prev = k_init as f32 * 0.637; // initial guess: I_pk × 2/π
+    let mut i_avg_prev: Vec<f32> = vec![k_init as f32 * 0.637; ac_phases]; // per-AC-phase
 
-    // Build load schedule: (half_cycle_count, load_power_w)
-    let mut schedule: Vec<(usize, f64)> = Vec::new();
-    schedule.push((SOFT_START_HALF_CYCLES, p_load_nom));  // soft-start
-    schedule.push((p.steady_half_cycles, p_load_nom));     // steady-state
+    // Build time-based schedule: Vec<(cumulative_end_time, load_power)>
+    let mut schedule: Vec<(f64, f64)> = Vec::new();
+    let mut seg_end = 0.0;
+    seg_end += SOFT_START_HALF_CYCLES as f64 * t_half;
+    schedule.push((seg_end, p_load_nom));
+    seg_end += p.steady_half_cycles as f64 * t_half;
+    schedule.push((seg_end, p_load_nom));
     for &p_step in p.p_loads_w.iter().skip(1) {
-        schedule.push((p.step_half_cycles, p_step));
+        seg_end += p.step_half_cycles as f64 * t_half;
+        schedule.push((seg_end, p_step));
     }
+    let total_time = seg_end;
+    let t_soft_start = SOFT_START_HALF_CYCLES as f64 * t_half;
 
-    let mut global_half_cycle = 0_usize;
-    for (seg_half_cycles, seg_power) in &schedule {
-        let seg_i_load = seg_power / p.v_out;
+    while t < total_time {
+        // Current load segment
+        let seg_i_load = schedule.iter()
+            .find(|(end, _)| t < *end)
+            .map(|(_, pw)| pw / p.v_out)
+            .unwrap_or(i_load_nom);
 
-        for _local_half in 0..*seg_half_cycles {
-            let is_soft_start = global_half_cycle < SOFT_START_HALF_CYCLES;
-            let ss_frac = if is_soft_start {
-                (global_half_cycle as f64 + 1.0) / SOFT_START_HALF_CYCLES as f64
-            } else {
-                1.0
-            };
+        // Soft-start: step-wise ramp per half-cycle (matches original behavior)
+        let ss_frac = if t < t_soft_start {
+            let completed_halves = (t / t_half).floor() as f64;
+            ((completed_halves + 1.0) / SOFT_START_HALF_CYCLES as f64).min(1.0)
+        } else {
+            1.0
+        };
 
-            // Helper closure: build a PfcSimPoint from phase results
-            let build_point = |sims: &[PfcBoostSim], phase_results: &[electronics_sim::pfc_boost::PfcCycleResult],
-                               t: f64, v_in_rect: f64, theta: f64, i_ref_amps: f32, t_sw_actual: f64| {
-                let phase_points: Vec<PfcPhasePoint> = phase_results
-                    .iter()
-                    .map(|r| PfcPhasePoint {
-                        i_l_start: r.i_l_start as f32,
-                        i_l_peak: r.i_l_peak as f32,
-                        i_l_end: r.i_l_end as f32,
-                        duty: r.duty as f32,
-                        dcm: r.dcm,
-                        t_conduct_frac: r.t_conduct_frac as f32,
-                    })
-                    .collect();
-                let i_total_avg: f32 = phase_results.iter()
-                    .map(|r| r.i_l_avg as f32).sum();
-                let (i_total_min, i_total_max) = pfc_interleaved_envelope(
-                    &phase_points, t_sw_actual as f32,
-                );
-                PfcSimPoint {
-                    t_us: (t * 1e6) as f32,
-                    v_in_rect: v_in_rect as f32,
-                    v_out: sims[0].v_out() as f32,
-                    i_ref: i_ref_amps,
-                    line_phase: theta as f32,
-                    phases: phase_points,
-                    i_total_min,
-                    i_total_max,
-                    i_total_avg,
-                    t_sw_us: (t_sw_actual * 1e6) as f32,
-                }
-            };
+        let line_phase = 2.0 * PI * p.f_line_hz * t;
+        let v_target = p.v_out * ss_frac;
+
+        // Voltage loop → k (shared across all AC phases)
+        let v_error = (v_target - sims_per_ac[0][0].v_out()) as f32;
+        k = voltage_ctrl.update(v_error);
+        k = k.max(0.0);
+
+        // ── Per-AC-phase control and power stage tick ─────────
+        let mut all_phase_points: Vec<PfcPhasePoint> = Vec::new();
+        let mut all_i_avg_total: f32 = 0.0;
+        let mut actual_t_sw_out = 0.0_f64;
+        let mut primary_v_in_rect = 0.0_f64;
+        let mut primary_i_ref = 0.0_f32;
+
+        for ac_idx in 0..ac_phases {
+            let v_in_rect = ac.v_phase_rect(ac_idx, t);
+            let sin_theta = v_in_rect / v_in_pk;
+            if ac_idx == 0 {
+                primary_v_in_rect = v_in_rect;
+            }
+
+            let sims = &mut sims_per_ac[ac_idx];
 
             match p.control_mode {
                 PfcControlMode::CrCm => {
-                    // ── CrCM: variable-frequency loop ────────────────
-                    let mut t_within_half = 0.0_f64;
-                    while t_within_half < t_half_cycle {
-                        let theta = PI * (t_within_half + 1e-9) / t_half_cycle;
-                        let sin_theta = theta.sin();
-                        let v_in_rect = v_in_pk * sin_theta;
-                        let v_target = p.v_out * ss_frac;
+                    let t_on = full_control::pfc_runtime::crcm_on_time(
+                        l, k as f64, v_in_pk, num_phases as f64, t_sw,
+                    );
+                    let i_ref_amps = k / num_phases as f32 * sin_theta as f32;
+                    if ac_idx == 0 { primary_i_ref = i_ref_amps; }
 
-                        // Voltage loop → k (current amplitude envelope)
-                        let v_error = (v_target - sims[0].v_out()) as f32;
-                        k = voltage_ctrl.update(v_error);
-                        k = k.max(0.0);
+                    let phase_results = tick_multi_pfc_crm(sims, v_in_rect, t_on, seg_i_load / ac_phases as f64);
+                    // Use the longest switching period across all AC phases
+                    let this_t_sw = phase_results[0].t_sw_actual;
+                    if this_t_sw > actual_t_sw_out {
+                        actual_t_sw_out = this_t_sw;
+                    }
 
-                        let t_on = full_control::pfc_runtime::crcm_on_time(
-                            l, k as f64, v_in_pk, num_phases as f64, t_sw,
-                        );
-
-                        let i_ref_amps = k / num_phases as f32 * sin_theta as f32;
-
-                        // Tick all phases with CrCM
-                        let phase_results = tick_multi_pfc_crm(
-                            &mut sims, v_in_rect, t_on, seg_i_load,
-                        );
-                        let actual_t_sw = phase_results[0].t_sw_actual;
-
-                        points.push(build_point(
-                            &sims, &phase_results, t, v_in_rect, theta, i_ref_amps, actual_t_sw,
-                        ));
-
-                        let dt = actual_t_sw.max(t_sw * 0.01); // guard against zero
-                        t += dt;
-                        t_within_half += dt;
+                    for r in &phase_results {
+                        all_i_avg_total += r.i_l_avg as f32;
+                        all_phase_points.push(PfcPhasePoint {
+                            i_l_start: r.i_l_start as f32,
+                            i_l_peak: r.i_l_peak as f32,
+                            i_l_end: r.i_l_end as f32,
+                            duty: r.duty as f32,
+                            dcm: r.dcm,
+                            t_conduct_frac: r.t_conduct_frac as f32,
+                        });
                     }
                 }
                 _ => {
-                    // ── ACM / PCMC: fixed-frequency loop ─────────────
-                    for sw in 0..cycles_per_half {
-                        let theta = PI * (sw as f64 + 0.5) / cycles_per_half as f64;
-                        let sin_theta = theta.sin();
-                        let v_in_rect = v_in_pk * sin_theta;
-                        let v_target = p.v_out * ss_frac;
+                    actual_t_sw_out = t_sw; // fixed frequency for ACM/PCMC
+                    let i_ref_per_phase = k / num_phases as f32 * sin_theta as f32;
+                    let mut i_ref_amps = i_ref_per_phase;
 
-                        // Outer voltage loop → k
-                        let v_error = (v_target - sims[0].v_out()) as f32;
-                        k = voltage_ctrl.update(v_error);
-                        k = k.max(0.0);
-
-                        let i_ref_per_phase = k / num_phases as f32 * sin_theta as f32;
-                        let mut i_ref_amps = i_ref_per_phase;
-
-                        let duty = match p.control_mode {
-                            PfcControlMode::Acm => {
-                                // ACM: inner 2P2Z current loop → duty
-                                let i_error = (i_ref_per_phase - i_avg_prev) * r_sense as f32;
-                                current_ctrl.update(i_error) as f64
-                            }
-                            PfcControlMode::Pcmc => {
-                                use full_control::pfc_runtime::{pcmc_reference_corrected, pcmc_comparator};
-
-                                let oc = p.slope_overcomp;
-                                let i_start_val = sims[0].i_inductor;
-                                let v_out_now = sims[0].v_out();
-                                let i_avg_desired = (k as f64 / num_phases as f64) * sin_theta;
-
-                                let i_ref = pcmc_reference_corrected(
-                                    i_avg_desired, v_in_rect, v_out_now,
-                                    i_start_val, l, t_sw, oc,
-                                );
-                                i_ref_amps = i_ref as f32;
-
-                                pcmc_comparator(i_ref, i_start_val, oc, v_in_rect, l, t_sw)
-                            }
-                            PfcControlMode::CrCm => unreachable!(),
-                        };
-
-                        // Zero-crossing blanking for sync mode
-                        let blanking = effective_conduction == CurrentConduction::Synchronous
-                            && full_control::pfc_runtime::zc_blanking_active(v_in_rect, p.v_out, 0.05);
-                        if blanking {
-                            for sim in sims.iter_mut() {
-                                sim.current_conduction = CurrentConduction::Diode;
-                            }
+                    let duty = match p.control_mode {
+                        PfcControlMode::Acm => {
+                            let i_error = (i_ref_per_phase - i_avg_prev[ac_idx]) * r_sense as f32;
+                            current_ctrls[ac_idx].update(i_error) as f64
                         }
+                        PfcControlMode::Pcmc => {
+                            use full_control::pfc_runtime::{pcmc_reference_corrected, pcmc_comparator};
 
-                        let phase_results = tick_multi_pfc(
-                            &mut sims, v_in_rect, duty, seg_i_load,
-                        );
+                            let oc = p.slope_overcomp;
+                            let i_start_val = sims[0].i_inductor;
+                            let v_out_now = sims[0].v_out();
+                            let i_avg_desired = (k as f64 / num_phases as f64) * sin_theta as f64;
 
-                        if blanking {
-                            for sim in sims.iter_mut() {
-                                sim.current_conduction = effective_conduction;
-                            }
+                            let i_ref = pcmc_reference_corrected(
+                                i_avg_desired, v_in_rect, v_out_now,
+                                i_start_val, l, t_sw, oc,
+                            );
+                            i_ref_amps = i_ref as f32;
+
+                            pcmc_comparator(i_ref, i_start_val, oc, v_in_rect, l, t_sw)
                         }
+                        PfcControlMode::CrCm => unreachable!(),
+                    };
+                    if ac_idx == 0 { primary_i_ref = i_ref_amps; }
 
-                        // Feedback: average of all phases' currents (per-phase value)
-                        i_avg_prev = phase_results.iter()
-                            .map(|r| r.i_l_avg as f32)
-                            .sum::<f32>() / num_phases as f32;
+                    // Zero-crossing blanking for sync mode
+                    let blanking = effective_conduction == CurrentConduction::Synchronous
+                        && full_control::pfc_runtime::zc_blanking_active(v_in_rect, p.v_out, 0.05);
+                    if blanking {
+                        for sim in sims.iter_mut() {
+                            sim.current_conduction = CurrentConduction::Diode;
+                        }
+                    }
 
-                        points.push(build_point(
-                            &sims, &phase_results, t, v_in_rect, theta, i_ref_amps, t_sw,
-                        ));
+                    let phase_results = tick_multi_pfc(sims, v_in_rect, duty, seg_i_load / ac_phases as f64);
 
-                        t += t_sw;
+                    if blanking {
+                        for sim in sims.iter_mut() {
+                            sim.current_conduction = effective_conduction;
+                        }
+                    }
+
+                    i_avg_prev[ac_idx] = phase_results.iter()
+                        .map(|r| r.i_l_avg as f32)
+                        .sum::<f32>() / num_phases as f32;
+
+                    for r in &phase_results {
+                        all_i_avg_total += r.i_l_avg as f32;
+                        all_phase_points.push(PfcPhasePoint {
+                            i_l_start: r.i_l_start as f32,
+                            i_l_peak: r.i_l_peak as f32,
+                            i_l_end: r.i_l_end as f32,
+                            duty: r.duty as f32,
+                            dcm: r.dcm,
+                            t_conduct_frac: r.t_conduct_frac as f32,
+                        });
                     }
                 }
             }
-            global_half_cycle += 1;
         }
+
+        // Synchronize v_cap across all AC phases (shared DC bus)
+        if ac_phases > 1 {
+            let v_out_final = sims_per_ac.last().unwrap().last().unwrap().v_cap;
+            for ac_sims in &mut sims_per_ac {
+                for sim in ac_sims.iter_mut() {
+                    sim.v_cap = v_out_final;
+                }
+            }
+        }
+
+        // For single AC phase, compute interleaved envelope; for multi-AC,
+        // just use total avg (phases have different v_in so envelope isn't meaningful).
+        let (i_total_min, i_total_max) = if ac_phases == 1 {
+            pfc_interleaved_envelope(&all_phase_points, actual_t_sw_out as f32)
+        } else {
+            (0.0, all_i_avg_total) // placeholder for 3-phase
+        };
+
+        points.push(PfcSimPoint {
+            t_us: (t * 1e6) as f32,
+            v_in_rect: primary_v_in_rect as f32,
+            v_out: sims_per_ac[0][0].v_out() as f32,
+            i_ref: primary_i_ref,
+            line_phase: line_phase as f32,
+            phases: all_phase_points,
+            i_total_min,
+            i_total_max,
+            i_total_avg: all_i_avg_total,
+            t_sw_us: (actual_t_sw_out * 1e6) as f32,
+        });
+
+        t += if p.control_mode == PfcControlMode::CrCm {
+            actual_t_sw_out.max(t_sw * 0.01)
+        } else {
+            t_sw
+        };
     }
 
     // ── Compute metrics from last full line cycle ─────────────
-    let metrics = compute_metrics(&points, cycles_per_half, p);
+    let metrics = compute_metrics(&points, 0, p);
 
     Ok((points, metrics, design.summary))
 }
@@ -684,8 +729,8 @@ fn compute_metrics(
     let dcr = p.dcr_mohm * 1e-3;
     let r_esr = p.r_esr_mohm * 1e-3;
     let effective_v_diode = match p.topology {
-        PfcTopology::BridgedBoost => p.v_diode,
-        PfcTopology::TotemPole => 0.0,
+        PfcTopology::BridgedBoost | PfcTopology::Vienna => p.v_diode,
+        PfcTopology::TotemPole | PfcTopology::ActiveBridge => 0.0,
     };
     let mut loss_fet_energy = 0.0_f64;
     let mut loss_diode_energy = 0.0_f64;
@@ -694,20 +739,49 @@ fn compute_metrics(
 
     for pt in last_cycle {
         let dt = pt.t_sw_us as f64 * 1e-6;
-        let i_in = pt.i_total_avg as f64;
         let v_in = pt.v_in_rect as f64;
         let t_abs = pt.t_us as f64 * 1e-6;
-
-        // Sign: use line phase for correct half-cycle identification
         let line_phase = 2.0 * PI * p.f_line_hz * t_abs;
-        let sign = if line_phase.sin() >= 0.0 { 1.0 } else { -1.0 };
-        let i_in_signed = i_in * sign;
+
+        // Extract per-AC-phase current for THD/PF.
+        // For 3-phase: use phase A only (balanced system — all phases identical).
+        // For single-phase: sum of all interleaved stages (existing behaviour).
+        let (i_in, i_in_signed) = if p.ac_phases >= 3 && !pt.phases.is_empty() {
+            let num_stages = p.num_phases.max(1);
+            let n = num_stages.min(pt.phases.len());
+            // Phase A current = sum of its interleaved stages.
+            // Use triangular average: on-ramp (start→peak) + off-ramp (peak→end),
+            // accounting for DCM (t_conduct_frac < 1 means zero-current tail).
+            let i_a: f64 = pt.phases[0..n]
+                .iter()
+                .map(|ph| {
+                    let d = ph.duty as f64;
+                    let cf = ph.t_conduct_frac as f64;
+                    (ph.i_l_start as f64 + ph.i_l_peak as f64) / 2.0 * d
+                        + (ph.i_l_peak as f64 + ph.i_l_end as f64) / 2.0
+                            * (1.0 - d) * cf
+                })
+                .sum();
+
+            if p.topology == PfcTopology::ActiveBridge {
+                // Active bridge stores signed currents (bidirectional)
+                (i_a.abs(), i_a)
+            } else {
+                // Vienna / independent: currents are rectified (≥ 0)
+                let sign = if line_phase.sin() >= 0.0 { 1.0 } else { -1.0 };
+                (i_a, i_a * sign)
+            }
+        } else {
+            let i_in = pt.i_total_avg as f64;
+            let sign = if line_phase.sin() >= 0.0 { 1.0 } else { -1.0 };
+            (i_in, i_in * sign)
+        };
 
         i_rms_sq += i_in * i_in * dt;
         p_in += v_in * i_in * dt;
 
         // DFT: use actual time for phase
-        let phase = 2.0 * PI * p.f_line_hz * t_abs;
+        let phase = line_phase;
         for k in 1..=max_harmonic {
             cos_coeffs[k] += i_in_signed * (k as f64 * phase).cos() * dt;
             sin_coeffs[k] += i_in_signed * (k as f64 * phase).sin() * dt;
@@ -735,7 +809,7 @@ fn compute_metrics(
             let i_sq_off = (i_peak * i_peak + i_peak * i_off_end + i_off_end * i_off_end) / 3.0;
             loss_dcr_energy += dcr * (i_sq_on * t_on + i_sq_off * t_conduct);
 
-            let i_load_phase = p.p_load_w() / p.v_out / p.num_phases.max(1) as f64;
+            let i_load_phase = p.p_load_w() / p.v_out / (p.ac_phases.max(1) * p.num_phases.max(1)) as f64;
             let i_cap_on = i_load_phase;
             let i_cap_off = (i_avg_off - i_load_phase).abs();
             loss_esr_energy += r_esr * (i_cap_on * i_cap_on * t_on + i_cap_off * i_cap_off * t_conduct);
@@ -809,6 +883,381 @@ fn compute_metrics(
         p_loss_esr_w: p_loss_esr,
         p_loss_total_w: p_loss_total,
     }
+}
+
+// ── Active bridge (6-switch VSR) simulation with d-q control ────────────────
+
+fn run_active_bridge_simulation(
+    p: &PfcSimParams,
+) -> Result<(Vec<PfcSimPoint>, PfcMetrics, PfcDesignSummary), String> {
+    if p.ac_phases < 3 {
+        return Err("Active bridge requires 3-phase AC input".into());
+    }
+    if p.v_in_rms <= 0.0 {
+        return Err("V_in RMS must be positive".into());
+    }
+    if p.p_loads_w.is_empty() || p.p_loads_w[0] <= 0.0 {
+        return Err("Load power must be positive".into());
+    }
+
+    let v_in_pk = p.v_in_rms * 2.0_f64.sqrt();
+    let f_sw = p.f_sw_khz * 1e3;
+    let t_sw = 1.0 / f_sw;
+    let l = p.l_uh * 1e-6;
+    let c_out = p.c_out_uf * 1e-6;
+    let r_series = (p.dcr_mohm + p.rds_on_mohm) * 1e-3;
+    let t_half = 1.0 / (2.0 * p.f_line_hz);
+
+    // ── Power stage ──────────────────────────────────────────
+    let ac = AcSource::three_phase(p.v_in_rms, p.f_line_hz);
+    let mut bridge = ActiveBridgeSim::new(
+        l,
+        c_out,
+        p.r_esr_mohm * 1e-3,
+        r_series,
+        f_sw,
+        p.v_out,
+    );
+
+    // ── PLL ──────────────────────────────────────────────────
+    let tau = std::f64::consts::TAU;
+    let omega_n_pll = tau * 30.0;
+    let zeta = 0.707;
+    let kp_pll = 2.0 * zeta * omega_n_pll / v_in_pk;
+    let ki_pll = omega_n_pll * omega_n_pll / v_in_pk;
+    let pll = SrfPll::<f64>::new(p.f_line_hz, kp_pll, ki_pll, 5.0);
+
+    // ── d-q current controller ───────────────────────────────
+    let omega_bw = tau * p.current_crossover_khz * 1e3;
+    let kp_i = l * omega_bw;
+    let ki_i = r_series * omega_bw;
+    let mut dq_ctrl =
+        DqCurrentController::new(pll, kp_i, ki_i, p.v_out * 2.0).with_decoupling(l);
+
+    // ── Voltage loop (simple PI) ─────────────────────────────
+    let omega_v = tau * p.voltage_crossover_hz;
+    let kp_v = c_out * omega_v;
+    let ki_v = c_out * omega_v * omega_v / 2.0;
+    let mut v_integrator = 0.0_f64;
+    let i_d_max = p.p_load_w() * 4.0 / (3.0 * p.v_in_rms); // generous clamp
+
+    // ── Schedule ─────────────────────────────────────────────
+    let p_load_nom = p.p_load_w();
+    let i_load_nom = p_load_nom / p.v_out;
+    let mut schedule: Vec<(f64, f64)> = Vec::new();
+    let mut seg_end = 0.0;
+    let t_soft_start = SOFT_START_HALF_CYCLES as f64 * t_half;
+    seg_end += t_soft_start;
+    schedule.push((seg_end, p_load_nom));
+    seg_end += p.steady_half_cycles as f64 * t_half;
+    schedule.push((seg_end, p_load_nom));
+    for &p_step in p.p_loads_w.iter().skip(1) {
+        seg_end += p.step_half_cycles as f64 * t_half;
+        schedule.push((seg_end, p_step));
+    }
+    let total_time = seg_end;
+
+    // ── Simulation loop ──────────────────────────────────────
+    let mut points = Vec::new();
+    let mut t = 0.0_f64;
+
+    while t < total_time {
+        let seg_i_load = schedule
+            .iter()
+            .find(|(end, _)| t < *end)
+            .map(|(_, pw)| pw / p.v_out)
+            .unwrap_or(i_load_nom);
+
+        let ss_frac = if t < t_soft_start {
+            let completed_halves = (t / t_half).floor();
+            ((completed_halves + 1.0) / SOFT_START_HALF_CYCLES as f64).min(1.0)
+        } else {
+            1.0
+        };
+
+        let v_target = p.v_out * ss_frac;
+        let v_dc = bridge.v_dc();
+        let v_abc = ac.v_abc(t);
+
+        // PI voltage loop → i_d_ref
+        let v_error = v_target - v_dc;
+        v_integrator += ki_v * v_error * t_sw;
+        v_integrator = v_integrator.clamp(-i_d_max, i_d_max);
+        let i_d_ref = (kp_v * v_error + v_integrator).clamp(0.0, i_d_max);
+
+        // d-q controller
+        let dq_out = dq_ctrl.update(
+            v_abc[0], v_abc[1], v_abc[2],
+            bridge.i_l[0], bridge.i_l[1], bridge.i_l[2],
+            i_d_ref, 0.0, // i_q_ref = 0 for unity PF
+            v_dc, t_sw,
+        );
+
+        // Tick power stage
+        let result = bridge.tick(
+            [v_abc[0], v_abc[1], v_abc[2]],
+            [dq_out.duty_a, dq_out.duty_b, dq_out.duty_c],
+            seg_i_load,
+        );
+
+        // Record point (map to PfcSimPoint format)
+        let line_phase = 2.0 * PI * p.f_line_hz * t;
+        let mut phase_points = Vec::with_capacity(3);
+        let mut i_total_avg = 0.0_f32;
+        for pr in &result.phases {
+            i_total_avg += pr.i_avg.abs() as f32;
+            phase_points.push(PfcPhasePoint {
+                i_l_start: pr.i_start as f32,
+                i_l_peak: pr.i_start.max(pr.i_end) as f32,
+                i_l_end: pr.i_end as f32,
+                duty: pr.duty as f32,
+                dcm: false,
+                t_conduct_frac: 1.0,
+            });
+        }
+
+        points.push(PfcSimPoint {
+            t_us: (t * 1e6) as f32,
+            v_in_rect: v_abc[0].abs() as f32,
+            v_out: result.v_dc as f32,
+            i_ref: i_d_ref as f32,
+            line_phase: line_phase as f32,
+            phases: phase_points,
+            i_total_min: 0.0,
+            i_total_max: i_total_avg,
+            i_total_avg,
+            t_sw_us: (t_sw * 1e6) as f32,
+        });
+
+        t += t_sw;
+    }
+
+    let metrics = compute_metrics(&points, 0, p);
+
+    // Dummy design summary (active bridge uses PI, not 2P2Z)
+    let tau = std::f64::consts::TAU;
+    let dummy_design = PfcDesignSummary {
+        inner_plant_gain: 0.0,
+        r_sense: 0.0,
+        inner_omega_cp0: 0.0,
+        inner_omega_cz1: 0.0,
+        inner_omega_cp1: 0.0,
+        inner_omega_x: tau * p.current_crossover_khz * 1e3,
+        inner_phase_margin: 60.0_f64.to_radians(),
+        outer_plant_gain: 0.0,
+        c_out: p.c_out_uf * 1e-6,
+        r_esr_out: p.r_esr_mohm * 1e-3,
+        outer_omega_cp0: 0.0,
+        outer_omega_cz1: 0.0,
+        outer_omega_cp1: 0.0,
+        outer_omega_x: tau * p.voltage_crossover_hz,
+        outer_phase_margin: 60.0_f64.to_radians(),
+        f_sw: p.f_sw_khz * 1e3,
+        f_line: p.f_line_hz,
+    };
+
+    Ok((points, metrics, dummy_design))
+}
+
+// ── Vienna rectifier simulation ────────────────────────────────────────────
+
+fn run_vienna_simulation(
+    p: &PfcSimParams,
+) -> Result<(Vec<PfcSimPoint>, PfcMetrics, PfcDesignSummary), String> {
+    if p.ac_phases < 3 {
+        return Err("Vienna rectifier requires 3-phase AC input".into());
+    }
+    if p.v_in_rms <= 0.0 {
+        return Err("V_in RMS must be positive".into());
+    }
+    let v_in_pk = p.v_in_rms * 2.0_f64.sqrt();
+    if v_in_pk >= p.v_out / 2.0 {
+        return Err(format!(
+            "V_in peak ({v_in_pk:.0}V) must be < V_out/2 ({:.0}V) for Vienna",
+            p.v_out / 2.0
+        ));
+    }
+    if p.p_loads_w.is_empty() || p.p_loads_w[0] <= 0.0 {
+        return Err("Load power must be positive".into());
+    }
+
+    let f_sw = p.f_sw_khz * 1e3;
+    let t_sw = 1.0 / f_sw;
+    let l = p.l_uh * 1e-6;
+    let r_series = (p.dcr_mohm + p.rds_on_mohm) * 1e-3;
+    let r_sense = p.r_sense_mohm * 1e-3;
+    let t_half = 1.0 / (2.0 * p.f_line_hz);
+
+    // ── Design compensator for V_out/2 (per-phase boost target) ──
+    let vienna_pfc_params = PfcParameters {
+        v_out: p.v_out / 2.0, // Each phase boosts to V_dc/2
+        v_in_rms: p.v_in_rms,
+        f_line: p.f_line_hz,
+        f_sw,
+        l_boost: l,
+        c_out: p.c_out_uf * 1e-6,
+        r_esr_out: p.r_esr_mohm * 1e-3,
+        p_rated: p.p_load_w() / 3.0, // per phase
+        r_sense,
+        current_crossover_hz: p.current_crossover_khz * 1e3,
+        voltage_crossover_hz: p.voltage_crossover_hz,
+        phase_margin_current: 60.0_f64.to_radians(),
+        phase_margin_voltage: 60.0_f64.to_radians(),
+    };
+    let design = vienna_pfc_params
+        .design()
+        .ok_or("Compensator design infeasible for Vienna topology")?;
+
+    // ── Power stage ──────────────────────────────────────────
+    let ac = AcSource::three_phase(p.v_in_rms, p.f_line_hz);
+    let mut vienna = ViennaRectifierSim::new(
+        l,
+        p.c_out_uf * 1e-6,
+        p.r_esr_mohm * 1e-3,
+        r_series,
+        p.v_diode,
+        f_sw,
+        p.v_out,
+    );
+
+    // ── Controllers (per-phase current + shared voltage) ─────
+    let mut current_ctrls: Vec<_> = (0..3)
+        .map(|_| design.inner.to_controller(0.0_f32, 0.95))
+        .collect();
+    let p_per_phase = p.p_load_w() / 3.0;
+    let i_max_ref = (p_per_phase / (p.v_in_rms * 0.5)) as f32;
+    let mut voltage_ctrl = design.outer.to_controller(0.0_f32, i_max_ref);
+
+    // Prime controllers
+    let k_init = (p.p_load_w() / 3.0 / p.v_out) / (1.0 - v_in_pk / (p.v_out / 2.0));
+    voltage_ctrl.prime(k_init as f32, 0.0);
+    let d_init = 1.0 - v_in_pk / (p.v_out / 2.0);
+    for ctrl in &mut current_ctrls {
+        ctrl.prime(d_init as f32, 0.0);
+    }
+
+    // ── Schedule ─────────────────────────────────────────────
+    let p_load_nom = p.p_load_w();
+    let i_load_nom = p_load_nom / p.v_out;
+    let mut schedule: Vec<(f64, f64)> = Vec::new();
+    let mut seg_end = 0.0;
+    let t_soft_start = SOFT_START_HALF_CYCLES as f64 * t_half;
+    seg_end += t_soft_start;
+    schedule.push((seg_end, p_load_nom));
+    seg_end += p.steady_half_cycles as f64 * t_half;
+    schedule.push((seg_end, p_load_nom));
+    for &p_step in p.p_loads_w.iter().skip(1) {
+        seg_end += p.step_half_cycles as f64 * t_half;
+        schedule.push((seg_end, p_step));
+    }
+    let total_time = seg_end;
+
+    let mut t = 0.0_f64;
+    let mut points = Vec::new();
+    let mut i_avg_prev = [k_init as f32 * 0.637; 3];
+    #[allow(unused_assignments)]
+    let mut k = k_init as f32;
+
+    while t < total_time {
+        let seg_i_load = schedule
+            .iter()
+            .find(|(end, _)| t < *end)
+            .map(|(_, pw)| pw / p.v_out)
+            .unwrap_or(i_load_nom);
+
+        let ss_frac = if t < t_soft_start {
+            let completed_halves = (t / t_half).floor();
+            ((completed_halves + 1.0) / SOFT_START_HALF_CYCLES as f64).min(1.0)
+        } else {
+            1.0
+        };
+
+        let v_target = p.v_out * ss_frac;
+        let v_dc = vienna.v_dc();
+        let v_abc = ac.v_abc(t);
+
+        // Voltage loop (compare against full V_dc, not V_dc/2)
+        let v_error = (v_target - v_dc) as f32;
+        k = voltage_ctrl.update(v_error).max(0.0);
+
+        // Per-phase control → duties
+        let mut duties = [0.0_f64; 3];
+        let mut phase_points = Vec::with_capacity(3);
+        let mut primary_v_in_rect = 0.0_f64;
+        let mut primary_i_ref = 0.0_f32;
+
+        for phase in 0..3_usize {
+            let v_in_rect = v_abc[phase].abs();
+            let sin_theta = v_in_rect / v_in_pk;
+            if phase == 0 {
+                primary_v_in_rect = v_in_rect;
+            }
+
+            let i_ref_per_phase = k * sin_theta as f32;
+            if phase == 0 {
+                primary_i_ref = i_ref_per_phase;
+            }
+
+            let duty = match p.control_mode {
+                PfcControlMode::Acm => {
+                    let i_error = (i_ref_per_phase - i_avg_prev[phase]) * r_sense as f32;
+                    current_ctrls[phase].update(i_error) as f64
+                }
+                PfcControlMode::Pcmc => {
+                    use full_control::pfc_runtime::{pcmc_comparator, pcmc_reference_corrected};
+                    let oc = p.slope_overcomp;
+                    let v_out_half = v_dc / 2.0;
+                    let i_start_val = vienna.i_l[phase];
+                    let i_avg_desired = (k as f64) * sin_theta;
+                    let i_ref = pcmc_reference_corrected(
+                        i_avg_desired, v_in_rect, v_out_half, i_start_val, l, t_sw, oc,
+                    );
+                    pcmc_comparator(i_ref, i_start_val, oc, v_in_rect, l, t_sw)
+                }
+                PfcControlMode::CrCm => {
+                    // CrCM not supported for Vienna — use fixed duty approximation
+                    (1.0 - v_in_rect / (v_dc / 2.0)).clamp(0.0, 0.95)
+                }
+            };
+            duties[phase] = duty;
+        }
+
+        // Tick Vienna (all 3 phases at once)
+        let result = vienna.tick(v_abc, duties, seg_i_load);
+
+        for (phase, r) in result.phases.iter().enumerate() {
+            i_avg_prev[phase] = r.i_l_avg as f32;
+            phase_points.push(PfcPhasePoint {
+                i_l_start: r.i_l_start as f32,
+                i_l_peak: r.i_l_peak as f32,
+                i_l_end: r.i_l_end as f32,
+                duty: r.duty as f32,
+                dcm: r.dcm,
+                t_conduct_frac: r.t_conduct_frac as f32,
+            });
+        }
+
+        let i_total_avg: f32 = result.phases.iter().map(|r| r.i_l_avg as f32).sum();
+        let line_phase = 2.0 * PI * p.f_line_hz * t;
+
+        points.push(PfcSimPoint {
+            t_us: (t * 1e6) as f32,
+            v_in_rect: primary_v_in_rect as f32,
+            v_out: result.v_dc() as f32,
+            i_ref: primary_i_ref,
+            line_phase: line_phase as f32,
+            phases: phase_points,
+            i_total_min: 0.0,
+            i_total_max: i_total_avg,
+            i_total_avg,
+            t_sw_us: (t_sw * 1e6) as f32,
+        });
+
+        t += t_sw;
+    }
+
+    let metrics = compute_metrics(&points, 0, p);
+    Ok((points, metrics, design.summary))
 }
 
 #[cfg(test)]
@@ -1324,5 +1773,208 @@ mod tests {
         assert!(m.v_out_avg > 300.0,
             "Totem-pole PCMC v_out: {:.1}V", m.v_out_avg);
         assert!(m.p_loss_diode_w < 0.01);
+    }
+
+    // ── Three-phase AC tests ─────────────────────────────────
+
+    #[test]
+    fn three_phase_ac_runs_and_settles() {
+        let p = PfcSimParams {
+            ac_phases: 3,
+            steady_half_cycles: 36,
+            ..Default::default()
+        };
+        let (points, metrics, _) = run_pfc_simulation(&p).unwrap();
+        assert!(!points.is_empty());
+        let v_err = (metrics.v_out_avg - p.v_out).abs();
+        assert!(
+            v_err < p.v_out * 0.1,
+            "3-phase v_out_avg = {:.1}, target = {:.1}", metrics.v_out_avg, p.v_out
+        );
+    }
+
+    #[test]
+    fn three_phase_ac_pcmc() {
+        let m = settled_metrics(&PfcSimParams {
+            ac_phases: 3,
+            control_mode: PfcControlMode::Pcmc,
+            ..Default::default()
+        });
+        assert!(m.v_out_avg > 300.0,
+            "3-phase PCMC v_out: {:.1}V", m.v_out_avg);
+    }
+
+    #[test]
+    fn three_phase_ac_crm() {
+        let m = settled_metrics(&PfcSimParams {
+            ac_phases: 3,
+            control_mode: PfcControlMode::CrCm,
+            steady_half_cycles: 20,
+            ..Default::default()
+        });
+        assert!(m.v_out_avg > 300.0,
+            "3-phase CrCM v_out: {:.1}V", m.v_out_avg);
+    }
+
+    #[test]
+    fn active_bridge_runs_and_settles() {
+        let p = PfcSimParams {
+            topology: PfcTopology::ActiveBridge,
+            ac_phases: 3,
+            v_out: 700.0,
+            f_sw_khz: 20.0,
+            l_uh: 1000.0,     // 1mH
+            c_out_uf: 470.0,
+            r_esr_mohm: 50.0,
+            dcr_mohm: 50.0,
+            rds_on_mohm: 50.0,
+            current_crossover_khz: 1.0,
+            voltage_crossover_hz: 5.0,
+            steady_half_cycles: 20,
+            ..Default::default()
+        };
+        let (points, metrics, _) = run_pfc_simulation(&p).unwrap();
+        assert!(!points.is_empty(), "active bridge produced no points");
+        assert!(
+            metrics.v_out_avg > 500.0,
+            "active bridge v_out = {:.1}V, expected > 500V",
+            metrics.v_out_avg
+        );
+    }
+
+    #[test]
+    fn active_bridge_rejects_single_phase() {
+        let p = PfcSimParams {
+            topology: PfcTopology::ActiveBridge,
+            ac_phases: 1,
+            ..Default::default()
+        };
+        assert!(run_pfc_simulation(&p).is_err());
+    }
+
+    #[test]
+    fn vienna_runs_and_settles() {
+        let p = PfcSimParams {
+            topology: PfcTopology::Vienna,
+            ac_phases: 3,
+            v_out: 800.0,
+            steady_half_cycles: 20,
+            ..Default::default()
+        };
+        let (points, metrics, _) = run_pfc_simulation(&p).unwrap();
+        assert!(!points.is_empty(), "vienna produced no points");
+        assert!(
+            metrics.v_out_avg > 500.0,
+            "vienna v_out = {:.1}V, expected > 500V",
+            metrics.v_out_avg
+        );
+    }
+
+    #[test]
+    fn vienna_rejects_single_phase() {
+        let p = PfcSimParams {
+            topology: PfcTopology::Vienna,
+            ac_phases: 1,
+            ..Default::default()
+        };
+        assert!(run_pfc_simulation(&p).is_err());
+    }
+
+    #[test]
+    fn thd_sanity_all_topologies() {
+        // Single-phase BridgedBoost (ACM) — baseline
+        let m_bb = settled_metrics(&PfcSimParams::default());
+        eprintln!("BridgedBoost ACM:  THD={:.2}%  PF={:.4}  Vout={:.1}V  eff={:.1}%",
+            m_bb.thd_pct, m_bb.power_factor, m_bb.v_out_avg, m_bb.efficiency_pct);
+
+        // Single-phase TotemPole (ACM) — needs higher power to stay in CCM
+        // (at 300W/500µH the current reverses in DCM via sync FETs → huge ZC distortion)
+        let m_tp = settled_metrics(&PfcSimParams {
+            topology: PfcTopology::TotemPole,
+            current_conduction: CurrentConduction::Synchronous,
+            p_loads_w: vec![1000.0],
+            c_out_uf: 470.0,
+            ..Default::default()
+        });
+        eprintln!("TotemPole ACM 1kW: THD={:.2}%  PF={:.4}  Vout={:.1}V  eff={:.1}%",
+            m_tp.thd_pct, m_tp.power_factor, m_tp.v_out_avg, m_tp.efficiency_pct);
+
+        // Vienna (3-phase, ACM)
+        let m_vi = settled_metrics(&PfcSimParams {
+            topology: PfcTopology::Vienna,
+            ac_phases: 3,
+            v_out: 800.0,
+            steady_half_cycles: 60,
+            ..Default::default()
+        });
+        eprintln!("Vienna ACM:        THD={:.2}%  PF={:.4}  Vout={:.1}V  eff={:.1}%",
+            m_vi.thd_pct, m_vi.power_factor, m_vi.v_out_avg, m_vi.efficiency_pct);
+
+        // ActiveBridge (3-phase, d-q)
+        let m_ab = settled_metrics(&PfcSimParams {
+            topology: PfcTopology::ActiveBridge,
+            ac_phases: 3,
+            v_out: 700.0,
+            f_sw_khz: 20.0,
+            l_uh: 1000.0,
+            c_out_uf: 470.0,
+            r_esr_mohm: 50.0,
+            dcr_mohm: 50.0,
+            rds_on_mohm: 50.0,
+            current_crossover_khz: 1.0,
+            voltage_crossover_hz: 5.0,
+            steady_half_cycles: 60,
+            ..Default::default()
+        });
+        eprintln!("ActiveBridge d-q:  THD={:.2}%  PF={:.4}  Vout={:.1}V  eff={:.1}%",
+            m_ab.thd_pct, m_ab.power_factor, m_ab.v_out_avg, m_ab.efficiency_pct);
+
+        // Assertions
+        assert!(m_bb.thd_pct < 10.0, "BridgedBoost THD={:.1}%", m_bb.thd_pct);
+        assert!(m_bb.power_factor > 0.95, "BridgedBoost PF={:.4}", m_bb.power_factor);
+
+        assert!(m_tp.thd_pct < 10.0, "TotemPole THD={:.1}%", m_tp.thd_pct);
+        assert!(m_tp.power_factor > 0.95, "TotemPole PF={:.4}", m_tp.power_factor);
+
+        assert!(m_vi.thd_pct < 15.0, "Vienna THD={:.1}%", m_vi.thd_pct);
+        assert!(m_vi.power_factor > 0.90, "Vienna PF={:.4}", m_vi.power_factor);
+
+        assert!(m_ab.thd_pct < 15.0, "ActiveBridge THD={:.1}%", m_ab.thd_pct);
+        assert!(m_ab.power_factor > 0.90, "ActiveBridge PF={:.4}", m_ab.power_factor);
+
+        // ── PCMC mode ──
+        let m_pcmc = settled_metrics(&PfcSimParams {
+            control_mode: PfcControlMode::Pcmc,
+            steady_half_cycles: 80,
+            ..Default::default()
+        });
+        eprintln!("BridgedBoost PCMC: THD={:.2}%  PF={:.4}  Vout={:.1}V  eff={:.1}%",
+            m_pcmc.thd_pct, m_pcmc.power_factor, m_pcmc.v_out_avg, m_pcmc.efficiency_pct);
+        assert!(m_pcmc.thd_pct < 20.0, "PCMC THD={:.1}%", m_pcmc.thd_pct);
+        assert!(m_pcmc.power_factor > 0.90, "PCMC PF={:.4}", m_pcmc.power_factor);
+
+        // ── CrCM mode ──
+        let m_crcm = settled_metrics(&PfcSimParams {
+            control_mode: PfcControlMode::CrCm,
+            ..Default::default()
+        });
+        eprintln!("BridgedBoost CrCM: THD={:.2}%  PF={:.4}  Vout={:.1}V  eff={:.1}%",
+            m_crcm.thd_pct, m_crcm.power_factor, m_crcm.v_out_avg, m_crcm.efficiency_pct);
+        assert!(m_crcm.thd_pct.is_finite(), "CrCM THD not finite");
+        assert!(m_crcm.power_factor > 0.80, "CrCM PF={:.4}", m_crcm.power_factor);
+
+        // ── Vienna PCMC ──
+        let m_vi_pcmc = settled_metrics(&PfcSimParams {
+            topology: PfcTopology::Vienna,
+            ac_phases: 3,
+            v_out: 800.0,
+            control_mode: PfcControlMode::Pcmc,
+            steady_half_cycles: 80,
+            ..Default::default()
+        });
+        eprintln!("Vienna PCMC:       THD={:.2}%  PF={:.4}  Vout={:.1}V  eff={:.1}%",
+            m_vi_pcmc.thd_pct, m_vi_pcmc.power_factor, m_vi_pcmc.v_out_avg, m_vi_pcmc.efficiency_pct);
+        assert!(m_vi_pcmc.thd_pct < 20.0, "Vienna PCMC THD={:.1}%", m_vi_pcmc.thd_pct);
+        assert!(m_vi_pcmc.power_factor > 0.90, "Vienna PCMC PF={:.4}", m_vi_pcmc.power_factor);
     }
 }
