@@ -1,6 +1,6 @@
 use core::{
     f64::consts::PI,
-    ops::{Add, Mul},
+    ops::{Add, Div, Mul, Neg, Sub},
 };
 
 #[cfg(feature = "defmt")]
@@ -9,12 +9,19 @@ use defmt::println;
 use crate::math::{atan, pow2, sqrt, tan};
 
 pub trait Scalar:
-    Sized + Copy + PartialOrd + Add<Self, Output = Self> + Mul<Self, Output = Self>
+    Sized
+    + Copy
+    + PartialOrd
+    + Add<Self, Output = Self>
+    + Sub<Self, Output = Self>
+    + Mul<Self, Output = Self>
+    + Div<Self, Output = Self>
+    + Neg<Output = Self>
 {
     const ZERO: Self;
     fn from_f32(f: f32) -> Self;
-
     fn clamp(self, min: Self, max: Self) -> Self;
+    fn sqrt(self) -> Self;
 }
 
 impl Scalar for f32 {
@@ -25,6 +32,26 @@ impl Scalar for f32 {
 
     fn clamp(self, min: Self, max: Self) -> Self {
         self.clamp(min, max)
+    }
+
+    fn sqrt(self) -> Self {
+        micromath::F32Ext::sqrt(self)
+    }
+}
+
+#[cfg(feature = "std")]
+impl Scalar for f64 {
+    const ZERO: Self = 0.0;
+    fn from_f32(f: f32) -> Self {
+        f as _
+    }
+
+    fn clamp(self, min: Self, max: Self) -> Self {
+        self.clamp(min, max)
+    }
+
+    fn sqrt(self) -> Self {
+        f64::sqrt(self)
     }
 }
 
@@ -38,6 +65,10 @@ macro_rules! impl_scalar {
 
             fn clamp(self, min: Self, max: Self) -> Self {
                 Ord::clamp(self, min, max)
+            }
+
+            fn sqrt(self) -> Self {
+                self.sqrt()
             }
         }
     )*};
@@ -849,7 +880,7 @@ impl TransferFunction {
     #[cfg(any(feature = "std", feature = "defmt"))]
     pub fn print_high_freq_transfer_func(&self) {
         let ohmega_n = self.ohmega_n();
-        let q_inv = self.q_inv;
+        let q_inv = 1.0_f64; // Q_c = 1 assumption
         // High frequency transfer function
         // let h_h = |s: Complex| 1.0 / (s * s / (ohmega_n * ohmega_n) + s * q_inv / ohmega_n + 1.0);
 

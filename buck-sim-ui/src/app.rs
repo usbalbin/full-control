@@ -4,7 +4,7 @@ use full_control::control_2p2z::Topology as ControlTopology;
 
 use crate::bode::{BodeData, NonIdealParams, show_bode};
 use crate::pfc_bode::{PfcBodeData, show_pfc_bode};
-use crate::pfc_sim::{PfcSimParams, PfcSimPoint, PfcMetrics, run_pfc_simulation, run_pfc_vin_sweep, SOFT_START_HALF_CYCLES};
+use crate::pfc_sim::{PfcSimParams, PfcSimPoint, PfcMetrics, PfcControlMode, PfcTopology, run_pfc_simulation, run_pfc_vin_sweep, SOFT_START_HALF_CYCLES};
 use crate::sim::{CapTypeUi, CurrentConduction, FetProfile, McuProfile, CsProfile, DacProfile, LossBreakdown, LoadKind, SimParams, SimPoint, build_ctrl_params_multi, compute_losses, computed_r_series_mohm, run_simulation, SOFT_START_CYCLES, STEADY_STATE_CYCLES, LOAD_STEP_CYCLES};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -134,6 +134,11 @@ struct PfcState {
     // Conduction mode
     current_conduction: CurrentConduction,
 
+    // Control mode and topology
+    control_mode: PfcControlMode,
+    topology: PfcTopology,
+    slope_overcomp: f64,
+
     // Cap bank (empty = scalar mode)
     output_caps: Vec<CapTypeUi>,
 
@@ -189,6 +194,9 @@ impl PfcState {
             step_half_cycles: p.step_half_cycles,
             num_phases: p.num_phases,
             current_conduction: p.current_conduction,
+            control_mode: p.control_mode,
+            topology: p.topology,
+            slope_overcomp: p.slope_overcomp,
             output_caps: p.output_caps.clone(),
             sim_data,
             metrics,
@@ -221,6 +229,9 @@ impl PfcState {
             step_half_cycles: self.step_half_cycles,
             num_phases: self.num_phases,
             current_conduction: self.current_conduction,
+            control_mode: self.control_mode,
+            topology: self.topology,
+            slope_overcomp: self.slope_overcomp,
             output_caps: self.output_caps.clone(),
         }
     }
@@ -228,13 +239,13 @@ impl PfcState {
     /// Reconstruct per-phase triangular inductor current waveform.
     fn pfc_phase_waveform(&self, data: &[PfcSimPoint], phase_idx: usize) -> Vec<[f64; 2]> {
         let n = self.num_phases.max(1);
-        // f_sw_khz is in kHz, so 1/f_sw_khz gives period in ms directly
-        let t_sw_ms = 1.0 / self.f_sw_khz;
-        let offset_ms = phase_idx as f64 * t_sw_ms / n as f64;
         let mut pts = Vec::with_capacity(data.len() * 4);
         for p in data {
             if phase_idx >= p.phases.len() { continue; }
             let ph = &p.phases[phase_idx];
+            // Use per-point t_sw_us (varies in CrCM) instead of global f_sw_khz
+            let t_sw_ms = p.t_sw_us as f64 / 1000.0;
+            let offset_ms = phase_idx as f64 * t_sw_ms / n as f64;
             let t0 = p.t_us as f64 / 1000.0 + offset_ms; // ms
             let t_on_ms = ph.duty as f64 * t_sw_ms;
             let t_off_ms = t_sw_ms - t_on_ms;
@@ -1436,6 +1447,28 @@ impl BuckSimApp {
         ui.separator();
 
         egui::ScrollArea::vertical().show(ui, |ui| {
+            // Control mode
+            ui.horizontal(|ui| {
+                ui.label("Control:");
+                ui.radio_value(&mut self.pfc.control_mode, PfcControlMode::Acm, "ACM")
+                    .on_hover_text("Average Current Mode — inner 2P2Z current loop + outer voltage loop");
+                ui.radio_value(&mut self.pfc.control_mode, PfcControlMode::CrCm, "CrCM")
+                    .on_hover_text("Critical Conduction Mode — variable frequency, voltage loop sets on-time. Natural PFC, ZVS capable.");
+                ui.radio_value(&mut self.pfc.control_mode, PfcControlMode::Pcmc, "PCMC")
+                    .on_hover_text("Peak Current Mode — fixed frequency, comparator + slope compensation. D>0.5 requires careful slope comp.");
+            });
+
+            // Topology
+            ui.horizontal(|ui| {
+                ui.label("Topology:");
+                ui.radio_value(&mut self.pfc.topology, PfcTopology::BridgedBoost, "Bridged")
+                    .on_hover_text("Diode bridge rectifier + boost stage");
+                ui.radio_value(&mut self.pfc.topology, PfcTopology::TotemPole, "Totem-pole")
+                    .on_hover_text("Bridgeless totem-pole — no bridge diode loss, inherently synchronous. Higher efficiency.");
+            });
+
+            ui.separator();
+
             ui.add(egui::Slider::new(&mut self.pfc.v_in_rms, 85.0..=265.0)
                 .text("V_in RMS [V]").step_by(1.0))
                 .on_hover_text("AC mains RMS voltage");
@@ -1514,19 +1547,23 @@ impl BuckSimApp {
             egui::CollapsingHeader::new("FET / Diode / Inductor")
                 .default_open(false)
                 .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label("Rectifier:");
-                        ui.radio_value(&mut self.pfc.current_conduction, CurrentConduction::Diode, "Diode")
-                            .on_hover_text("Standard boost diode — DCM at light load and zero crossings");
-                        ui.radio_value(&mut self.pfc.current_conduction, CurrentConduction::Synchronous, "Sync FET")
-                            .on_hover_text("Synchronous rectification (totem-pole PFC) — current can go negative");
-                    });
+                    if self.pfc.topology == PfcTopology::BridgedBoost {
+                        ui.horizontal(|ui| {
+                            ui.label("Rectifier:");
+                            ui.radio_value(&mut self.pfc.current_conduction, CurrentConduction::Diode, "Diode")
+                                .on_hover_text("Standard boost diode — DCM at light load and zero crossings");
+                            ui.radio_value(&mut self.pfc.current_conduction, CurrentConduction::Synchronous, "Sync FET")
+                                .on_hover_text("Synchronous rectification — current can go negative");
+                        });
+                        if self.pfc.current_conduction == CurrentConduction::Diode {
+                            ui.add(egui::Slider::new(&mut self.pfc.v_diode, 0.0..=2.0)
+                                .text("V_diode [V]").step_by(0.1));
+                        }
+                    } else {
+                        ui.label(egui::RichText::new("Totem-pole: sync FET, no bridge diode").small());
+                    }
                     ui.add(egui::Slider::new(&mut self.pfc.rds_on_mohm, 1.0..=500.0)
                         .text("Rds(on) [mΩ]").logarithmic(true));
-                    if self.pfc.current_conduction == CurrentConduction::Diode {
-                        ui.add(egui::Slider::new(&mut self.pfc.v_diode, 0.0..=2.0)
-                            .text("V_diode [V]").step_by(0.1));
-                    }
                     ui.add(egui::Slider::new(&mut self.pfc.dcr_mohm, 1.0..=200.0)
                         .text("DCR [mΩ]").logarithmic(true));
                     ui.add(egui::Slider::new(&mut self.pfc.r_sense_mohm, 1.0..=200.0)
@@ -1536,9 +1573,16 @@ impl BuckSimApp {
             egui::CollapsingHeader::new("Controller")
                 .default_open(true)
                 .show(ui, |ui| {
-                    ui.add(egui::Slider::new(&mut self.pfc.current_crossover_khz, 0.5..=50.0)
-                        .text("I-loop f_x [kHz]").logarithmic(true))
-                        .on_hover_text("Inner current loop crossover frequency");
+                    if self.pfc.control_mode == PfcControlMode::Acm {
+                        ui.add(egui::Slider::new(&mut self.pfc.current_crossover_khz, 0.5..=50.0)
+                            .text("I-loop f_x [kHz]").logarithmic(true))
+                            .on_hover_text("Inner current loop crossover frequency (ACM only)");
+                    }
+                    if self.pfc.control_mode == PfcControlMode::Pcmc {
+                        ui.add(egui::Slider::new(&mut self.pfc.slope_overcomp, 1.0..=5.0)
+                            .text("Slope overcomp").step_by(0.1))
+                            .on_hover_text("Slope compensation margin (1.0 = exact stability limit, 1.5 = 50% extra)");
+                    }
                     let max_v_xover = (self.pfc.f_line_hz / 3.0 - 0.1).max(1.0);
                     if self.pfc.voltage_crossover_hz > max_v_xover {
                         self.pfc.voltage_crossover_hz = max_v_xover;
@@ -1629,10 +1673,17 @@ impl BuckSimApp {
             self.pfc.last_params = params;
         }
 
+        // Redirect away from CurrentLoopBode if mode is not ACM
+        if self.pfc.tab == PfcTab::CurrentLoopBode && self.pfc.control_mode != PfcControlMode::Acm {
+            self.pfc.tab = PfcTab::Simulation;
+        }
+
         // Tab bar
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.pfc.tab, PfcTab::Simulation, "Simulation");
-            ui.selectable_value(&mut self.pfc.tab, PfcTab::CurrentLoopBode, "Current Loop");
+            if self.pfc.control_mode == PfcControlMode::Acm {
+                ui.selectable_value(&mut self.pfc.tab, PfcTab::CurrentLoopBode, "Current Loop");
+            }
             ui.selectable_value(&mut self.pfc.tab, PfcTab::VoltageLoopBode, "Voltage Loop");
             ui.selectable_value(&mut self.pfc.tab, PfcTab::Harmonics, "Harmonics");
             ui.selectable_value(&mut self.pfc.tab, PfcTab::VinSweep, "Vin Sweep");

@@ -5,6 +5,7 @@ pub mod control_pfc;
 pub mod fmac;
 pub(crate) mod math;
 pub mod buck_boost;
+pub mod pfc_runtime;
 
 #[cfg(test)]
 mod tests {
