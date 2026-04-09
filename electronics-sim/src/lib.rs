@@ -1,5 +1,6 @@
 pub mod cap_bank;
 pub mod math;
+pub mod pfc_boost;
 
 #[cfg(feature = "rerun")]
 use rerun::RecordingStream;

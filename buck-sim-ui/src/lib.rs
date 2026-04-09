@@ -1,5 +1,7 @@
 pub mod app;
 pub mod bode;
+pub mod pfc_bode;
+pub mod pfc_sim;
 pub mod sim;
 
 #[cfg(target_arch = "wasm32")]

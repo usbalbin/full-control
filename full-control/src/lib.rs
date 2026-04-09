@@ -1,6 +1,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 pub mod control_2p2z;
+pub mod control_pfc;
 pub mod fmac;
 pub(crate) mod math;
 pub mod buck_boost;
