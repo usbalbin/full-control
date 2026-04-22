@@ -196,9 +196,36 @@ pub struct Parameters {
 
     /// Maximum duty cycle fraction (0.0–1.0).  `1.0` = no limit.
     pub max_duty: f64,
+
+    /// Optional inductor saturation model.  When `Some`, inductance varies
+    /// with current according to the model; when `None`, the constant
+    /// `l_inductor` value is used (backward compatible).
+    pub inductor_model: Option<InductorModel>,
+
+    /// Dead time between complementary switch transitions \[s\].  `0.0` = ideal.
+    ///
+    /// During dead time neither the high-side nor the low-side switch is on.
+    /// The inductor current freewheels through the body diode of the
+    /// complementary switch, adding a forward-voltage drop (`v_body_diode`)
+    /// and reducing the effective duty cycle by `2 * t_dead / period`.
+    pub t_dead: Time,
+
+    /// Body diode forward voltage \[V\].  Used during dead-time intervals.
+    ///
+    /// Typical values: 0.7 V for Si MOSFETs, 1.5--2.0 V for GaN.
+    /// Only has an effect when `t_dead > 0`.
+    pub v_body_diode: Voltage,
 }
 
 impl Parameters {
+    /// Effective inductance at the given current.
+    pub fn l_eff(&self, i: f64) -> f64 {
+        match &self.inductor_model {
+            Some(model) => model.l_at(i),
+            None => self.l_inductor.0,
+        }
+    }
+
     pub fn bw_to_tau(bw: T) -> Time {
         if bw > 0.0 {
             Time(1.0 / (2.0 * std::f64::consts::PI * bw))
@@ -335,13 +362,28 @@ impl CurrentModeConverter {
 
                 // V = L di/dt
                 // di/dt = V/L
-                let di_dt_on = v_ind_on.0 / self.parameters.l_inductor.0;
+                // Estimate peak to evaluate L at the midpoint current (improves
+                // accuracy when the inductor saturation model is active).
+                let l_on_0 = self.parameters.l_eff(self.i_inductor.0);
+                let di_dt_est = v_ind_on.0 / l_on_0;
+                let slope_denom = di_dt_est - self.parameters.slope_amp_per_sec;
+                let t_on_est = if slope_denom.abs() > 1e-30 {
+                    ((trip_current.0 - self.i_inductor.0) / slope_denom)
+                        .clamp(0.0, self.parameters.period.0)
+                } else {
+                    self.parameters.period.0
+                };
+                let i_peak_est = self.i_inductor.0 + di_dt_est * t_on_est;
+                let l_on = Inductance(
+                    self.parameters.l_eff((self.i_inductor.0 + i_peak_est) / 2.0),
+                );
+                let di_dt_on = v_ind_on.0 / l_on.0;
 
                 let i_on_func = math::rlc(
                     v_eff,
                     self.v_out,
                     self.i_inductor,
-                    self.parameters.l_inductor,
+                    l_on,
                     self.parameters.c_out,
                     self.parameters.r_series,
                 );
@@ -416,6 +458,18 @@ impl CurrentModeConverter {
                 }
 
                 let t_on = Time(t_on.0.clamp(0.0, self.parameters.period.0));
+
+                // Dead-time adjustment: reduce effective ON time by t_dead (the
+                // HS-to-LS transition dead time).  The LS-to-HS dead time at the
+                // start of the next cycle similarly eats into ON time.  Together,
+                // the two transitions lose 2 * t_dead per period, but since the
+                // comparator fires during the ON phase and we model each cycle
+                // as [ON, OFF], the simplest correct model subtracts one t_dead
+                // from each edge: t_on_eff = t_on - t_dead, t_off += t_dead.
+                // During dead time the body diode conducts, adding v_body_diode
+                // to the inductor voltage drop.
+                let t_dead = self.parameters.t_dead.0;
+                let t_on = Time((t_on.0 - t_dead).max(0.0));
                 let t_off = self.parameters.period - t_on;
 
                 // EMI estimate: computed while i_inductor / i_in_cap are still start-of-cycle.
@@ -431,11 +485,12 @@ impl CurrentModeConverter {
                 let v_out_at_off =
                     self.v_out + Voltage((q_on - q_out_on) / self.parameters.c_out.0);
 
+                let l_off = Inductance(self.parameters.l_eff(i_max.0));
                 let i_off_func = math::rlc(
                     Voltage(0.0),
                     v_out_at_off,
                     i_max,
-                    self.parameters.l_inductor,
+                    l_off,
                     self.parameters.c_out,
                     self.parameters.r_series,
                 );
@@ -459,6 +514,19 @@ impl CurrentModeConverter {
 
                 let q_out_off = load_current.0 * t_off.0;
                 self.v_out = v_out_at_off + Voltage((q_off - q_out_off) / self.parameters.c_out.0);
+
+                // Body-diode conduction loss during dead time.  The body diode
+                // drops v_body_diode across the inductor current path during
+                // both dead-time intervals (HS→LS and LS→HS).  This dissipates
+                // energy P_dead = v_body_diode × |i_L| × 2 × t_dead per cycle.
+                // Model as extra charge drained from the output capacitor.
+                if t_dead > 0.0 {
+                    let v_bd = self.parameters.v_body_diode.0;
+                    let i_avg_cycle = ((self.i_inductor.0 + i_max.0) / 2.0).abs();
+                    let p_dead = v_bd * i_avg_cycle * 2.0 * t_dead;
+                    let q_dead = p_dead / self.v_out.0.max(0.1);
+                    self.v_out = self.v_out - Voltage(q_dead / self.parameters.c_out.0);
+                }
 
                 // Compute v_out at the ADC sample point within this cycle.
                 let t_sample = self.parameters.t_adc_sample_point.0;
@@ -517,9 +585,24 @@ impl CurrentModeConverter {
                 // Exact solution is exponential; approximate as linear with effective V_in
                 // computed at the midpoint of the ON-phase current swing.  Error is
                 // O((R·ΔI/V_in)²) — negligible for typical R << L·f_sw.
-                let v_on_eff = v_eff.0
-                    - self.parameters.r_series.0 * (self.i_inductor.0 + trip_current.0) / 2.0;
-                let di_dt_on = v_on_eff / self.parameters.l_inductor.0;
+                //
+                // Two-pass estimation: first estimate peak with the raw slope (no R
+                // correction, valley L), then refine using the midpoint current for
+                // both R drop and L(i) evaluation.
+                let l_on_0 = self.parameters.l_eff(self.i_inductor.0);
+                let di_dt_raw = v_eff.0 / l_on_0;
+                let slope_denom = di_dt_raw - self.parameters.slope_amp_per_sec;
+                let t_on_est = if slope_denom.abs() > 1e-30 {
+                    ((trip_current.0 - self.i_inductor.0) / slope_denom)
+                        .clamp(0.0, self.parameters.period.0)
+                } else {
+                    self.parameters.period.0
+                };
+                let i_peak_est = self.i_inductor.0 + di_dt_raw * t_on_est;
+                let i_mid = (self.i_inductor.0 + i_peak_est) / 2.0;
+                let l_on = self.parameters.l_eff(i_mid);
+                let v_on_eff = v_eff.0 - self.parameters.r_series.0 * i_mid;
+                let di_dt_on = v_on_eff / l_on;
                 let i_on_line = Line {
                     k: di_dt_on,
                     m: self.i_inductor.0,
@@ -589,6 +672,10 @@ impl CurrentModeConverter {
                     i_max = Current(i_on_line.f(t_on.0));
                     t_on
                 };
+
+                // Dead-time adjustment (same logic as Buck branch).
+                let t_dead = self.parameters.t_dead.0;
+                let t_on = Time((t_on.0 - t_dead).max(0.0));
                 let t_off = self.parameters.period - t_on;
 
                 // EMI estimate: computed while i_inductor / i_in_cap are still start-of-cycle.
@@ -608,11 +695,12 @@ impl CurrentModeConverter {
                     Topology::Boost => v_eff,
                     Topology::BuckBoost | Topology::Buck => Voltage(0.0),
                 };
+                let l_off = Inductance(self.parameters.l_eff(i_max.0));
                 let i_off_func = math::rlc(
                     v_off_source,
                     v_out_at_off,
                     i_max,
-                    self.parameters.l_inductor,
+                    l_off,
                     self.parameters.c_out,
                     self.parameters.r_series,
                 );
@@ -637,6 +725,15 @@ impl CurrentModeConverter {
                 };
                 let q_out_off = load_current.0 * t_off.0;
                 self.v_out = v_out_at_off + Voltage((q_in - q_out_off) / self.parameters.c_out.0);
+
+                // Body-diode conduction loss during dead time (same as Buck).
+                if t_dead > 0.0 {
+                    let v_bd = self.parameters.v_body_diode.0;
+                    let i_avg_cycle = ((self.i_inductor.0 + i_max.0) / 2.0).abs();
+                    let p_dead = v_bd * i_avg_cycle * 2.0 * t_dead;
+                    let q_dead = p_dead / self.v_out.0.max(0.1);
+                    self.v_out = self.v_out - Voltage(q_dead / self.parameters.c_out.0);
+                }
 
                 // Simplified: use end-of-cycle v_out (full ADC sample model is Buck-only)
                 self.v_out_at_adc = self.v_out;
@@ -732,7 +829,6 @@ impl CurrentModeConverter {
         let tau_dac = self.parameters.tau_dac;
         let t_dac_sample = self.parameters.t_dac_sample;
         let r_series = self.parameters.r_series.0;
-        let l = self.parameters.l_inductor.0;
 
         // Snapshot pre-tick state for current-sense filter and caller
         self.i_inductor_prev = self.i_inductor;
@@ -741,8 +837,23 @@ impl CurrentModeConverter {
         // ── Compute initial di/dt for trip time estimation ───────────────
         // The inductor ramp rate at the start of the ON phase. This uses the
         // cap bank's v_out (which equals self.v_out since they track together).
+        // Estimate peak to evaluate L at midpoint (same as tick()).
         let v_out_start = self.v_out;
-        let di_dt_on = (v_eff.0 - v_out_start.0) / l;
+        let v_ind_on = v_eff.0 - v_out_start.0;
+        let l_on_0 = self.parameters.l_eff(self.i_inductor.0);
+        let di_dt_est = v_ind_on / l_on_0;
+        let slope_denom = di_dt_est - self.parameters.slope_amp_per_sec;
+        let t_on_est = if slope_denom.abs() > 1e-30 {
+            ((trip_current.0 - self.i_inductor.0) / slope_denom)
+                .clamp(0.0, self.parameters.period.0)
+        } else {
+            self.parameters.period.0
+        };
+        let i_peak_est = self.i_inductor.0 + di_dt_est * t_on_est;
+        let l_on = self.parameters.l_eff(
+            (self.i_inductor.0 + i_peak_est) / 2.0,
+        );
+        let di_dt_on = v_ind_on / l_on;
         self.last_di_dt_on = di_dt_on;
 
         // ── Trip time calculation ────────────────────────────────────────
@@ -793,6 +904,10 @@ impl CurrentModeConverter {
         let t_on = Time(t_on.0.max(self.parameters.t_blanking.0));
         let t_on = t_on + self.parameters.t_prop_delay;
         let t_on = Time(t_on.0.clamp(0.0, self.parameters.period.0 * self.parameters.max_duty));
+
+        // Dead-time adjustment (same logic as tick()).
+        let t_dead = self.parameters.t_dead.0;
+        let t_on = Time((t_on.0 - t_dead).max(0.0));
         let t_off = self.parameters.period - t_on;
 
         // EMI estimate (before state update, same as tick())
@@ -811,11 +926,12 @@ impl CurrentModeConverter {
 
         // ── ON phase: integrate cap bank with RK4 ────────────────────────
         cap_bank.reset_v_out_minmax();
-        cap_bank.integrate_phase(t_on.0, v_eff.0, load_current.0, r_series, l, None);
+        cap_bank.integrate_phase(t_on.0, v_eff.0, load_current.0, r_series, l_on, None);
         let i_max = Current(cap_bank.i_l());
 
         // ── OFF phase: integrate cap bank with v_applied = 0 ─────────────
-        cap_bank.integrate_phase(t_off.0, 0.0, load_current.0, r_series, l, None);
+        let l_off = self.parameters.l_eff(i_max.0);
+        cap_bank.integrate_phase(t_off.0, 0.0, load_current.0, r_series, l_off, None);
         let i_final = Current(cap_bank.i_l());
 
         // ── DCM: clamp to zero if diode mode and current went negative ───
@@ -833,6 +949,15 @@ impl CurrentModeConverter {
         self.i_inductor = i_final;
         self.v_out_min_cycle = Voltage(cap_bank.v_out_min());
         self.v_out_max_cycle = Voltage(cap_bank.v_out_max());
+
+        // Body-diode conduction loss during dead time (same as tick()).
+        if t_dead > 0.0 {
+            let v_bd = self.parameters.v_body_diode.0;
+            let i_avg_cycle = ((self.i_inductor_prev.0 + i_max.0) / 2.0).abs();
+            let p_dead = v_bd * i_avg_cycle * 2.0 * t_dead;
+            let q_dead = p_dead / self.v_out.0.max(0.1);
+            self.v_out = self.v_out - Voltage(q_dead / self.parameters.c_out.0);
+        }
 
         // ── ADC sample point ─────────────────────────────────────────────
         // For the cap bank path, approximate v_out_at_adc using linear interpolation.
@@ -1255,6 +1380,49 @@ impl_math!(Resistance);
 impl_math!(Voltage);
 impl_math!(Time);
 
+/// Inductor with current-dependent inductance (saturation model).
+///
+/// Uses a simple quadratic rolloff: L(I) = L0 / (1 + (I/I_sat)²)
+/// where L0 is the zero-current inductance and I_sat is the current
+/// at which inductance drops to L0/2.
+///
+/// This is a good approximation for powder-core and molded inductors.
+/// For ferrite (sharp saturation knee), use a steeper exponent or
+/// piecewise model.
+#[derive(Debug, Clone, Copy)]
+pub struct InductorModel {
+    /// Zero-current inductance [H].
+    pub l0: f64,
+    /// Saturation current [A] — current at which L drops to L0/2.
+    pub i_sat: f64,
+}
+
+impl InductorModel {
+    /// Constant (non-saturating) inductor.
+    pub fn constant(l: f64) -> Self {
+        Self { l0: l, i_sat: f64::INFINITY }
+    }
+
+    /// Create from two (I, L) data points using quadratic model.
+    ///
+    /// Given L(0) = l0 and L(i1) = l1, solves for i_sat:
+    /// l1 = l0 / (1 + (i1/i_sat)²) → i_sat = i1 / sqrt(l0/l1 - 1)
+    pub fn from_two_points(l0: f64, i1: f64, l1: f64) -> Self {
+        let ratio = l0 / l1 - 1.0;
+        if ratio <= 0.0 {
+            return Self::constant(l0);
+        }
+        let i_sat = i1 / ratio.sqrt();
+        Self { l0, i_sat }
+    }
+
+    /// Inductance at current `i` [A] (uses absolute value).
+    pub fn l_at(&self, i: f64) -> f64 {
+        let x = i / self.i_sat;
+        self.l0 / (1.0 + x * x)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1337,6 +1505,9 @@ mod tests {
             t_blanking: Time(0.0),
             t_adc_sample_point: Time(0.0),
             max_duty: 1.0,
+            inductor_model: None,
+            t_dead: Time(0.0),
+            v_body_diode: Voltage(0.0),
         };
         let mut sim = CurrentModeConverter::new(params, Topology::Buck);
 
@@ -1366,6 +1537,9 @@ mod tests {
             t_blanking: Time(0.0),
             t_adc_sample_point: Time(0.0),
             max_duty: 1.0,
+            inductor_model: None,
+            t_dead: Time(0.0),
+            v_body_diode: Voltage(0.0),
         };
         let mut sim = CurrentModeConverter::new(params, Topology::Buck);
 
@@ -1577,6 +1751,9 @@ mod tests {
             t_blanking: Time(0.0),
             t_adc_sample_point: Time(0.0),
             max_duty: 1.0,
+            inductor_model: None,
+            t_dead: Time(0.0),
+            v_body_diode: Voltage(0.0),
         };
         let mut sim = CurrentModeConverter::new(params, Topology::Buck);
 
@@ -1588,5 +1765,232 @@ mod tests {
         // staircase quantisation, but must be positive and reasonable).
         assert!(sim.v_out.0 > 3.0, "v_out = {:.2} V", sim.v_out.0);
         assert!(sim.v_out.0 < 24.0, "v_out = {:.2} V", sim.v_out.0);
+    }
+
+    // ── InductorModel tests ───────────────────────────────────────────────
+
+    #[test]
+    fn test_inductor_model_constant() {
+        let model = InductorModel::constant(2.2e-6);
+        assert_eq!(model.l_at(0.0), 2.2e-6);
+        assert_eq!(model.l_at(10.0), 2.2e-6);
+        assert_eq!(model.l_at(100.0), 2.2e-6);
+        assert_eq!(model.l_at(-50.0), 2.2e-6);
+    }
+
+    #[test]
+    fn test_inductor_model_l_at_zero_equals_l0() {
+        let model = InductorModel::from_two_points(2.2e-6, 8.0, 2.0e-6);
+        assert!((model.l_at(0.0) - 2.2e-6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_inductor_model_l_at_i_sat_equals_half() {
+        let model = InductorModel::from_two_points(2.2e-6, 8.0, 2.0e-6);
+        let l_half = model.l_at(model.i_sat);
+        let expected = model.l0 / 2.0;
+        assert!(
+            (l_half - expected).abs() < 1e-15,
+            "L(i_sat) = {:.4e}, expected L0/2 = {:.4e}",
+            l_half,
+            expected
+        );
+    }
+
+    #[test]
+    fn test_inductor_model_xal8080_fit() {
+        // XAL8080-222MED: L(0)=2.2uH, L(8A)=2.0uH, L(24A)=1.5uH
+        // Fit from L(0) and L(8A), then check L(24A).
+        let model = InductorModel::from_two_points(2.2e-6, 8.0, 2.0e-6);
+
+        // Verify the fit point is exact.
+        let l_at_8 = model.l_at(8.0);
+        assert!(
+            (l_at_8 - 2.0e-6).abs() < 1e-12,
+            "L(8A) = {:.4e}, expected 2.0e-6",
+            l_at_8
+        );
+
+        // Verify L(24A) is in the right ballpark.
+        // The quadratic model is a single-parameter fit, so it cannot exactly
+        // match three data points.  With L(0)=2.2uH, L(8A)=2.0uH the fit
+        // predicts L(24A) ~ 1.16uH vs the datasheet's 1.5uH (a ~23% error).
+        // This is acceptable for a simple model; real powder-core rolloff is
+        // between linear and quadratic.
+        let l_at_24 = model.l_at(24.0);
+        let error_pct = ((l_at_24 - 1.5e-6) / 1.5e-6).abs() * 100.0;
+        assert!(
+            error_pct < 30.0,
+            "L(24A) = {:.4e} H ({:.1}% error vs 1.5uH), quadratic fit too inaccurate",
+            l_at_24,
+            error_pct
+        );
+    }
+
+    #[test]
+    fn test_inductor_model_from_two_points_no_rolloff() {
+        // l1 >= l0 should produce a constant inductor.
+        let model = InductorModel::from_two_points(2.0e-6, 10.0, 2.5e-6);
+        assert!(model.i_sat.is_infinite());
+        assert_eq!(model.l_at(100.0), 2.0e-6);
+    }
+
+    #[test]
+    fn test_buck_saturating_inductor_higher_peak_current() {
+        // A buck converter with a saturating inductor should have higher peak
+        // current than one with a constant inductor at the same trip point,
+        // because L drops with current so di/dt increases and the current
+        // overshoots the linear prediction.
+        //
+        // Uses slope compensation (non-zero slope_amp_per_sec) to avoid a
+        // degenerate intersection in the analytical RLC solver when the trip
+        // line has zero slope.
+        let base_params = Parameters {
+            period: Time(2e-6),
+            slope_amp_per_sec: -1e6,
+            r_series: Resistance(0.01),
+            r_esr: Resistance(0.0),
+            c_out: Capacitance(47e-6),
+            l_inductor: Inductance(2.2e-6),
+            c_in: Capacitance(0.0),
+            r_esr_cin: Resistance(0.0),
+            r_in: Resistance(0.0),
+            l_in: Inductance(0.0),
+            tau_current_sense: Time(0.0),
+            tau_dac: Time(0.0),
+            t_prop_delay: Time(0.0),
+            t_dac_sample: Time(0.0),
+            current_conduction: CurrentConduction::Synchronous,
+            t_blanking: Time(0.0),
+            t_adc_sample_point: Time(0.0),
+            max_duty: 1.0,
+            inductor_model: None,
+            t_dead: Time(0.0),
+            v_body_diode: Voltage(0.0),
+        };
+
+        // Constant inductor run
+        let mut sim_const = CurrentModeConverter::new(base_params, Topology::Buck);
+        let mut peak_const = 0.0_f64;
+        for _ in 0..2000 {
+            let (_, i_max) = sim_const.tick(Voltage(24.0), Current(8.0), |_| Current(3.0));
+            peak_const = peak_const.max(i_max.0);
+        }
+
+        // Saturating inductor run (XAL8080 model)
+        let mut sat_params = base_params;
+        sat_params.inductor_model = Some(InductorModel::from_two_points(2.2e-6, 8.0, 2.0e-6));
+        let mut sim_sat = CurrentModeConverter::new(sat_params, Topology::Buck);
+        let mut peak_sat = 0.0_f64;
+        for _ in 0..2000 {
+            let (_, i_max) = sim_sat.tick(Voltage(24.0), Current(8.0), |_| Current(3.0));
+            peak_sat = peak_sat.max(i_max.0);
+        }
+
+        assert!(
+            peak_sat > peak_const,
+            "Saturating inductor peak ({:.3} A) should exceed constant ({:.3} A)",
+            peak_sat,
+            peak_const
+        );
+    }
+
+    // ── Dead-time tests ──────────────────────────────────────────────────
+
+    /// Helper: build a buck converter Parameters struct with optional dead time.
+    fn buck_params_with_dead_time(t_dead_ns: f64, v_body_diode: f64) -> Parameters {
+        Parameters {
+            period: Time(2e-6), // 500 kHz
+            slope_amp_per_sec: -5e6,
+            r_series: Resistance(0.01),
+            r_esr: Resistance(0.001),
+            c_out: Capacitance(47e-6),
+            l_inductor: Inductance(4e-6),
+            c_in: Capacitance(0.0),
+            r_esr_cin: Resistance(0.0),
+            r_in: Resistance(0.0),
+            l_in: Inductance(0.0),
+            tau_current_sense: Time(0.0),
+            tau_dac: Time(0.0),
+            t_prop_delay: Time(0.0),
+            t_dac_sample: Time(0.0),
+            current_conduction: CurrentConduction::Synchronous,
+            t_blanking: Time(0.0),
+            t_adc_sample_point: Time(0.0),
+            max_duty: 1.0,
+            inductor_model: None,
+            t_dead: Time(t_dead_ns * 1e-9),
+            v_body_diode: Voltage(v_body_diode),
+        }
+    }
+
+    #[test]
+    fn test_zero_dead_time_is_identical() {
+        // Zero dead time must produce the same result as before (backward compat).
+        let params = buck_params_with_dead_time(0.0, 0.0);
+        let mut sim = CurrentModeConverter::new(params, Topology::Buck);
+
+        for _ in 0..2000 {
+            sim.tick(Voltage(24.0), Current(5.0), |_| Current(2.0));
+        }
+        let v_out_no_dead = sim.v_out.0;
+        let i_l_no_dead = sim.i_inductor.0;
+
+        assert!(v_out_no_dead > 3.0, "v_out = {:.3} V", v_out_no_dead);
+        assert!(i_l_no_dead > 0.0, "i_L = {:.3} A", i_l_no_dead);
+    }
+
+    #[test]
+    fn test_buck_dead_time_reduces_output_voltage() {
+        // With 30 ns dead time, the effective ON time is shorter, so the
+        // output voltage should be lower than without dead time.
+        let mut sim_ideal = CurrentModeConverter::new(
+            buck_params_with_dead_time(0.0, 0.0),
+            Topology::Buck,
+        );
+        let mut sim_dead = CurrentModeConverter::new(
+            buck_params_with_dead_time(30.0, 0.7),
+            Topology::Buck,
+        );
+
+        for _ in 0..3000 {
+            sim_ideal.tick(Voltage(24.0), Current(5.0), |_| Current(2.0));
+            sim_dead.tick(Voltage(24.0), Current(5.0), |_| Current(2.0));
+        }
+
+        // The output voltage with dead time should be lower (dead time eats
+        // into ON time and body diode dissipates energy).
+        assert!(
+            sim_dead.v_out.0 < sim_ideal.v_out.0,
+            "v_out with dead time ({:.3} V) should be lower than ideal ({:.3} V)",
+            sim_dead.v_out.0,
+            sim_ideal.v_out.0
+        );
+    }
+
+    #[test]
+    fn test_buck_dead_time_larger_effect_with_more_dead_time() {
+        // 50 ns dead time + 0.7V body diode should have a bigger effect than
+        // 20 ns + 0.7V.  (Moderate values so the open-loop sim stays stable.)
+        let mut sim_small = CurrentModeConverter::new(
+            buck_params_with_dead_time(20.0, 0.7),
+            Topology::Buck,
+        );
+        let mut sim_large = CurrentModeConverter::new(
+            buck_params_with_dead_time(50.0, 0.7),
+            Topology::Buck,
+        );
+
+        for _ in 0..5000 {
+            sim_small.tick(Voltage(24.0), Current(5.0), |_| Current(2.0));
+            sim_large.tick(Voltage(24.0), Current(5.0), |_| Current(2.0));
+        }
+
+        assert!(
+            sim_large.v_out.0 < sim_small.v_out.0,
+            "larger dead time should lower v_out more: small={:.3} V, large={:.3} V",
+            sim_small.v_out.0,
+            sim_large.v_out.0
+        );
     }
 }

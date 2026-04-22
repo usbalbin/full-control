@@ -127,6 +127,9 @@ fn main() {
         t_blanking: Time(0.0),
         t_adc_sample_point: Time(0.0),
         max_duty: 1.0,
+        inductor_model: None,
+        t_dead: Time(0.0),
+        v_body_diode: Voltage(0.0),
     };
     let mut sim = CurrentModeConverter::new(sim_params, Mode::Buck);
 

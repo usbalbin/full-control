@@ -45,6 +45,12 @@ pub struct ViennaRectifierSim {
     pub c_half: f64,
     pub r_esr: f64,
 
+    // Dead time
+    /// Dead time between complementary switch transitions [s]. 0 = ideal.
+    /// During dead time the phase is effectively disconnected from the
+    /// midpoint, reducing the effective ON time of the bidirectional switch.
+    pub t_dead: f64,
+
     // State
     pub i_l: [f64; 3],
     pub v_top: f64,
@@ -68,10 +74,17 @@ impl ViennaRectifierSim {
             r_series,
             v_diode,
             t_sw: 1.0 / f_sw,
+            t_dead: 0.0,
             i_l: [0.0; 3],
             v_top: v_dc_init / 2.0,
             v_bot: v_dc_init / 2.0,
         }
+    }
+
+    /// Set dead-time parameter (builder pattern).
+    pub fn with_dead_time(mut self, t_dead: f64) -> Self {
+        self.t_dead = t_dead;
+        self
     }
 
     /// Total DC bus voltage.
@@ -112,7 +125,10 @@ impl ViennaRectifierSim {
             let v_in_abs = v_in.abs();
             let positive = v_in >= 0.0;
             let duty = duties[phase].clamp(0.0, 0.98);
-            let t_on = self.t_sw * duty;
+            // Dead-time adjustment: reduce effective ON time.  The Vienna's
+            // bidirectional switch has two transitions per cycle, each with
+            // t_dead during which the phase is disconnected from the midpoint.
+            let t_on = (self.t_sw * duty - self.t_dead).max(0.0);
             let t_off = self.t_sw - t_on;
 
             // Current cap half voltage (includes charge from previous phases)
