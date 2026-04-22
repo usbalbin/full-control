@@ -498,7 +498,22 @@ impl eframe::App for PeriPlannerApp {
                                 .show_ui(ui, |ui| {
                                     for &opt in RequirementSpec::palette() {
                                         if ui.selectable_label(opt == spec, opt.name()).clicked() {
-                                            *to_set_spec = Some((i, opt));
+                                            // Preserve pinned_sub_timer and
+                                            // fault when switching between
+                                            // HRTIM roles — otherwise a user
+                                            // who pinned TimF and then picks
+                                            // "Voltage-mode PWM" loses the pin.
+                                            let carried = if let (
+                                                RequirementSpec::UseHrtimSub { pinned_sub_timer, fault, .. },
+                                                RequirementSpec::UseHrtimSub { role, outputs, .. },
+                                            ) = (spec, opt) {
+                                                RequirementSpec::UseHrtimSub {
+                                                    pinned_sub_timer, role, outputs, fault,
+                                                }
+                                            } else {
+                                                opt
+                                            };
+                                            *to_set_spec = Some((i, carried));
                                         }
                                     }
                                 });

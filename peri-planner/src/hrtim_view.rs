@@ -94,7 +94,7 @@ fn render_master_card(ui: &mut egui::Ui, design: &Design) {
 
 fn is_master_event(ev: crate::g474::CrossbarSource) -> bool {
     use crate::g474::CrossbarSource::*;
-    matches!(ev, Mcr1 | Mcr2 | Mcr3 | Mper)
+    matches!(ev, Mcr1 | Mcr2 | Mcr3 | Mcr4 | Mper)
 }
 
 fn render_sub_card(ui: &mut egui::Ui, design: &Design, timer: HrtimId) -> Option<HrtimAction> {
@@ -268,12 +268,14 @@ fn render_role_toggles(
     let forces_both = dem_forces_both || phase_shift_forces_both;
     let mut new_outputs = outputs;
     ui.horizontal(|ui| {
-        let mut ch1only = outputs == OutputMode::Ch1Only;
-        let mut ch1ch2 = outputs == OutputMode::Ch1AndCh2;
-        if ui.add_enabled(!forces_both, egui::Checkbox::new(&mut ch1only, "CH1 only")).clicked() && ch1only {
+        let resp_ch1 = ui.add_enabled(
+            !forces_both,
+            egui::RadioButton::new(outputs == OutputMode::Ch1Only, "CH1 only"),
+        );
+        if resp_ch1.clicked() {
             new_outputs = OutputMode::Ch1Only;
         }
-        if ui.checkbox(&mut ch1ch2, "CH1+CH2").clicked() && ch1ch2 {
+        if ui.radio(outputs == OutputMode::Ch1AndCh2, "CH1+CH2").clicked() {
             new_outputs = OutputMode::Ch1AndCh2;
         }
     });
