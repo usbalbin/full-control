@@ -106,8 +106,20 @@ impl FetProfile {
         }
     }
 
+    pub fn epc23102() -> Self {
+        Self {
+            name: "EPC23102".into(),
+            rds_on_mohm: 5.2,
+            coss_pf: 370.0,
+            qg_nc: 12.0,
+            vgs_v: 5.0,
+            t_rise_ns: 2.0,
+            t_fall_ns: 2.0,
+        }
+    }
+
     pub fn presets() -> Vec<Self> {
-        vec![Self::ideal(), Self::epc2306()]
+        vec![Self::ideal(), Self::epc2306(), Self::epc23102()]
     }
 }
 
@@ -563,6 +575,9 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
         t_blanking: Time(p.blanking_ns * 1e-9),
         t_adc_sample_point: Time(p.adc_sample_ns * 1e-9),
         max_duty: p.max_duty_pct / 100.0,
+        inductor_model: None,
+        t_dead: Time(0.0),
+        v_body_diode: Voltage(0.0),
     };
     let num_phases = p.num_phases.max(1);
     let mut sims: Vec<CurrentModeConverter> = (0..num_phases)
