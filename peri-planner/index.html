@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Peripheral planner</title>
+    <!-- Tell trunk to build the cdylib, not the native binary -->
+    <link data-trunk rel="rust" data-target-name="peri_planner" />
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        overflow: hidden;
+        width: 100%;
+        height: 100%;
+        background: #1a1a1a;
+      }
+      canvas {
+        width: 100%;
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <!-- trunk replaces this with the generated JS + WASM loader -->
+    <canvas id="peri_planner_canvas"></canvas>
+  </body>
+</html>

@@ -1,0 +1,40 @@
+pub mod app;
+pub mod comms_view;
+pub mod fabric_view;
+pub mod g474;
+pub mod hrtim_view;
+pub mod package_view;
+pub mod picker;
+pub mod pinout;
+pub mod requirements;
+pub mod solver;
+pub mod timers_view;
+pub mod waveform_view;
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::prelude::*;
+
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(start)]
+pub async fn start() {
+    use app::PeriPlannerApp;
+    use wasm_bindgen::JsCast as _;
+
+    let canvas = web_sys::window()
+        .unwrap()
+        .document()
+        .unwrap()
+        .get_element_by_id("peri_planner_canvas")
+        .unwrap()
+        .dyn_into::<web_sys::HtmlCanvasElement>()
+        .unwrap();
+
+    eframe::WebRunner::new()
+        .start(
+            canvas,
+            eframe::WebOptions::default(),
+            Box::new(|cc| Ok(Box::new(PeriPlannerApp::new(cc)))),
+        )
+        .await
+        .expect("failed to start eframe");
+}

@@ -1,0 +1,1054 @@
+use std::collections::BTreeMap;
+
+use eframe::egui;
+
+use crate::fabric_view::{self, Selection};
+use crate::g474::*;
+use crate::pinout::{self, ChipVariant};
+use crate::requirements::*;
+use crate::solver::{TimerSlotUsage, ALL_CR_SLOTS_HELPER};
+
+const STORAGE_KEY: &str = "peri_planner_design_v2";
+const HISTORY_CAP: usize = 40;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+enum ViewMode {
+    Fabric,
+    Hrtim,
+    Comms,
+    Timers,
+    Waveforms,
+    Package,
+}
+
+pub struct PeriPlannerApp {
+    design: Design,
+    variant: ChipVariant,
+    view: ViewMode,
+    history: Vec<Design>,
+    redo: Vec<Design>,
+    /// Role "picked up" in the package view, waiting to be dropped on a
+    /// candidate pin. Not persisted — ephemeral interaction state.
+    picked: Option<crate::picker::PickedRole>,
+}
+
+impl Default for PeriPlannerApp {
+    fn default() -> Self {
+        Self {
+            design: Design::default(),
+            variant: ChipVariant::G474R,
+            view: ViewMode::Fabric,
+            history: Vec::new(),
+            redo: Vec::new(),
+            picked: None,
+        }
+    }
+}
+
+impl PeriPlannerApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut slf = Self::default();
+        if let Some(storage) = cc.storage {
+            if let Some(design) = eframe::get_value::<Design>(storage, STORAGE_KEY) {
+                slf.design = design;
+            }
+            // Legacy: older saves persisted the variant separately. Honour
+            // it only if it disagrees with the newly-loaded Design (which
+            // defaults to G474R via serde when absent). Keeps an older
+            // non-G474R session restorable through the bump.
+            if let Some(v) = eframe::get_value::<ChipVariant>(storage, "peri_planner_variant_v1") {
+                if slf.design.variant != v {
+                    slf.design.set_variant(v);
+                }
+            }
+            slf.variant = slf.design.variant;
+            if let Some(v) = eframe::get_value::<ViewMode>(storage, "peri_planner_view_v1") {
+                slf.view = v;
+            }
+        }
+        slf
+    }
+
+    /// Wrap a mutation so it records a history entry iff state actually changed.
+    fn mutate(&mut self, f: impl FnOnce(&mut Design)) {
+        let before = self.design.clone();
+        f(&mut self.design);
+        if self.design != before {
+            self.history.push(before);
+            if self.history.len() > HISTORY_CAP {
+                self.history.remove(0);
+            }
+            self.redo.clear();
+        }
+    }
+
+    fn undo(&mut self) {
+        if let Some(prev) = self.history.pop() {
+            let current = std::mem::replace(&mut self.design, prev);
+            self.redo.push(current);
+        }
+    }
+
+    fn redo_op(&mut self) {
+        if let Some(next) = self.redo.pop() {
+            let current = std::mem::replace(&mut self.design, next);
+            self.history.push(current);
+        }
+    }
+
+    fn handle_package_action(&mut self, action: Option<crate::package_view::Action>) {
+        use crate::package_view::Action;
+        use crate::picker;
+        match action {
+            Some(Action::Click(pin)) => {
+                match self.picked {
+                    None => {
+                        // Try to identify a role from the signal on this pin.
+                        let pin_signals = picker::current_pin_signals(&self.design, self.variant);
+                        if let Some(sig) = pin_signals.get(&pin).copied() {
+                            self.picked = picker::role_for_pin(pin, sig, self.variant, &self.design);
+                        }
+                    }
+                    Some(role) => {
+                        // Clicking the source pin cancels the pick.
+                        if pin == role.current_pin() {
+                            self.picked = None;
+                            return;
+                        }
+                        if let Some(mv) = picker::resolve_move(&self.design, self.variant, role, pin) {
+                            let variant = self.variant;
+                            self.mutate(|d| picker::apply_move(d, variant, mv));
+                        }
+                        self.picked = None;
+                    }
+                }
+            }
+            Some(Action::ClickEmpty) => {
+                self.picked = None;
+            }
+            None => {}
+        }
+    }
+}
+
+impl eframe::App for PeriPlannerApp {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, STORAGE_KEY, &self.design);
+        eframe::set_value(storage, "peri_planner_variant_v1", &self.variant);
+        eframe::set_value(storage, "peri_planner_view_v1", &self.view);
+    }
+
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let ctrl = ctx.input(|i| i.modifiers.command);
+        let shift = ctx.input(|i| i.modifiers.shift);
+        if ctrl && ctx.input(|i| i.key_pressed(egui::Key::Z)) {
+            if shift { self.redo_op(); } else { self.undo(); }
+        }
+        if ctrl && ctx.input(|i| i.key_pressed(egui::Key::Y)) {
+            self.redo_op();
+        }
+        self.design.normalize();
+
+        let phases = self.design.phases();
+        let external_eevs = self.design.external_eevs();
+        let fault = self.design.first_fault();
+        let drive_dac = self.design.first_drive_dac();
+        let plan = self.design.master_triggered_sequencer();
+        let phase_timers = self.design.phase_timers_and_dem();
+        let phase_edges = self.design.phase_edges();
+        let phase_dac_timers = self.design.phase_dac_timers();
+        let adc_sequencers: Vec<fabric_view::AdcSequencerView> =
+            build_adc_sequencer_views(&self.design);
+        let used_timers: Vec<HrtimId> = phase_timers.iter().map(|(t, _)| *t).collect();
+        let all_used: std::collections::HashSet<Resource> = self
+            .design
+            .assignments
+            .iter()
+            .flatten()
+            .flat_map(|a| a.consumed())
+            .chain(self.design.locks.iter().copied())
+            .collect();
+
+        egui::SidePanel::right("resources")
+            .resizable(true)
+            .default_width(340.0)
+            .show(ctx, |ui| {
+                ui.heading("Resource accounting");
+                ui.separator();
+
+                ui.label(format!(
+                    "Requirements: {}   Assigned: {}",
+                    self.design.requirements.len(),
+                    self.design.assignments.iter().flatten().count()
+                ));
+
+                ui.separator();
+                ui.label("Used by kind:");
+                let used = self.design_used();
+                for (kind, vs) in &used {
+                    ui.label(format!("  {}: {}", kind, vs.join(", ")));
+                }
+
+                ui.separator();
+                ui.label("ADC sequencers (claimed):");
+                let seqs: Vec<_> = self.design.assignments.iter().flatten().filter_map(|a| match a {
+                    Assignment::AdcSequencer { adc, kind, trigger, .. } => Some((*adc, *kind, *trigger)),
+                    _ => None,
+                }).collect();
+                if seqs.is_empty() {
+                    ui.label("  (none -- add an ADC sequencer requirement)");
+                } else {
+                    for (adc, kind, trig) in &seqs {
+                        ui.label(format!("  {:?} {:?} trig={:?}", adc, kind, trig));
+                    }
+                }
+
+                ui.separator();
+                ui.label("Capability checks:");
+                let mut fix_to_apply: Option<Fix> = None;
+                for c in self.design.warnings() {
+                    let (color, glyph) = match c.severity {
+                        Severity::Ok => (egui::Color32::from_rgb(100, 200, 120), "OK  "),
+                        Severity::Info => (egui::Color32::from_rgb(120, 170, 220), "INFO"),
+                        Severity::Warn => (egui::Color32::from_rgb(220, 140, 80), "WARN"),
+                    };
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(color, format!("  {} {}", glyph, c.message));
+                        if let Some(fix) = &c.fix {
+                            if ui.small_button(fix.label()).clicked() {
+                                fix_to_apply = Some(fix.clone());
+                            }
+                        }
+                    });
+                }
+                if let Some(fix) = fix_to_apply {
+                    self.mutate(|d| d.apply_fix(fix));
+                }
+
+                ui.separator();
+                let mut pending_set_pin: Option<(pinout::Signal, pinout::Pin)> = None;
+                let mut pending_clear_pin: Option<pinout::Signal> = None;
+                let mut pending_clear_all_pins = false;
+                ui.horizontal(|ui| {
+                    ui.label("Pin map:");
+                    if !self.design.pin_assignments.is_empty()
+                        && ui.small_button("Clear pin locks").clicked()
+                    {
+                        pending_clear_all_pins = true;
+                    }
+                });
+                let signals = self.design.used_signals();
+                if signals.is_empty() {
+                    ui.label("  (no pin-mappable signals yet)");
+                } else {
+                    let unreachable = pinout::unreachable_signals(&signals, self.variant);
+                    for (idx, s) in signals.iter().enumerate() {
+                        let cands = pinout::pin_candidates_respecting_locks(
+                            *s,
+                            self.variant,
+                            &self.design.pin_assignments,
+                        );
+                        let locked = self.design.pin_assignments.contains_key(s);
+                        ui.horizontal(|ui| {
+                            ui.label(format!("  {:<14} ->", s.name()));
+                            let all_cands = pinout::pins_for(*s, self.variant);
+                            if all_cands.is_empty() {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 100, 100),
+                                    "(no pin available)",
+                                );
+                            } else if all_cands.len() == 1 {
+                                ui.label(all_cands[0].name());
+                            } else {
+                                let current =
+                                    self.design.pin_assignments.get(s).copied();
+                                let label = current
+                                    .map(|p| p.name())
+                                    .unwrap_or_else(|| format!("{} options", cands.len()));
+                                egui::ComboBox::from_id_salt(("pin", idx))
+                                    .width(120.0)
+                                    .selected_text(label)
+                                    .show_ui(ui, |ui| {
+                                        if ui
+                                            .selectable_label(current.is_none(), "(any)")
+                                            .clicked()
+                                        {
+                                            pending_clear_pin = Some(*s);
+                                        }
+                                        for p in &all_cands {
+                                            let taken_by_other = !cands.contains(p)
+                                                && Some(*p) != current;
+                                            let label = if taken_by_other {
+                                                format!("{} (taken)", p.name())
+                                            } else {
+                                                p.name()
+                                            };
+                                            if ui
+                                                .add_enabled(
+                                                    !taken_by_other,
+                                                    egui::Button::selectable(
+                                                        Some(*p) == current,
+                                                        label,
+                                                    ),
+                                                )
+                                                .clicked()
+                                            {
+                                                pending_set_pin = Some((*s, *p));
+                                            }
+                                        }
+                                    });
+                                if locked {
+                                    ui.label(
+                                        egui::RichText::new("(locked)").small().strong(),
+                                    );
+                                } else {
+                                    ui.label(
+                                        egui::RichText::new("[alt]").weak().small(),
+                                    );
+                                }
+                            }
+                        });
+                    }
+                    let conflicts =
+                        pinout::conflicting_signal_pairs(&signals, self.variant);
+                    if !conflicts.is_empty() {
+                        ui.label(
+                            egui::RichText::new("  Pin-contention candidates:")
+                                .color(egui::Color32::from_rgb(200, 180, 80)),
+                        );
+                        for (a, b, p) in &conflicts {
+                            ui.label(format!(
+                                "    {} <-> {} share {}",
+                                a.name(),
+                                b.name(),
+                                p.name()
+                            ));
+                        }
+                    }
+                    if !unreachable.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 100, 100),
+                            format!(
+                                "  {} signal(s) have no pin on {} -- incompatible chip.",
+                                unreachable.len(),
+                                self.variant.display_label()
+                            ),
+                        );
+                    }
+                }
+                if let Some((s, p)) = pending_set_pin {
+                    self.mutate(|d| d.set_pin(s, p));
+                }
+                if let Some(s) = pending_clear_pin {
+                    self.mutate(|d| d.clear_pin(s));
+                }
+                if pending_clear_all_pins {
+                    self.mutate(|d| d.clear_all_pins());
+                }
+
+                ui.separator();
+                ui.label("HRTIM CR budget per PCM phase:");
+                if phase_timers.is_empty() {
+                    ui.label("  (no PCM phases)");
+                } else {
+                    for (t, dem) in &phase_timers {
+                        let usage = cr_usage_for(*t, *dem);
+                        ui.label(format!("  {:?}{}:", t, if *dem { " (+DEM)" } else { "" }));
+                        for (slot, purpose) in &usage.claims {
+                            ui.label(format!("    {:?}: {}", slot, purpose));
+                        }
+                        let free: Vec<_> = ALL_CR_SLOTS_HELPER
+                            .iter()
+                            .copied()
+                            .filter(|s| !usage.claims.iter().any(|(u, _)| u == s))
+                            .collect();
+                        if free.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(220, 140, 80),
+                                "    (no free slots)",
+                            );
+                        } else {
+                            ui.label(format!("    free: {:?}", free));
+                        }
+                    }
+                }
+            });
+
+        let can_undo = !self.history.is_empty();
+        let can_redo = !self.redo.is_empty();
+
+        // Top toolbar: heading, chip, undo/redo, view tabs.
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("STM32G474 planner").strong());
+                ui.separator();
+                ui.label("Chip:");
+                let mut pending_variant: Option<ChipVariant> = None;
+                egui::ComboBox::from_id_salt("variant")
+                    .selected_text(self.variant.display_label())
+                    .show_ui(ui, |ui| {
+                        for &v in ChipVariant::ALL {
+                            if ui.selectable_label(v == self.variant, v.display_label()).clicked() {
+                                pending_variant = Some(v);
+                            }
+                        }
+                    });
+                if let Some(v) = pending_variant {
+                    self.variant = v;
+                    self.mutate(|d| d.set_variant(v));
+                }
+                ui.separator();
+                if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
+                    self.undo();
+                }
+                if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
+                    self.redo_op();
+                }
+                ui.separator();
+                ui.label("View:");
+                ui.selectable_value(&mut self.view, ViewMode::Fabric, "Power fabric");
+                ui.selectable_value(&mut self.view, ViewMode::Hrtim, "HRTIM");
+                ui.selectable_value(&mut self.view, ViewMode::Comms, "Comms");
+                ui.selectable_value(&mut self.view, ViewMode::Timers, "Timers");
+                ui.selectable_value(&mut self.view, ViewMode::Waveforms, "Waveforms");
+                ui.selectable_value(&mut self.view, ViewMode::Package, "Package");
+                ui.separator();
+                if ui.button("Export").clicked() {
+                    let text = self.design.export_summary();
+                    ui.ctx().copy_text(text);
+                }
+            });
+        });
+
+        // Requirements + Add + Locks in a resizable top panel. User can
+        // drag to give more or less room to the fabric view below.
+        let mut to_remove: Option<usize> = None;
+        let mut to_set_spec: Option<(usize, RequirementSpec)> = None;
+        let mut to_set_assignment: Option<(usize, Assignment)> = None;
+
+        egui::TopBottomPanel::top("requirements")
+            .resizable(true)
+            .default_height(150.0)
+            .min_height(50.0)
+            .max_height(500.0)
+            .show(ctx, |ui| {
+            // Controls first (+ Add, Locks) so they remain visible even
+            // when the scroll area below is tall, then the scroll area
+            // fills the remaining panel height.
+            ui.horizontal_wrapped(|ui| {
+                ui.label("+ Add:");
+                let mut to_add: Option<RequirementSpec> = None;
+                for &opt in RequirementSpec::add_palette() {
+                    if ui.small_button(opt.name()).clicked() {
+                        to_add = Some(opt);
+                    }
+                }
+                // Collapse the 8 comms families into one menu to keep the
+                // horizontal palette tractable.
+                ui.menu_button("Comms \u{25BE}", |ui| {
+                    for &opt in RequirementSpec::comms_palette() {
+                        if ui.button(opt.name()).clicked() {
+                            to_add = Some(opt);
+                            ui.close();
+                        }
+                    }
+                });
+                if let Some(opt) = to_add {
+                    self.mutate(|d| {
+                        d.add(opt);
+                    });
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Locks:");
+                if self.design.locks.is_empty() {
+                    ui.label(
+                        egui::RichText::new("(none)")
+                            .weak()
+                            .italics(),
+                    );
+                }
+                let locks_snapshot: Vec<Resource> = self.design.locks.iter().copied().collect();
+                for r in &locks_snapshot {
+                    if ui.small_button(format!("{} x", resource_label(*r))).clicked() {
+                        self.mutate(|d| d.clear_lock(*r));
+                    }
+                }
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    let n = self.design.requirements.len();
+                    let mid = n.div_ceil(2);
+                    let render_row = |ui: &mut egui::Ui,
+                                      i: usize,
+                                      design: &Design,
+                                      to_remove: &mut Option<usize>,
+                                      to_set_spec: &mut Option<(usize, RequirementSpec)>,
+                                      to_set_assignment: &mut Option<(usize, Assignment)>| {
+                        let spec = design.requirements[i];
+                        let candidates = design.candidates_for(i);
+                        let current = design.assignments[i].clone();
+                        ui.horizontal(|ui| {
+                            ui.label(format!("#{:<2}", i + 1));
+                            egui::ComboBox::from_id_salt(("spec", i))
+                                .width(150.0)
+                                .selected_text(spec.name())
+                                .show_ui(ui, |ui| {
+                                    for &opt in RequirementSpec::palette() {
+                                        if ui.selectable_label(opt == spec, opt.name()).clicked() {
+                                            *to_set_spec = Some((i, opt));
+                                        }
+                                    }
+                                });
+                            // Preferred-timer selector for PCM phases. "auto" lets
+                            // the solver pick the first free sub-timer (current
+                            // default); locking to a specific sub-timer is useful
+                            // when e.g. reserving TimF for an aux topology.
+                            if let RequirementSpec::PcmPhase { dem, threshold, preferred_timer } = spec {
+                                let label = match preferred_timer {
+                                    None => "auto".to_string(),
+                                    Some(t) => format!("{:?}", t),
+                                };
+                                egui::ComboBox::from_id_salt(("pcm-t", i))
+                                    .width(70.0)
+                                    .selected_text(label)
+                                    .show_ui(ui, |ui| {
+                                        if ui.selectable_label(preferred_timer.is_none(), "auto").clicked() {
+                                            *to_set_spec = Some((
+                                                i,
+                                                RequirementSpec::PcmPhase {
+                                                    dem, threshold, preferred_timer: None,
+                                                },
+                                            ));
+                                        }
+                                        for &t in &[HrtimId::TimA, HrtimId::TimB, HrtimId::TimC, HrtimId::TimD, HrtimId::TimE, HrtimId::TimF] {
+                                            let sel = preferred_timer == Some(t);
+                                            if ui.selectable_label(sel, format!("{:?}", t)).clicked() {
+                                                *to_set_spec = Some((
+                                                    i,
+                                                    RequirementSpec::PcmPhase {
+                                                        dem, threshold, preferred_timer: Some(t),
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                    });
+                            }
+                            // Trigger selector for ADC sequencers — covers
+                            // master compares, sub-timer compares, EEVs,
+                            // and software. List comes straight from the
+                            // ADC-trigger crossbar table.
+                            if let RequirementSpec::AdcSequencer { adc, kind, trigger } = spec {
+                                let trig_label = match trigger {
+                                    TriggerSource::Software => "SW".to_string(),
+                                    TriggerSource::Event(ev) => format!("{:?}", ev),
+                                };
+                                egui::ComboBox::from_id_salt(("trg", i))
+                                    .width(100.0)
+                                    .selected_text(trig_label)
+                                    .show_ui(ui, |ui| {
+                                        if ui.selectable_label(
+                                            matches!(trigger, TriggerSource::Software),
+                                            "Software",
+                                        ).clicked() {
+                                            *to_set_spec = Some((
+                                                i,
+                                                RequirementSpec::AdcSequencer {
+                                                    adc, kind,
+                                                    trigger: TriggerSource::Software,
+                                                },
+                                            ));
+                                        }
+                                        for &(ev, _) in crate::g474::CROSSBAR_TO_ADC_TRIGGER {
+                                            let selected = matches!(
+                                                trigger,
+                                                TriggerSource::Event(e) if e == ev
+                                            );
+                                            if ui.selectable_label(
+                                                selected,
+                                                format!("{:?}", ev),
+                                            ).clicked() {
+                                                *to_set_spec = Some((
+                                                    i,
+                                                    RequirementSpec::AdcSequencer {
+                                                        adc, kind,
+                                                        trigger: TriggerSource::Event(ev),
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                    });
+                            }
+                            if let RequirementSpec::AdcConversion { group, purpose, adc_pref, speed } = spec {
+                                let sequencers = design.sequencer_ids();
+                                let group_label = sequencers
+                                    .iter()
+                                    .find(|(id, _)| *id == group)
+                                    .map(|(id, idx)| format!("-> #{} (id={})", idx + 1, id))
+                                    .unwrap_or_else(|| "-> (no sequencer)".to_string());
+                                egui::ComboBox::from_id_salt(("grp", i))
+                                    .width(110.0)
+                                    .selected_text(group_label)
+                                    .show_ui(ui, |ui| {
+                                        for (id, idx) in &sequencers {
+                                            if ui.selectable_label(
+                                                *id == group,
+                                                format!("#{} (id={})", idx + 1, id),
+                                            ).clicked() {
+                                                *to_set_spec = Some((
+                                                    i,
+                                                    RequirementSpec::AdcConversion {
+                                                        group: *id, purpose, adc_pref, speed,
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                        if sequencers.is_empty() {
+                                            ui.label(egui::RichText::new("(add a sequencer first)").weak());
+                                        }
+                                    });
+                                // ADC-unit preference: when parent is a dual
+                                // sequencer the pool spans both ADCs, so this
+                                // lets the user pin the conversion to one or
+                                // the other. For single-ADC parents this is
+                                // effectively a no-op but still visible.
+                                let adc_label = match adc_pref {
+                                    None => "any ADC".to_string(),
+                                    Some(a) => format!("ADC{}", a.number()),
+                                };
+                                egui::ComboBox::from_id_salt(("adcpref", i))
+                                    .width(80.0)
+                                    .selected_text(adc_label)
+                                    .show_ui(ui, |ui| {
+                                        if ui.selectable_label(adc_pref.is_none(), "any ADC").clicked() {
+                                            *to_set_spec = Some((
+                                                i,
+                                                RequirementSpec::AdcConversion {
+                                                    group, purpose, adc_pref: None, speed,
+                                                },
+                                            ));
+                                        }
+                                        for &a in crate::g474::AdcInstance::ALL {
+                                            let sel = adc_pref == Some(a);
+                                            if ui.selectable_label(sel, format!("ADC{}", a.number())).clicked() {
+                                                *to_set_spec = Some((
+                                                    i,
+                                                    RequirementSpec::AdcConversion {
+                                                        group, purpose, adc_pref: Some(a), speed,
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                    });
+                                // Speed preference: any / fast / slow.
+                                egui::ComboBox::from_id_salt(("spd", i))
+                                    .width(70.0)
+                                    .selected_text(speed.short())
+                                    .show_ui(ui, |ui| {
+                                        for s in [SpeedPref::Any, SpeedPref::Fast, SpeedPref::Slow] {
+                                            if ui.selectable_label(speed == s, s.short()).clicked() {
+                                                *to_set_spec = Some((
+                                                    i,
+                                                    RequirementSpec::AdcConversion {
+                                                        group, purpose, adc_pref, speed: s,
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                    });
+                            }
+                            if let RequirementSpec::UseOpamp { instance, external_vinp, external_vinm, external_vout } = spec {
+                                egui::ComboBox::from_id_salt(("op", i))
+                                    .width(90.0)
+                                    .selected_text(format!("OPAMP{}", instance.number()))
+                                    .show_ui(ui, |ui| {
+                                        for &o in crate::g474::OpampId::ALL {
+                                            if ui.selectable_label(instance == o, format!("OPAMP{}", o.number())).clicked() {
+                                                *to_set_spec = Some((
+                                                    i,
+                                                    RequirementSpec::UseOpamp {
+                                                        instance: o,
+                                                        external_vinp, external_vinm, external_vout,
+                                                    },
+                                                ));
+                                            }
+                                        }
+                                    });
+                                let mut p = external_vinp;
+                                let mut m = external_vinm;
+                                let mut o = external_vout;
+                                let before = (p, m, o);
+                                ui.checkbox(&mut p, "VINP pin");
+                                ui.checkbox(&mut m, "VINM pin");
+                                ui.checkbox(&mut o, "VOUT pin");
+                                if (p, m, o) != before {
+                                    *to_set_spec = Some((
+                                        i,
+                                        RequirementSpec::UseOpamp {
+                                            instance,
+                                            external_vinp: p,
+                                            external_vinm: m,
+                                            external_vout: o,
+                                        },
+                                    ));
+                                }
+                            }
+                            let sel_label = current
+                                .as_ref()
+                                .map(|a| a.label())
+                                .unwrap_or_else(|| "(no compatible option)".to_string());
+                            egui::ComboBox::from_id_salt(("asn", i))
+                                .width(240.0)
+                                .selected_text(sel_label)
+                                .show_ui(ui, |ui| {
+                                    if candidates.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "(no candidate -- resource conflict)",
+                                            )
+                                            .weak(),
+                                        );
+                                    }
+                                    if matches!(spec, RequirementSpec::AdcConversion { .. }) {
+                                        render_adc_conversion_candidates(
+                                            ui, i, &candidates, &current, to_set_assignment,
+                                        );
+                                    } else {
+                                        for cand in &candidates {
+                                            if ui
+                                                .selectable_label(
+                                                    current.as_ref() == Some(cand),
+                                                    cand.label(),
+                                                )
+                                                .clicked()
+                                            {
+                                                *to_set_assignment = Some((i, cand.clone()));
+                                            }
+                                        }
+                                    }
+                                });
+                            if ui.small_button("x").clicked() {
+                                *to_remove = Some(i);
+                            }
+                        });
+                    };
+                    ui.columns(2, |cols| {
+                        for i in 0..mid {
+                            render_row(
+                                &mut cols[0], i,
+                                &self.design,
+                                &mut to_remove, &mut to_set_spec, &mut to_set_assignment,
+                            );
+                        }
+                        for i in mid..n {
+                            render_row(
+                                &mut cols[1], i,
+                                &self.design,
+                                &mut to_remove, &mut to_set_spec, &mut to_set_assignment,
+                            );
+                        }
+                    });
+                });
+
+        });
+
+        if let Some(i) = to_remove {
+            self.mutate(|d| d.remove(i));
+        }
+        if let Some((i, s)) = to_set_spec {
+            self.mutate(|d| d.set_spec(i, s));
+        }
+        if let Some((i, a)) = to_set_assignment {
+            self.mutate(|d| d.set_assignment(i, a));
+        }
+
+        // Central panel: the visualization itself, using all remaining
+        // vertical space.
+        egui::CentralPanel::default().show(ctx, |ui| {
+            match self.view {
+                ViewMode::Fabric => {
+                    let click = fabric_view::show(
+                        ui,
+                        &Selection {
+                            phases: &phases,
+                            external_eevs: &external_eevs,
+                            phase_edges: &phase_edges,
+                            used_timers: &used_timers,
+                            fault,
+                            drive_dac,
+                            used: &all_used,
+                            master_trigger_event: plan.as_ref().and_then(|a| match a {
+                                Assignment::AdcSequencer { trigger: TriggerSource::Event(ev), .. } => Some(*ev),
+                                _ => None,
+                            }),
+                            plan_label: plan.as_ref().map(|a| a.label()),
+                            phase_dac_timers: &phase_dac_timers,
+                            adc_sequencers: &adc_sequencers,
+                        },
+                        &self.design.locks,
+                    );
+                    if let Some(r) = click {
+                        self.mutate(|d| d.toggle_lock(r));
+                    }
+                }
+                ViewMode::Hrtim => {
+                    let action = crate::hrtim_view::show(ui, &self.design);
+                    if let Some(a) = action {
+                        use crate::hrtim_view::HrtimAction;
+                        match a {
+                            HrtimAction::SetSpec(i, s) => self.mutate(|d| d.set_spec(i, s)),
+                            HrtimAction::Remove(i) => self.mutate(|d| d.remove(i)),
+                            HrtimAction::AddPhaseOn(t) => {
+                                self.mutate(|d| {
+                                    d.add(RequirementSpec::PcmPhase {
+                                        dem: false,
+                                        threshold: ThresholdSource::Internal,
+                                        preferred_timer: Some(t),
+                                    });
+                                });
+                            }
+                        }
+                    }
+                }
+                ViewMode::Comms => {
+                    let action = crate::comms_view::show(ui, &self.design, self.variant);
+                    if let Some(a) = action {
+                        use crate::comms_view::CommsAction;
+                        match a {
+                            CommsAction::SetSpec(i, s) => self.mutate(|d| d.set_spec(i, s)),
+                            CommsAction::Remove(i) => self.mutate(|d| d.remove(i)),
+                            CommsAction::SetPin(sig, p) => self.mutate(|d| d.set_pin(sig, p)),
+                            CommsAction::ClearPin(sig) => self.mutate(|d| d.clear_pin(sig)),
+                        }
+                    }
+                }
+                ViewMode::Timers => {
+                    let action = crate::timers_view::show(ui, &self.design, self.variant);
+                    if let Some(a) = action {
+                        use crate::timers_view::TimersAction;
+                        match a {
+                            TimersAction::SetSpec(i, s) => self.mutate(|d| d.set_spec(i, s)),
+                            TimersAction::Remove(i) => self.mutate(|d| d.remove(i)),
+                            TimersAction::SetPin(sig, p) => self.mutate(|d| d.set_pin(sig, p)),
+                            TimersAction::ClearPin(sig) => self.mutate(|d| d.clear_pin(sig)),
+                        }
+                    }
+                }
+                ViewMode::Waveforms => {
+                    crate::waveform_view::show(ui, &self.design.assignments);
+                }
+                ViewMode::Package => {
+                    // Header + legend.
+                    if let Some(role) = self.picked {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new(format!("Moving: {}", role.description(&self.design)))
+                                    .color(egui::Color32::from_rgb(220, 170, 60))
+                                    .strong(),
+                            );
+                            ui.label(
+                                egui::RichText::new(
+                                    "green = direct, teal = semantic change, yellow = cascade, red = blocked",
+                                ).weak(),
+                            );
+                        });
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "Click an assigned pin to pick up its role. Candidate destinations will be colored by impact.",
+                            ).weak(),
+                        );
+                    }
+                    let paints = crate::picker::build_pin_paints(
+                        &self.design, self.variant, self.picked,
+                    );
+                    let action = crate::package_view::show(ui, self.variant, &paints);
+                    self.handle_package_action(action);
+                }
+            }
+        });
+    }
+}
+
+/// Render ADC-conversion candidates grouped by ADC unit with fast/slow
+/// sub-sections, since users typically care about "which ADC" and
+/// "fast vs slow" more than the specific channel number.
+fn render_adc_conversion_candidates(
+    ui: &mut egui::Ui,
+    row: usize,
+    candidates: &[Assignment],
+    current: &Option<Assignment>,
+    to_set_assignment: &mut Option<(usize, Assignment)>,
+) {
+    use crate::g474::{is_fast_adc_channel, AdcInstance};
+    let mut by_adc: Vec<(AdcInstance, Vec<&Assignment>)> = Vec::new();
+    for adc in AdcInstance::ALL {
+        let group: Vec<&Assignment> = candidates
+            .iter()
+            .filter(|c| matches!(c, Assignment::AdcConversion { adc: a, .. } if a == adc))
+            .collect();
+        if !group.is_empty() {
+            by_adc.push((*adc, group));
+        }
+    }
+    for (adc, mut group) in by_adc {
+        // Fast channels first within each ADC.
+        group.sort_by_key(|c| match c {
+            Assignment::AdcConversion { channel, .. } => {
+                (!is_fast_adc_channel(*channel), *channel)
+            }
+            _ => (true, 0),
+        });
+        ui.label(
+            egui::RichText::new(format!("ADC{}", adc.number()))
+                .strong()
+                .color(egui::Color32::from_gray(200)),
+        );
+        for cand in group {
+            let Assignment::AdcConversion { channel, .. } = cand else { continue; };
+            let pin = crate::pinout::pins_for(
+                crate::pinout::Signal::AdcIn { adc, channel: *channel },
+                crate::pinout::ChipVariant::G474R,
+            )
+            .first()
+            .map(|p| p.name())
+            .unwrap_or_else(|| "?".to_string());
+            let tag = if is_fast_adc_channel(*channel) { "fast" } else { "slow" };
+            let label = format!("  [{}] IN{:<2} @ {}", tag, channel, pin);
+            if ui
+                .selectable_label(current.as_ref() == Some(cand), label)
+                .clicked()
+            {
+                *to_set_assignment = Some((row, cand.clone()));
+            }
+        }
+    }
+}
+
+fn build_adc_sequencer_views(design: &Design) -> Vec<fabric_view::AdcSequencerView> {
+    use fabric_view::{AdcConversionView, AdcSequencerView};
+    let mut views: Vec<(u32, AdcSequencerView)> = Vec::new();
+    for (idx, asn) in design.assignments.iter().enumerate() {
+        let Some(asn) = asn else { continue; };
+        if let Assignment::AdcSequencer { adc, kind, trigger, .. } = asn {
+            let id = design.ids[idx];
+            views.push((
+                id,
+                AdcSequencerView {
+                    adc: *adc,
+                    kind: *kind,
+                    trigger: *trigger,
+                    conversions: Vec::new(),
+                },
+            ));
+        }
+    }
+    for (idx, asn) in design.assignments.iter().enumerate() {
+        let Some(Assignment::AdcConversion { adc, channel, purpose }) = asn else { continue; };
+        let group = match design.requirements[idx] {
+            RequirementSpec::AdcConversion { group, .. } => group,
+            _ => continue,
+        };
+        if let Some((_, view)) = views.iter_mut().find(|(id, _)| *id == group) {
+            let pin = crate::pinout::pins_for(
+                crate::pinout::Signal::AdcIn { adc: *adc, channel: *channel },
+                crate::pinout::ChipVariant::G474R,
+            )
+            .first()
+            .copied();
+            view.conversions.push(AdcConversionView {
+                adc: *adc,
+                channel: *channel,
+                purpose: *purpose,
+                pin,
+            });
+        }
+    }
+    views.into_iter().map(|(_, v)| v).collect()
+}
+
+fn resource_label(r: Resource) -> String {
+    match r {
+        Resource::Dac(d) => format!("DAC {:?}", d),
+        Resource::Comp(c) => format!("{:?}", c),
+        Resource::Eev(e) => format!("{:?}", e),
+        Resource::Flt(f) => format!("{:?}", f),
+        Resource::Timer(t) => format!("{:?}", t),
+        Resource::AdcSequencer(a, k) => format!("{:?}.{:?}", a, k),
+        Resource::AdcInput(a, c) => format!("{:?}.IN{}", a, c),
+        Resource::Pin(p) => format!("pin {}", p.name()),
+        Resource::AdcTrigger(t) => format!("{:?}", t),
+        Resource::TimerSlot(t, s) => format!("{:?}.{:?}", t, s),
+        Resource::TimerCapture(t, c) => format!("{:?}.{:?}", t, c),
+        Resource::MasterCompareSlot(n) => format!("Master.MCR{}", n),
+        Resource::Opamp(o) => format!("OPAMP{}", o.number()),
+        Resource::Spi(s)    => format!("SPI{}", s.number()),
+        Resource::I2c(i)    => format!("I2C{}", i.number()),
+        Resource::Usart(u)  => format!("USART{}", u.number()),
+        Resource::Uart(u)   => format!("UART{}", u.number()),
+        Resource::Lpuart(_) => "LPUART1".to_string(),
+        Resource::Can(c)    => format!("FDCAN{}", c.number()),
+        Resource::Usb       => "USB".to_string(),
+        Resource::Ucpd(_)   => "UCPD1".to_string(),
+        Resource::Tim(t)    => format!("TIM{}", t.number()),
+    }
+}
+
+impl PeriPlannerApp {
+    fn design_used(&self) -> Vec<(&'static str, Vec<String>)> {
+        let mut by_kind = BTreeMap::<&'static str, Vec<String>>::new();
+        for a in self.design.assignments.iter().flatten() {
+            for r in a.consumed() {
+                let (k, v) = match r {
+                    Resource::Dac(d) => ("DAC", format!("{:?}", d)),
+                    Resource::Comp(c) => ("COMP", format!("{:?}", c)),
+                    Resource::Eev(e) => ("EEV", format!("{:?}", e)),
+                    Resource::Flt(f) => ("FLT", format!("{:?}", f)),
+                    Resource::Timer(t) => ("Timer", format!("{:?}", t)),
+                    Resource::AdcSequencer(a, k) => ("ADC-seq", format!("{:?}.{:?}", a, k)),
+                    Resource::AdcInput(a, c) => ("ADC-in", format!("{:?}.IN{}", a, c)),
+                    Resource::Pin(p) => ("Pin", p.name()),
+                    Resource::AdcTrigger(t) => ("ADC-trg", format!("{:?}", t)),
+                    Resource::TimerSlot(t, s) => ("CR", format!("{:?}.{:?}", t, s)),
+                    Resource::TimerCapture(t, c) => ("CPT", format!("{:?}.{:?}", t, c)),
+                    Resource::MasterCompareSlot(n) => ("Master-CR", format!("MCR{}", n)),
+                    Resource::Opamp(o) => ("OPAMP", format!("OPAMP{}", o.number())),
+                    Resource::Spi(s)    => ("SPI", format!("SPI{}", s.number())),
+                    Resource::I2c(i)    => ("I2C", format!("I2C{}", i.number())),
+                    Resource::Usart(u)  => ("USART", format!("USART{}", u.number())),
+                    Resource::Uart(u)   => ("UART", format!("UART{}", u.number())),
+                    Resource::Lpuart(_) => ("LPUART", "LPUART1".to_string()),
+                    Resource::Can(c)    => ("FDCAN", format!("FDCAN{}", c.number())),
+                    Resource::Usb       => ("USB", "USB".to_string()),
+                    Resource::Ucpd(_)   => ("UCPD", "UCPD1".to_string()),
+                    Resource::Tim(t)    => ("TIM", format!("TIM{}", t.number())),
+                };
+                by_kind.entry(k).or_default().push(v);
+            }
+        }
+        for vs in by_kind.values_mut() {
+            vs.sort();
+            vs.dedup();
+        }
+        by_kind.into_iter().collect()
+    }
+}
+
+/// Per-phase CR usage summary. Inlined here because the new model carries
+/// DEM per-phase while `solver::compute_cr_usage` still takes a global
+/// `Intent`. Kept local so we don't rebreak the solver API.
+fn cr_usage_for(timer: HrtimId, dem: bool) -> TimerSlotUsage {
+    let mut claims = vec![(
+        TimerCompareSlot::Cr2,
+        "DAC sawtooth step (CMP2, slope comp)",
+    )];
+    if dem {
+        claims.push((
+            TimerCompareSlot::Cr4,
+            "DEM auto-delayed deadtime (CMP4)",
+        ));
+    }
+    TimerSlotUsage { timer, claims }
+}
