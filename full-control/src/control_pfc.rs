@@ -55,7 +55,7 @@ pub struct PfcDesignSummary {
     pub inner_phase_margin: f64,
 
     // ── Outer voltage loop ────────────────────────────────────
-    /// Voltage plant gain: V_in_pk² / (4 × V_out).
+    /// Voltage plant gain: V_in_pk / (2 × V_out).
     pub outer_plant_gain: f64,
     /// Output capacitance [F].
     pub c_out: f64,

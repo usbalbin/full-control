@@ -9,6 +9,9 @@ pub mod pfc_runtime;
 pub mod transforms;
 pub mod pll;
 pub mod dq_controller;
+pub mod soft_start;
+pub mod protection;
+pub mod current_sharing;
 
 #[cfg(test)]
 mod tests {
