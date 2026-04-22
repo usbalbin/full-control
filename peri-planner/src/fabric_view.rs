@@ -58,6 +58,14 @@ pub struct Selection<'a> {
     /// blocks at the bottom of the fabric canvas with edges back to the
     /// trigger source (master or sub-timer).
     pub adc_sequencers: &'a [AdcSequencerView],
+    /// HRTIM sub-timer uses that aren't PCM phases (voltage-mode PWM,
+    /// phase-shift full-bridge, External). Rendered as annotated timer
+    /// blocks in the Timer column — no DAC/COMP/EEV edges since these
+    /// roles don't go through the current-mode fabric.
+    pub non_pcm_hrtim: &'a [(HrtimId, String)],
+    /// Phase-shift peer links between sub-timers — drawn as a separate
+    /// edge style from the PCM DAC→COMP→EEV chain.
+    pub phase_shift_links: &'a [(HrtimId, HrtimId)],
 }
 
 const COL_DAC: f32 = 0.07;
@@ -370,7 +378,17 @@ pub fn show(ui: &mut egui::Ui, sel: &Selection, locks: &ResourceBag) -> Option<R
     for &t in &layout.timers {
         let center = pt(t);
         let used_by_phase = sel.used_timers.contains(&t);
-        let color = if used_by_phase { C_USED_PHASE } else { C_FREE };
+        let non_pcm_role: Option<&String> = sel
+            .non_pcm_hrtim
+            .iter()
+            .find_map(|(tt, r)| if *tt == t { Some(r) } else { None });
+        let color = if used_by_phase {
+            C_USED_PHASE
+        } else if non_pcm_role.is_some() {
+            C_USED_EXT
+        } else {
+            C_FREE
+        };
         draw_timer_block(
             &painter,
             center,
@@ -378,6 +396,18 @@ pub fn show(ui: &mut egui::Ui, sel: &Selection, locks: &ResourceBag) -> Option<R
             locks.contains(&Resource::Timer(t)),
             &format!("{:?}", t),
         );
+        // Compact role badge above the block for non-PCM uses so the
+        // fabric view still surfaces voltage-mode / phase-shift / external
+        // even though these don't live on the DAC→COMP→EEV chain.
+        if let Some(label) = non_pcm_role {
+            painter.text(
+                Pos2::new(center.x, center.y - TIMER_BLOCK_H / 2.0 - 4.0),
+                egui::Align2::CENTER_BOTTOM,
+                label,
+                FontId::monospace(9.5),
+                Color32::from_rgb(130, 190, 210),
+            );
+        }
         // SET/RST slot markers on the left edge.
         for &slot in &[
             TimerInputSlot::Set1,
@@ -416,6 +446,30 @@ pub fn show(ui: &mut egui::Ui, sel: &Selection, locks: &ResourceBag) -> Option<R
                 Color32::from_rgb(200, 180, 80),
             );
         }
+    }
+
+    // Phase-shift peer links: thin dashed-style line between coupled
+    // sub-timer blocks. Dedup so we don't render both (A,B) and (B,A).
+    let mut seen_ps: std::collections::HashSet<(HrtimId, HrtimId)> =
+        std::collections::HashSet::new();
+    for &(a, b) in sel.phase_shift_links {
+        let (lo, hi) = if (a as u8) < (b as u8) { (a, b) } else { (b, a) };
+        if !seen_ps.insert((lo, hi)) { continue; }
+        let pa = pt(a);
+        let pb = pt(b);
+        let left_a = Pos2::new(pa.x - TIMER_BLOCK_W / 2.0, pa.y);
+        let left_b = Pos2::new(pb.x - TIMER_BLOCK_W / 2.0, pb.y);
+        painter.line_segment(
+            [left_a, left_b],
+            Stroke::new(1.5, Color32::from_rgb(130, 190, 210)),
+        );
+        let mid = Pos2::new(left_a.x - 10.0, (left_a.y + left_b.y) / 2.0);
+        painter.text(
+            mid, egui::Align2::RIGHT_CENTER,
+            "φ-shift",
+            FontId::monospace(9.0),
+            Color32::from_rgb(130, 190, 210),
+        );
     }
     for &f in &layout.flts {
         let p = pf(f);

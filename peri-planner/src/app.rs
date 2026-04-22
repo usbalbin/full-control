@@ -157,6 +157,8 @@ impl eframe::App for PeriPlannerApp {
         let phase_timers = self.design.phase_timers_and_dem();
         let phase_edges = self.design.phase_edges();
         let phase_dac_timers = self.design.phase_dac_timers();
+        let non_pcm_hrtim = self.design.non_pcm_hrtim_uses();
+        let phase_shift_links = self.design.phase_shift_links();
         let adc_sequencers: Vec<fabric_view::AdcSequencerView> =
             build_adc_sequencer_views(&self.design);
         let used_timers: Vec<HrtimId> = phase_timers.iter().map(|(t, _)| *t).collect();
@@ -800,6 +802,8 @@ impl eframe::App for PeriPlannerApp {
                             plan_label: plan.as_ref().map(|a| a.label()),
                             phase_dac_timers: &phase_dac_timers,
                             adc_sequencers: &adc_sequencers,
+                            non_pcm_hrtim: &non_pcm_hrtim,
+                            phase_shift_links: &phase_shift_links,
                         },
                         &self.design.locks,
                     );

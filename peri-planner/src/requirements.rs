@@ -261,10 +261,71 @@ pub enum RequirementSpec {
         bkin: bool,
         #[serde(default)]
         etr: bool,
+        #[serde(default)]
+        mode: TimMode,
+        /// Attach a comparator output to this timer's CH1 input capture
+        /// — the typical triac zero-cross topology: mains → resistor
+        /// divider → COMP → TIM input capture → reset timer → delay →
+        /// CH output → triac gate. The link is internal on G474 (COMP
+        /// output routes through TIM's slave-trigger mux), so no pin is
+        /// claimed for the COMP→TIM path itself.
+        #[serde(default)]
+        capture_comp: Option<CompId>,
+        /// Attach a comparator output to BKIN (emergency brake on
+        /// overcurrent etc.). Also internal routing.
+        #[serde(default)]
+        bkin_comp: Option<CompId>,
     },
 }
 
 fn default_tim_channels_mask() -> u8 { 0b0011 }
+
+/// Signals a TIM claim emits given its role + flags. Shared between
+/// `forced_pin_claims` and `used_signals` so the two always agree.
+/// Encoder mode overrides channels_mask: CH1+CH2 only, no CHxN; input-
+/// capture uses CH1 only. PWM mode claims whatever channels_mask says.
+fn tim_claim_signals(
+    instance: TimId,
+    channels_mask: u8,
+    complementary: bool,
+    bkin: bool,
+    etr: bool,
+    mode: TimMode,
+) -> Vec<crate::pinout::Signal> {
+    use crate::pinout::Signal;
+    let mut s = Vec::new();
+    let effective_mask: u8 = match mode {
+        TimMode::Encoder      => 0b0011,
+        TimMode::InputCapture => 0b0001,
+        TimMode::Pwm          => channels_mask,
+    };
+    let effective_complementary = complementary && matches!(mode, TimMode::Pwm);
+    let chs = [
+        crate::g474::TimCh::Ch1, crate::g474::TimCh::Ch2,
+        crate::g474::TimCh::Ch3, crate::g474::TimCh::Ch4,
+    ];
+    for (i, ch) in chs.iter().enumerate() {
+        if effective_mask & (1 << i as u8) != 0 {
+            s.push(Signal::TimCh(instance, *ch));
+            if effective_complementary { s.push(Signal::TimChN(instance, *ch)); }
+        }
+    }
+    if bkin { s.push(Signal::TimBkin(instance)); }
+    if etr  { s.push(Signal::TimEtr(instance)); }
+    s
+}
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum TimMode {
+    /// Output-compare / PWM generation on the claimed channels. Default.
+    #[default]
+    Pwm,
+    /// Quadrature-encoder input on CH1+CH2. No output pins claimed.
+    Encoder,
+    /// Input-capture on CH1 — used with `capture_comp` for COMP→TIM
+    /// slave-reset topologies (triac zero-cross, line-sync etc.).
+    InputCapture,
+}
 
 impl RequirementSpec {
     /// Canonical "add one of each" defaults for the top-panel Add
@@ -294,6 +355,7 @@ impl RequirementSpec {
             Self::UseTim {
                 instance: TimId::Tim2, channels_mask: 0b0011,
                 complementary: false, bkin: false, etr: false,
+                mode: TimMode::Pwm, capture_comp: None, bkin_comp: None,
             },
         ]
     }
@@ -458,10 +520,12 @@ impl RequirementSpec {
             Self::UseTim {
                 instance: TimId::Tim2, channels_mask: 0b0011,
                 complementary: false, bkin: false, etr: false,
+                mode: TimMode::Pwm, capture_comp: None, bkin_comp: None,
             },
             Self::UseTim {
                 instance: TimId::Tim1, channels_mask: 0b0011,
                 complementary: true, bkin: true, etr: false,
+                mode: TimMode::Pwm, capture_comp: None, bkin_comp: None,
             },
         ]
     }
@@ -575,9 +639,21 @@ impl RequirementSpec {
                 if used.contains(&Resource::Ucpd(instance)) { Vec::new() }
                 else { vec![Assignment::Ucpd { instance }] }
             }
-            Self::UseTim { instance, channels_mask, complementary, bkin, etr } => {
-                if used.contains(&Resource::Tim(instance)) { Vec::new() }
-                else { vec![Assignment::Tim { instance, channels_mask, complementary, bkin, etr }] }
+            Self::UseTim {
+                instance, channels_mask, complementary, bkin, etr,
+                mode, capture_comp, bkin_comp,
+            } => {
+                if used.contains(&Resource::Tim(instance)) { return Vec::new(); }
+                if let Some(c) = capture_comp {
+                    if used.contains(&Resource::Comp(c)) { return Vec::new(); }
+                }
+                if let Some(c) = bkin_comp {
+                    if used.contains(&Resource::Comp(c)) { return Vec::new(); }
+                }
+                vec![Assignment::Tim {
+                    instance, channels_mask, complementary, bkin, etr,
+                    mode, capture_comp, bkin_comp,
+                }]
             }
             Self::UseHrtimSub { pinned_sub_timer, role, outputs, fault } => {
                 enumerate_hrtim_sub(pinned_sub_timer, role, outputs, fault, used)
@@ -628,6 +704,9 @@ pub enum Assignment {
         complementary: bool,
         bkin: bool,
         etr: bool,
+        mode: TimMode,
+        capture_comp: Option<CompId>,
+        bkin_comp: Option<CompId>,
     },
     /// Resolved companion to `RequirementSpec::UseHrtimSub`. Enumerator
     /// fills in concrete picks; HrtimResolved matches the role shape.
@@ -714,7 +793,12 @@ impl Assignment {
             Self::Can { instance }        => vec![Resource::Can(*instance)],
             Self::Usb                     => vec![Resource::Usb],
             Self::Ucpd { instance }       => vec![Resource::Ucpd(*instance)],
-            Self::Tim { instance, .. }    => vec![Resource::Tim(*instance)],
+            Self::Tim { instance, capture_comp, bkin_comp, .. } => {
+                let mut r = vec![Resource::Tim(*instance)];
+                if let Some(c) = capture_comp { r.push(Resource::Comp(*c)); }
+                if let Some(c) = bkin_comp    { r.push(Resource::Comp(*c)); }
+                r
+            }
             Self::HrtimSub { sub_timer, resolved, fault, .. } => {
                 let mut r = vec![Resource::Timer(*sub_timer)];
                 if let Some(f) = fault { r.push(Resource::Flt(*f)); }
@@ -819,8 +903,13 @@ impl Assignment {
             Self::Can { instance } => format!("FDCAN{} [TX,RX]", instance.number()),
             Self::Usb => "USB [DP,DM]".to_string(),
             Self::Ucpd { .. } => "UCPD1 [CC1,CC2]".to_string(),
-            Self::Tim { instance, channels_mask, complementary, bkin, etr } => {
+            Self::Tim {
+                instance, channels_mask, complementary, bkin, etr,
+                mode, capture_comp, bkin_comp,
+            } => {
                 let mut tags: Vec<String> = Vec::new();
+                if *mode == TimMode::Encoder { tags.push("encoder".to_string()); }
+                if *mode == TimMode::InputCapture { tags.push("input-cap".to_string()); }
                 for i in 0..4u8 {
                     if channels_mask & (1 << i) != 0 {
                         tags.push(format!("CH{}", i + 1));
@@ -829,6 +918,8 @@ impl Assignment {
                 }
                 if *bkin { tags.push("BKIN".to_string()); }
                 if *etr { tags.push("ETR".to_string()); }
+                if let Some(c) = capture_comp { tags.push(format!("cap←{:?}", c)); }
+                if let Some(c) = bkin_comp    { tags.push(format!("bkin←{:?}", c)); }
                 format!("TIM{} [{}]", instance.number(), tags.join(","))
             }
             Self::HrtimSub { sub_timer, resolved, outputs, fault } => {
@@ -1562,21 +1653,10 @@ impl Design {
                 Assignment::Ucpd { instance } => {
                     vec![Signal::UcpdCc1(*instance), Signal::UcpdCc2(*instance)]
                 }
-                Assignment::Tim { instance, channels_mask, complementary, bkin, etr } => {
-                    let mut s = Vec::new();
-                    let chs = [
-                        crate::g474::TimCh::Ch1, crate::g474::TimCh::Ch2,
-                        crate::g474::TimCh::Ch3, crate::g474::TimCh::Ch4,
-                    ];
-                    for (i, ch) in chs.iter().enumerate() {
-                        if channels_mask & (1 << i as u8) != 0 {
-                            s.push(Signal::TimCh(*instance, *ch));
-                            if *complementary { s.push(Signal::TimChN(*instance, *ch)); }
-                        }
-                    }
-                    if *bkin { s.push(Signal::TimBkin(*instance)); }
-                    if *etr { s.push(Signal::TimEtr(*instance)); }
-                    s
+                Assignment::Tim {
+                    instance, channels_mask, complementary, bkin, etr, mode, ..
+                } => {
+                    tim_claim_signals(*instance, *channels_mask, *complementary, *bkin, *etr, *mode)
                 }
                 Assignment::HrtimSub { sub_timer, outputs, resolved, .. } => {
                     let mut s = vec![Signal::HrtimChannel { timer: *sub_timer, ch: HrtimCh::Ch1 }];
@@ -1701,6 +1781,39 @@ impl Design {
         }).collect()
     }
 
+    /// Non-PCM HRTIM sub-timer uses: voltage-mode PWM, phase-shift FB,
+    /// External. Returns (sub_timer, short role label) pairs so the
+    /// fabric view can tag the timer blocks without dragging the full
+    /// `HrtimResolved` shape into its Selection.
+    pub fn non_pcm_hrtim_uses(&self) -> Vec<(HrtimId, String)> {
+        self.assignments.iter().flatten().filter_map(|a| match a {
+            Assignment::HrtimSub { sub_timer, resolved, .. } => match resolved {
+                HrtimResolved::VoltageModePwm => Some((*sub_timer, "voltage-mode".to_string())),
+                HrtimResolved::PhaseShift { peer, .. } => {
+                    Some((*sub_timer, format!("phase-shift → {:?}", peer)))
+                }
+                HrtimResolved::External => Some((*sub_timer, "generic".to_string())),
+                // PCM roles render via phases() / phase_edges().
+                _ => None,
+            },
+            _ => None,
+        }).collect()
+    }
+
+    /// Phase-shift peer links: each (sub_timer, peer) pair for
+    /// `HrtimResolved::PhaseShift`. Returned so fabric_view can draw a
+    /// distinct edge style between coupled sub-timers.
+    pub fn phase_shift_links(&self) -> Vec<(HrtimId, HrtimId)> {
+        self.assignments.iter().flatten().filter_map(|a| match a {
+            Assignment::HrtimSub {
+                sub_timer,
+                resolved: HrtimResolved::PhaseShift { peer, .. },
+                ..
+            } => Some((*sub_timer, *peer)),
+            _ => None,
+        }).collect()
+    }
+
     pub fn phase_timers_and_dem(&self) -> Vec<(HrtimId, bool)> {
         self.assignments.iter().flatten().filter_map(|a| match a {
             Assignment::HrtimSub { sub_timer, resolved, .. } => match resolved {
@@ -1801,19 +1914,12 @@ impl Design {
                     out.push(Signal::UcpdCc1(*instance));
                     out.push(Signal::UcpdCc2(*instance));
                 }
-                Assignment::Tim { instance, channels_mask, complementary, bkin, etr } => {
-                    let chs = [
-                        crate::g474::TimCh::Ch1, crate::g474::TimCh::Ch2,
-                        crate::g474::TimCh::Ch3, crate::g474::TimCh::Ch4,
-                    ];
-                    for (i, ch) in chs.iter().enumerate() {
-                        if channels_mask & (1 << i as u8) != 0 {
-                            out.push(Signal::TimCh(*instance, *ch));
-                            if *complementary { out.push(Signal::TimChN(*instance, *ch)); }
-                        }
-                    }
-                    if *bkin { out.push(Signal::TimBkin(*instance)); }
-                    if *etr  { out.push(Signal::TimEtr(*instance)); }
+                Assignment::Tim {
+                    instance, channels_mask, complementary, bkin, etr, mode, ..
+                } => {
+                    out.extend(tim_claim_signals(
+                        *instance, *channels_mask, *complementary, *bkin, *etr, *mode,
+                    ));
                 }
                 Assignment::HrtimSub { sub_timer, outputs, resolved, .. } => {
                     out.push(Signal::HrtimChannel { timer: *sub_timer, ch: HrtimCh::Ch1 });

@@ -1,17 +1,17 @@
 //! Timers tab: card grid for TIM1/8/20 (advanced-control) and TIM2-5 /
 //! TIM15-17 (general-purpose). Each card offers CHx / CHxN / BKIN(2) /
-//! ETR checkboxes and a pin picker per active signal.
+//! ETR checkboxes, a mode selector (PWM / Encoder / Input-capture), and
+//! COMP→TIM internal-routing pickers for capture and BKIN (the triac
+//! zero-cross topology uses capture←COMP). Pin pickers below the card
+//! for every signal the chosen config actually claims.
 //!
-//! Inter-peripheral wiring (COMP→TIM capture for triac zero-cross,
-//! TIM→ADC trigger, TIM→DAC, encoder mode, slave-mode trigger) belongs
-//! to a later pass — see the power fabric view for the equivalent on
-//! HRTIM. Hooks for those go into TODO(wiring) markers.
+//! TIM→ADC and TIM→DAC routing is deliberately out of scope per user.
 
 use eframe::egui;
 
-use crate::g474::{TimCh, TimId};
+use crate::g474::{CompId, TimCh, TimId};
 use crate::pinout::{self, ChipVariant, Pin, Signal};
-use crate::requirements::{Assignment, Design, RequirementSpec};
+use crate::requirements::{Assignment, Design, RequirementSpec, TimMode};
 
 pub enum TimersAction {
     SetSpec(usize, RequirementSpec),
@@ -67,8 +67,10 @@ fn render_card(
     req_idx: usize,
 ) -> Option<TimersAction> {
     let mut action: Option<TimersAction> = None;
-    let RequirementSpec::UseTim { instance, channels_mask, complementary, bkin, etr } =
-        design.requirements[req_idx]
+    let RequirementSpec::UseTim {
+        instance, channels_mask, complementary, bkin, etr,
+        mode, capture_comp, bkin_comp,
+    } = design.requirements[req_idx]
     else {
         return None;
     };
@@ -95,55 +97,138 @@ fn render_card(
                         req_idx,
                         RequirementSpec::UseTim {
                             instance: t, channels_mask, complementary, bkin, etr,
+                            mode, capture_comp, bkin_comp,
                         },
                     ));
                 }
             }
         });
 
-    // Channel toggles (CH1-CH4).
-    let mut mask = channels_mask;
-    ui.horizontal(|ui| {
-        for i in 0..4u8 {
-            let mut v = mask & (1 << i) != 0;
-            if ui.checkbox(&mut v, format!("CH{}", i + 1)).clicked() {
-                if v { mask |= 1 << i; } else { mask &= !(1 << i); }
+    // Mode selector: PWM / Encoder / InputCapture.
+    let mut new_mode = mode;
+    egui::ComboBox::from_id_salt(("tim-mode", req_idx))
+        .width(120.0)
+        .selected_text(match mode {
+            TimMode::Pwm => "PWM / compare",
+            TimMode::Encoder => "Encoder (A/B)",
+            TimMode::InputCapture => "Input-capture",
+        })
+        .show_ui(ui, |ui| {
+            for (m, label) in [
+                (TimMode::Pwm, "PWM / compare"),
+                (TimMode::Encoder, "Encoder (A/B)"),
+                (TimMode::InputCapture, "Input-capture"),
+            ] {
+                if ui.selectable_label(mode == m, label).clicked() {
+                    new_mode = m;
+                }
             }
-        }
-    });
+        });
+
+    // Channel toggles only meaningful in PWM mode — Encoder forces CH1+CH2,
+    // InputCapture forces CH1.
+    let mut mask = channels_mask;
+    if matches!(mode, TimMode::Pwm) {
+        ui.horizontal(|ui| {
+            for i in 0..4u8 {
+                let mut v = mask & (1 << i) != 0;
+                if ui.checkbox(&mut v, format!("CH{}", i + 1)).clicked() {
+                    if v { mask |= 1 << i; } else { mask &= !(1 << i); }
+                }
+            }
+        });
+    }
     let mut c = complementary;
     let mut b = bkin;
     let mut e = etr;
-    ui.horizontal(|ui| {
-        ui.checkbox(&mut c, "Complementary (CHxN)");
-    });
+    if matches!(mode, TimMode::Pwm) {
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut c, "Complementary (CHxN)");
+        });
+    }
     ui.horizontal(|ui| {
         ui.checkbox(&mut b, "BKIN");
         ui.checkbox(&mut e, "ETR");
     });
-    if (mask, c, b, e) != (channels_mask, complementary, bkin, etr) {
+
+    // COMP→TIM internal routing: capture input (for triac zero-cross
+    // and line-sync) and BKIN (for overcurrent brake). No pin is
+    // claimed here — the link is internal to the MCU.
+    let mut new_cap = capture_comp;
+    let mut new_bkin_comp = bkin_comp;
+    ui.horizontal(|ui| {
+        ui.label("capture ←");
+        egui::ComboBox::from_id_salt(("tim-cap", req_idx))
+            .width(90.0)
+            .selected_text(match capture_comp {
+                Some(c) => format!("{:?}", c),
+                None => "(none)".to_string(),
+            })
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(capture_comp.is_none(), "(none)").clicked() {
+                    new_cap = None;
+                }
+                for cc in [CompId::Comp1, CompId::Comp2, CompId::Comp3, CompId::Comp4,
+                           CompId::Comp5, CompId::Comp6, CompId::Comp7] {
+                    if ui.selectable_label(capture_comp == Some(cc), format!("{:?}", cc)).clicked() {
+                        new_cap = Some(cc);
+                    }
+                }
+            });
+    });
+    ui.horizontal(|ui| {
+        ui.label("BKIN ←");
+        egui::ComboBox::from_id_salt(("tim-bkincomp", req_idx))
+            .width(90.0)
+            .selected_text(match bkin_comp {
+                Some(c) => format!("{:?}", c),
+                None => "(none)".to_string(),
+            })
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(bkin_comp.is_none(), "(none)").clicked() {
+                    new_bkin_comp = None;
+                }
+                for cc in [CompId::Comp1, CompId::Comp2, CompId::Comp3, CompId::Comp4,
+                           CompId::Comp5, CompId::Comp6, CompId::Comp7] {
+                    if ui.selectable_label(bkin_comp == Some(cc), format!("{:?}", cc)).clicked() {
+                        new_bkin_comp = Some(cc);
+                    }
+                }
+            });
+    });
+
+    if (mask, c, b, e, new_mode, new_cap, new_bkin_comp)
+        != (channels_mask, complementary, bkin, etr, mode, capture_comp, bkin_comp)
+    {
         action = Some(TimersAction::SetSpec(
             req_idx,
             RequirementSpec::UseTim {
                 instance, channels_mask: mask, complementary: c, bkin: b, etr: e,
+                mode: new_mode, capture_comp: new_cap, bkin_comp: new_bkin_comp,
             },
         ));
     }
 
     // Pin pickers for active signals on this timer.
     let Some(Assignment::Tim {
-        instance: ai, channels_mask: am, complementary: ac, bkin: ab, etr: ae,
+        instance: ai, channels_mask: am, complementary: ac, bkin: ab, etr: ae, mode: amode, ..
     }) = design.assignments.get(req_idx).and_then(|a| a.as_ref())
     else {
         ui.label(egui::RichText::new("(not assigned)").weak());
         return action;
     };
+    // Effective channel pins depend on mode — Encoder pins CH1+CH2, InputCapture CH1 only.
+    let (effective_mask, effective_comp) = match amode {
+        TimMode::Encoder      => (0b0011u8, false),
+        TimMode::InputCapture => (0b0001u8, false),
+        TimMode::Pwm          => (*am, *ac),
+    };
     let mut signals: Vec<Signal> = Vec::new();
     let chs = [TimCh::Ch1, TimCh::Ch2, TimCh::Ch3, TimCh::Ch4];
     for (i, ch) in chs.iter().enumerate() {
-        if am & (1 << i as u8) != 0 {
+        if effective_mask & (1 << i as u8) != 0 {
             signals.push(Signal::TimCh(*ai, *ch));
-            if *ac { signals.push(Signal::TimChN(*ai, *ch)); }
+            if effective_comp { signals.push(Signal::TimChN(*ai, *ch)); }
         }
     }
     if *ab { signals.push(Signal::TimBkin(*ai)); }
