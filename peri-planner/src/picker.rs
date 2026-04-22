@@ -37,10 +37,11 @@ pub enum PickedRole {
         signal: Signal,
         current_pin: Pin,
     },
-    /// A PCM phase's HRTIM channel pin. Picking this up lets the user
-    /// retarget the whole phase to a different timer — the paired channel
-    /// (CH1↔CH2 on the same timer) moves automatically.
-    PcmPhaseChannel {
+    /// An HRTIM sub-timer output-channel pin. Picking it up retargets the
+    /// whole sub-timer use (PCM / voltage-mode / phase-shift / etc.) to a
+    /// different sub-timer; the paired channel (CH1↔CH2) — if present —
+    /// moves automatically.
+    HrtimSubChannel {
         req_idx: usize,
         current_pin: Pin,
         current_timer: HrtimId,
@@ -53,7 +54,7 @@ impl PickedRole {
         match self {
             Self::AdcConversion { current_pin, .. }
             | Self::AltPinSignal { current_pin, .. }
-            | Self::PcmPhaseChannel { current_pin, .. } => *current_pin,
+            | Self::HrtimSubChannel { current_pin, .. } => *current_pin,
         }
     }
 
@@ -71,9 +72,9 @@ impl PickedRole {
                 )
             }
             Self::AltPinSignal { signal, .. } => signal.name(),
-            Self::PcmPhaseChannel { current_timer, current_ch, req_idx, .. } => {
+            Self::HrtimSubChannel { current_timer, current_ch, req_idx, .. } => {
                 let ch = match current_ch { HrtimCh::Ch1 => "CH1", HrtimCh::Ch2 => "CH2" };
-                format!("PCM phase #{} {} on {:?}", req_idx + 1, ch, current_timer)
+                format!("HRTIM #{} {} on {:?}", req_idx + 1, ch, current_timer)
             }
         }
     }
@@ -106,14 +107,12 @@ pub fn role_for_pin(
             None
         }
         Signal::HrtimChannel { timer, ch } => {
-            // Find the PcmPhase assignment using this timer. Retargeting it
-            // to a different timer moves both CH1 and CH2.
+            // Find the HrtimSub assignment using this sub-timer. Retargeting
+            // moves both CH1 and CH2 (for Ch1AndCh2 outputs).
             for (idx, asn) in design.assignments.iter().enumerate() {
-                if let Some(Assignment::PcmPhase { timer: t, .. })
-                    | Some(Assignment::PcmPhaseExternal { timer: t, .. }) = asn
-                {
+                if let Some(Assignment::HrtimSub { sub_timer: t, .. }) = asn {
                     if *t == timer {
-                        return Some(PickedRole::PcmPhaseChannel {
+                        return Some(PickedRole::HrtimSubChannel {
                             req_idx: idx,
                             current_pin: pin,
                             current_timer: timer,
@@ -334,7 +333,7 @@ fn compute_move(
         PickedRole::AltPinSignal { signal, current_pin } => {
             compute_alt_pin_move(design, variant, signal, current_pin, target, pin_signals)
         }
-        PickedRole::PcmPhaseChannel { req_idx, current_timer, current_ch, .. } => {
+        PickedRole::HrtimSubChannel { req_idx, current_timer, current_ch, .. } => {
             compute_phase_move(design, variant, req_idx, current_timer, current_ch, target)
         }
     }
@@ -361,10 +360,13 @@ fn compute_phase_move(
     if new_timer == current_timer {
         return MoveResult::NotApplicable;
     }
-    // Is this phase DEM-capable? (We need to preserve CR4/CPT2 claims.)
+    // Is this HRTIM use DEM-capable? (Preserves CR4/CPT2 claims on move.)
     let dem = match design.assignments.get(req_idx) {
-        Some(Some(Assignment::PcmPhase { dem, .. })) => *dem,
-        Some(Some(Assignment::PcmPhaseExternal { dem, .. })) => *dem,
+        Some(Some(Assignment::HrtimSub { resolved, .. })) => match resolved {
+            crate::requirements::HrtimResolved::PcmInternal { dem, .. }
+            | crate::requirements::HrtimResolved::PcmExternal { dem, .. } => *dem,
+            _ => false,
+        },
         _ => false,
     };
     // Resource pool excluding this phase's own claims.
@@ -639,7 +641,7 @@ pub fn resolve_move(
             })
         }
         (MoveResult::Direct { .. } | MoveResult::Semantic { .. },
-         PickedRole::PcmPhaseChannel { req_idx, current_ch, .. }) => {
+         PickedRole::HrtimSubChannel { req_idx, current_ch, .. }) => {
             let new_timer = pinout::signals_on(target, variant)
                 .into_iter()
                 .find_map(|(_, s)| match s {
@@ -686,15 +688,12 @@ pub fn apply_move(design: &mut Design, variant: ChipVariant, mv: AppliedMove) {
             design.set_pin(signal, new_pin);
         }
         PrimaryMove::RetargetPhaseTimer { req_idx, new_timer } => {
-            // Mutate the PcmPhase / PcmPhaseExternal assignment to point at
-            // the new timer, keeping everything else.
+            // Repoint the HrtimSub assignment to a different sub-timer,
+            // preserving resolved picks (DAC/COMP/EEV, outputs, etc.).
             let new_asn = match design.assignments.get(req_idx).and_then(|a| a.clone()) {
-                Some(Assignment::PcmPhase { alloc, zcd_eev, dem, .. }) => {
-                    Some(Assignment::PcmPhase { alloc, zcd_eev, timer: new_timer, dem })
-                }
-                Some(Assignment::PcmPhaseExternal { dac, peak_eev, zcd_eev, dem, .. }) => {
-                    Some(Assignment::PcmPhaseExternal {
-                        dac, peak_eev, zcd_eev, timer: new_timer, dem,
+                Some(Assignment::HrtimSub { resolved, outputs, fault, .. }) => {
+                    Some(Assignment::HrtimSub {
+                        sub_timer: new_timer, resolved, outputs, fault,
                     })
                 }
                 _ => None,

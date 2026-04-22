@@ -38,21 +38,6 @@ impl MonitorPurpose {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum ThresholdSource {
-    /// Internal COMP + fast DAC for peak detection. With DEM, the same
-    /// COMP handles zero-crossing via INM-swap (DMA or firmware).
-    Internal,
-    /// Internal COMP + fast DAC for peak (with slope comp), plus a
-    /// dedicated external comp on a second EEV for zero-crossing.
-    /// Meaningful only when DEM is enabled.
-    InternalExtZcd,
-    /// External comp for peak detection (no slope comp — slow DAC can't
-    /// drive a sawtooth at 1 MHz). With DEM, a second external comp on
-    /// another EEV handles zero-crossing.
-    External,
-}
-
 /// ADC sequencer mode. `Dual*` kinds couple Adc1+Adc2 or Adc3+Adc4 and can
 /// only be placed on the master (Adc1 or Adc3).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
@@ -175,19 +160,50 @@ pub fn compare_slot_for_event(ev: CrossbarSource) -> Option<Resource> {
 
 pub type ResourceBag = HashSet<Resource>;
 
+/// Which of an HRTIM sub-timer's two output channels this use claims.
+/// `Ch1Only` is typical for single-ended buck/boost / voltage-mode PWM;
+/// `Ch1AndCh2` is required for DEM (CH2 drives the INM-swap), for
+/// phase-shift full-bridge (two complementary legs), and for classic
+/// PCM phases that already used both.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum OutputMode { Ch1Only, Ch1AndCh2 }
+
+/// What an HRTIM sub-timer is doing. User intent, serialized as part of
+/// a `RequirementSpec::UseHrtimSub`. The solver resolves this into a
+/// concrete `HrtimResolved` at assignment time (DAC/COMP/EEV picks).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum HrtimRole {
+    /// Peak-current-mode with internal comparator + fast DAC. `ext_zcd`
+    /// routes a second EEV for zero-crossing detect in DEM mode.
+    PcmInternal { ext_zcd: bool, dem: bool },
+    /// PCM with an external comparator feeding the EEV directly.
+    /// `with_slow_dac` reserves a slow DAC as the threshold reference.
+    PcmExternal { with_slow_dac: bool, ext_zcd: bool, dem: bool },
+    /// Voltage-mode PWM — no current loop, duty controlled by firmware.
+    /// Fabric claims the sub-timer + output pin(s); nothing else.
+    VoltageModePwm,
+    /// Phase-shift full-bridge / LLC. Two coupled sub-timers; optionally
+    /// pin the peer, else solver picks a free partner.
+    PhaseShift { peer_sub_timer: Option<HrtimId> },
+    /// Free-form use the planner shouldn't constrain. Claims the
+    /// sub-timer + optional fault input only — user picks output pins
+    /// (if any) manually via the package view.
+    External,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum RequirementSpec {
-    PcmPhase {
-        dem: bool,
-        threshold: ThresholdSource,
-        /// Pin this phase to a specific HRTIM sub-timer. `None` = solver
-        /// picks the first free timer (legacy behavior, useful when you
-        /// just need N phases and don't care which sub-timers they land
-        /// on). Set to `Some` when a specific sub-timer matters — e.g.
-        /// reserving TimF for an auxiliary topology that needs its TimF
-        /// event slots, or making sure TimA is kept for a fast phase.
+    /// Canonical HRTIM sub-timer use — unifies PCM (internal/external),
+    /// voltage-mode PWM, phase-shift full-bridge, and free-form External
+    /// under one shape. Preset Add-buttons pre-fill this with sensible
+    /// defaults per role; users can switch role via the per-row combo.
+    UseHrtimSub {
         #[serde(default)]
-        preferred_timer: Option<HrtimId>,
+        pinned_sub_timer: Option<HrtimId>,
+        role: HrtimRole,
+        outputs: OutputMode,
+        #[serde(default)]
+        fault: Option<HrtimFltId>,
     },
     ShortCircuitFault,
     ShareBusDrive,
@@ -258,9 +274,6 @@ impl RequirementSpec {
     pub fn add_palette() -> &'static [Self] {
         &[
             // Power
-            Self::PcmPhase {
-                dem: false, threshold: ThresholdSource::Internal, preferred_timer: None,
-            },
             Self::ShortCircuitFault,
             Self::ShareBusDrive,
             Self::UseOpamp {
@@ -277,10 +290,59 @@ impl RequirementSpec {
                 group: 0, purpose: MonitorPurpose::VOut,
                 adc_pref: None, speed: SpeedPref::Any,
             },
-            // Timer (HRTIM has its own tab's Add flow; this is for TIM*)
+            // Timer (HRTIM has its own menu — see hrtim_palette; this is for TIM*)
             Self::UseTim {
                 instance: TimId::Tim2, channels_mask: 0b0011,
                 complementary: false, bkin: false, etr: false,
+            },
+        ]
+    }
+
+    /// HRTIM sub-timer presets (one `HRTIM ▾` menu entry each). All are
+    /// `UseHrtimSub` with a role-specific pre-fill.
+    pub fn hrtim_palette() -> &'static [Self] {
+        &[
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PcmInternal { ext_zcd: false, dem: false },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PcmInternal { ext_zcd: false, dem: true },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PcmInternal { ext_zcd: true, dem: true },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PcmExternal { with_slow_dac: true, ext_zcd: false, dem: false },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::VoltageModePwm,
+                outputs: OutputMode::Ch1Only,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PhaseShift { peer_sub_timer: None },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::External,
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
             },
         ]
     }
@@ -303,11 +365,54 @@ impl RequirementSpec {
 
     pub fn palette() -> &'static [Self] {
         &[
-            Self::PcmPhase { dem: false, threshold: ThresholdSource::Internal, preferred_timer: None },
-            Self::PcmPhase { dem: true, threshold: ThresholdSource::Internal, preferred_timer: None },
-            Self::PcmPhase { dem: true, threshold: ThresholdSource::InternalExtZcd, preferred_timer: None },
-            Self::PcmPhase { dem: false, threshold: ThresholdSource::External, preferred_timer: None },
-            Self::PcmPhase { dem: true, threshold: ThresholdSource::External, preferred_timer: None },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PcmInternal { ext_zcd: false, dem: false },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PcmInternal { ext_zcd: false, dem: true },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PcmInternal { ext_zcd: true, dem: true },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PcmExternal { with_slow_dac: true, ext_zcd: false, dem: false },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PcmExternal { with_slow_dac: true, ext_zcd: true, dem: true },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::VoltageModePwm,
+                outputs: OutputMode::Ch1Only,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PhaseShift { peer_sub_timer: None },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            },
+            Self::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::External,
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            },
             Self::ShortCircuitFault,
             Self::ShareBusDrive,
             Self::AdcSequencer {
@@ -363,19 +468,6 @@ impl RequirementSpec {
 
     pub fn name(self) -> String {
         match self {
-            Self::PcmPhase { dem, threshold, preferred_timer } => {
-                let base = match (dem, threshold) {
-                    (false, ThresholdSource::Internal) => "PCM phase",
-                    (true,  ThresholdSource::Internal) => "PCM phase + DEM",
-                    (_,     ThresholdSource::InternalExtZcd) => "PCM phase + DEM (int peak, ext ZCD)",
-                    (false, ThresholdSource::External) => "PCM phase (ext COMP)",
-                    (true,  ThresholdSource::External) => "PCM phase + DEM (ext COMP)",
-                };
-                match preferred_timer {
-                    Some(t) => format!("{} on {:?}", base, t),
-                    None => base.to_string(),
-                }
-            }
             Self::ShortCircuitFault => "Short-circuit fault".into(),
             Self::ShareBusDrive => "Share-bus drive".into(),
             Self::AdcSequencer { adc, kind, trigger } => {
@@ -409,6 +501,27 @@ impl RequirementSpec {
                 if tags.is_empty() { format!("TIM{}", instance.number()) }
                 else { format!("TIM{} [{}]", instance.number(), tags.join(",")) }
             }
+            Self::UseHrtimSub { pinned_sub_timer, role, .. } => {
+                let base = match role {
+                    HrtimRole::PcmInternal { ext_zcd, dem } => match (ext_zcd, dem) {
+                        (false, false) => "HRTIM PCM".to_string(),
+                        (false, true)  => "HRTIM PCM + DEM".to_string(),
+                        (true,  _)     => "HRTIM PCM + DEM (ext ZCD)".to_string(),
+                    },
+                    HrtimRole::PcmExternal { dem, ext_zcd, .. } => match (ext_zcd, dem) {
+                        (false, false) => "HRTIM PCM (ext COMP)".to_string(),
+                        (false, true)  => "HRTIM PCM + DEM (ext COMP)".to_string(),
+                        (true,  _)     => "HRTIM PCM + DEM (ext COMP, ext ZCD)".to_string(),
+                    },
+                    HrtimRole::VoltageModePwm => "HRTIM voltage-mode PWM".to_string(),
+                    HrtimRole::PhaseShift { .. } => "HRTIM phase-shift FB".to_string(),
+                    HrtimRole::External => "HRTIM (generic)".to_string(),
+                };
+                match pinned_sub_timer {
+                    Some(t) => format!("{} on {:?}", base, t),
+                    None => base,
+                }
+            }
         }
     }
 
@@ -419,15 +532,6 @@ impl RequirementSpec {
         variant: crate::pinout::ChipVariant,
     ) -> Vec<Assignment> {
         match self {
-            Self::PcmPhase { dem, threshold: ThresholdSource::Internal, preferred_timer } => {
-                enumerate_pcm_phase_internal(dem, None, preferred_timer, used)
-            }
-            Self::PcmPhase { threshold: ThresholdSource::InternalExtZcd, preferred_timer, .. } => {
-                enumerate_pcm_phase_hybrid(preferred_timer, used)
-            }
-            Self::PcmPhase { dem, threshold: ThresholdSource::External, preferred_timer } => {
-                enumerate_pcm_phase_external(dem, preferred_timer, used)
-            }
             Self::ShortCircuitFault => enumerate_fault(used),
             Self::ShareBusDrive => enumerate_drive(used),
             Self::AdcSequencer { adc, kind, trigger } => {
@@ -475,27 +579,15 @@ impl RequirementSpec {
                 if used.contains(&Resource::Tim(instance)) { Vec::new() }
                 else { vec![Assignment::Tim { instance, channels_mask, complementary, bkin, etr }] }
             }
+            Self::UseHrtimSub { pinned_sub_timer, role, outputs, fault } => {
+                enumerate_hrtim_sub(pinned_sub_timer, role, outputs, fault, used)
+            }
         }
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Assignment {
-    PcmPhase {
-        alloc: PhaseAllocation,
-        /// External-ZCD EEV when using the hybrid "internal peak, external
-        /// ZCD" path. `None` for pure-internal (INM-swap DEM) or non-DEM.
-        zcd_eev: Option<CrossbarSource>,
-        timer: HrtimId,
-        dem: bool,
-    },
-    PcmPhaseExternal {
-        dac: Option<DacId>,
-        peak_eev: CrossbarSource,
-        zcd_eev: Option<CrossbarSource>,
-        timer: HrtimId,
-        dem: bool,
-    },
     ShortCircuitFault(ShortCircuitFault),
     ShareBusDrive(ShareBusDrive),
     AdcSequencer {
@@ -537,42 +629,39 @@ pub enum Assignment {
         bkin: bool,
         etr: bool,
     },
+    /// Resolved companion to `RequirementSpec::UseHrtimSub`. Enumerator
+    /// fills in concrete picks; HrtimResolved matches the role shape.
+    HrtimSub {
+        sub_timer: HrtimId,
+        resolved: HrtimResolved,
+        outputs: OutputMode,
+        fault: Option<HrtimFltId>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HrtimResolved {
+    PcmInternal {
+        dac: DacId,
+        comp: CompId,
+        eev: CrossbarSource,
+        zcd_eev: Option<CrossbarSource>,
+        dem: bool,
+    },
+    PcmExternal {
+        dac: Option<DacId>,
+        peak_eev: CrossbarSource,
+        zcd_eev: Option<CrossbarSource>,
+        dem: bool,
+    },
+    VoltageModePwm,
+    PhaseShift { peer: HrtimId, phase_shift_q15: u16 },
+    External,
 }
 
 impl Assignment {
     pub fn consumed(&self) -> Vec<Resource> {
         match self {
-            Self::PcmPhase { alloc, zcd_eev, timer, dem } => {
-                let mut r = vec![
-                    Resource::Dac(alloc.dac),
-                    Resource::Comp(alloc.comp),
-                    Resource::Eev(alloc.eev),
-                    Resource::Timer(*timer),
-                    Resource::TimerSlot(*timer, TimerCompareSlot::Cr2),
-                ];
-                if let Some(z) = zcd_eev {
-                    r.push(Resource::Eev(*z));
-                }
-                if *dem {
-                    r.push(Resource::TimerSlot(*timer, TimerCompareSlot::Cr4));
-                    r.push(Resource::TimerCapture(*timer, TimerCaptureUnit::Cpt2));
-                }
-                r
-            }
-            Self::PcmPhaseExternal { dac, peak_eev, zcd_eev, timer, dem } => {
-                let mut r = vec![Resource::Eev(*peak_eev), Resource::Timer(*timer)];
-                if let Some(d) = dac {
-                    r.push(Resource::Dac(*d));
-                }
-                if let Some(z) = zcd_eev {
-                    r.push(Resource::Eev(*z));
-                }
-                if *dem {
-                    r.push(Resource::TimerSlot(*timer, TimerCompareSlot::Cr4));
-                    r.push(Resource::TimerCapture(*timer, TimerCaptureUnit::Cpt2));
-                }
-                r
-            }
             Self::ShortCircuitFault(f) => vec![
                 Resource::Dac(f.dac),
                 Resource::Comp(f.comp),
@@ -626,37 +715,43 @@ impl Assignment {
             Self::Usb                     => vec![Resource::Usb],
             Self::Ucpd { instance }       => vec![Resource::Ucpd(*instance)],
             Self::Tim { instance, .. }    => vec![Resource::Tim(*instance)],
+            Self::HrtimSub { sub_timer, resolved, fault, .. } => {
+                let mut r = vec![Resource::Timer(*sub_timer)];
+                if let Some(f) = fault { r.push(Resource::Flt(*f)); }
+                match resolved {
+                    HrtimResolved::PcmInternal { dac, comp, eev, zcd_eev, dem } => {
+                        r.push(Resource::Dac(*dac));
+                        r.push(Resource::Comp(*comp));
+                        r.push(Resource::Eev(*eev));
+                        r.push(Resource::TimerSlot(*sub_timer, TimerCompareSlot::Cr2));
+                        if let Some(z) = zcd_eev { r.push(Resource::Eev(*z)); }
+                        if *dem {
+                            r.push(Resource::TimerSlot(*sub_timer, TimerCompareSlot::Cr4));
+                            r.push(Resource::TimerCapture(*sub_timer, TimerCaptureUnit::Cpt2));
+                        }
+                    }
+                    HrtimResolved::PcmExternal { dac, peak_eev, zcd_eev, dem } => {
+                        r.push(Resource::Eev(*peak_eev));
+                        if let Some(d) = dac { r.push(Resource::Dac(*d)); }
+                        if let Some(z) = zcd_eev { r.push(Resource::Eev(*z)); }
+                        if *dem {
+                            r.push(Resource::TimerSlot(*sub_timer, TimerCompareSlot::Cr4));
+                            r.push(Resource::TimerCapture(*sub_timer, TimerCaptureUnit::Cpt2));
+                        }
+                    }
+                    HrtimResolved::VoltageModePwm => {}
+                    HrtimResolved::PhaseShift { peer, .. } => {
+                        r.push(Resource::Timer(*peer));
+                    }
+                    HrtimResolved::External => {}
+                }
+                r
+            }
         }
     }
 
     pub fn label(&self) -> String {
         match self {
-            Self::PcmPhase { alloc, zcd_eev, timer, dem } => {
-                let zcd = match zcd_eev {
-                    Some(z) => format!(", extZCD={:?}", z),
-                    None => String::new(),
-                };
-                format!(
-                    "{:?}: {:?} -> {:?} -> {:?}{}{}",
-                    timer, alloc.dac, alloc.comp, alloc.eev, zcd,
-                    if *dem { " +DEM" } else { "" }
-                )
-            }
-            Self::PcmPhaseExternal { dac, peak_eev, zcd_eev, timer, dem } => {
-                let src = match dac {
-                    Some(d) => format!("{:?}", d),
-                    None => "fixed-ref".to_string(),
-                };
-                let zcd = match zcd_eev {
-                    Some(z) => format!(", ZCD={:?}", z),
-                    None => String::new(),
-                };
-                format!(
-                    "{:?}: [ext] {} -> peak={:?}{}{}",
-                    timer, src, peak_eev, zcd,
-                    if *dem { " +DEM" } else { "" }
-                )
-            }
             Self::ShortCircuitFault(f) => {
                 format!("{:?} -> {:?} -> {:?}", f.dac, f.comp, f.flt)
             }
@@ -736,6 +831,46 @@ impl Assignment {
                 if *etr { tags.push("ETR".to_string()); }
                 format!("TIM{} [{}]", instance.number(), tags.join(","))
             }
+            Self::HrtimSub { sub_timer, resolved, outputs, fault } => {
+                let out_tag = match outputs {
+                    OutputMode::Ch1Only => "CH1",
+                    OutputMode::Ch1AndCh2 => "CH1+CH2",
+                };
+                let flt_tag = match fault {
+                    Some(f) => format!(" flt={:?}", f),
+                    None => String::new(),
+                };
+                let body = match resolved {
+                    HrtimResolved::PcmInternal { dac, comp, eev, zcd_eev, dem } => {
+                        let z = match zcd_eev {
+                            Some(z) => format!(", extZCD={:?}", z),
+                            None => String::new(),
+                        };
+                        format!("PCM {:?}→{:?}→{:?}{}{}",
+                            dac, comp, eev, z,
+                            if *dem { " +DEM" } else { "" })
+                    }
+                    HrtimResolved::PcmExternal { dac, peak_eev, zcd_eev, dem } => {
+                        let src = match dac {
+                            Some(d) => format!("{:?}", d),
+                            None => "fixed-ref".to_string(),
+                        };
+                        let z = match zcd_eev {
+                            Some(z) => format!(", ZCD={:?}", z),
+                            None => String::new(),
+                        };
+                        format!("[ext] {} → peak {:?}{}{}",
+                            src, peak_eev, z,
+                            if *dem { " +DEM" } else { "" })
+                    }
+                    HrtimResolved::VoltageModePwm => "voltage-mode PWM".to_string(),
+                    HrtimResolved::PhaseShift { peer, phase_shift_q15 } => {
+                        format!("phase-shift peer={:?} φ=Q15({})", peer, phase_shift_q15)
+                    }
+                    HrtimResolved::External => "generic".to_string(),
+                };
+                format!("{:?}: {} [{}]{}", sub_timer, body, out_tag, flt_tag)
+            }
         }
     }
 }
@@ -749,109 +884,157 @@ const ALL_TIMERS: &[HrtimId] = &[
     HrtimId::TimD, HrtimId::TimE, HrtimId::TimF,
 ];
 
-fn enumerate_pcm_phase_internal(
-    dem: bool,
-    zcd_eev_override: Option<CrossbarSource>,
-    preferred_timer: Option<HrtimId>,
+/// Canonical HRTIM sub-timer enumerator. Dispatches on `HrtimRole` and
+/// yields resolved-picks in `Assignment::HrtimSub`.
+fn enumerate_hrtim_sub(
+    pinned_sub_timer: Option<HrtimId>,
+    role: HrtimRole,
+    outputs: OutputMode,
+    fault: Option<HrtimFltId>,
     used: &ResourceBag,
 ) -> Vec<Assignment> {
-    let mut out = Vec::new();
-    let pinned = preferred_timer.map(|t| [t]);
+    // Reject invalid role × outputs combos. DEM always needs CH2; phase-shift
+    // always needs both channels.
+    let dem_implied = matches!(
+        role,
+        HrtimRole::PcmInternal { dem: true, .. }
+        | HrtimRole::PcmExternal { dem: true, .. }
+    );
+    if dem_implied && outputs == OutputMode::Ch1Only { return Vec::new(); }
+    if matches!(role, HrtimRole::PhaseShift { .. }) && outputs == OutputMode::Ch1Only {
+        return Vec::new();
+    }
+
+    let pinned = pinned_sub_timer.map(|t| [t]);
     let timers: &[HrtimId] = match &pinned {
         Some(arr) => arr,
         None => ALL_TIMERS,
     };
-    for &dac in FAST_DACS {
-        if used.contains(&Resource::Dac(dac)) { continue; }
-        for &comp in comps_for_dac(dac) {
-            if used.contains(&Resource::Comp(comp)) { continue; }
-            for &eev in eevs_for_comp(comp) {
-                if used.contains(&Resource::Eev(eev)) { continue; }
-                for &timer in timers {
-                    if used.contains(&Resource::Timer(timer)) { continue; }
-                    if used.contains(&Resource::TimerSlot(timer, TimerCompareSlot::Cr2)) { continue; }
-                    if dem && used.contains(&Resource::TimerSlot(timer, TimerCompareSlot::Cr4)) { continue; }
-                    out.push(Assignment::PcmPhase {
-                        alloc: PhaseAllocation { dac, comp, eev },
-                        zcd_eev: zcd_eev_override,
-                        timer,
-                        dem,
+
+    // Fault resource must be free regardless of role.
+    if let Some(f) = fault {
+        if used.contains(&Resource::Flt(f)) { return Vec::new(); }
+    }
+
+    let mut out = Vec::new();
+    match role {
+        HrtimRole::PcmInternal { ext_zcd, dem } => {
+            let zcd_eevs: Vec<Option<CrossbarSource>> = if ext_zcd {
+                ALL_EEVS.iter().copied()
+                    .filter(|z| !used.contains(&Resource::Eev(*z)))
+                    .map(Some).collect()
+            } else {
+                vec![None]
+            };
+            for &dac in FAST_DACS {
+                if used.contains(&Resource::Dac(dac)) { continue; }
+                for &comp in comps_for_dac(dac) {
+                    if used.contains(&Resource::Comp(comp)) { continue; }
+                    for &eev in eevs_for_comp(comp) {
+                        if used.contains(&Resource::Eev(eev)) { continue; }
+                        for &sub_timer in timers {
+                            if used.contains(&Resource::Timer(sub_timer)) { continue; }
+                            if used.contains(&Resource::TimerSlot(sub_timer, TimerCompareSlot::Cr2)) { continue; }
+                            if dem && used.contains(&Resource::TimerSlot(sub_timer, TimerCompareSlot::Cr4)) { continue; }
+                            for &zcd_eev in &zcd_eevs {
+                                if matches!(zcd_eev, Some(z) if z == eev) { continue; }
+                                out.push(Assignment::HrtimSub {
+                                    sub_timer,
+                                    resolved: HrtimResolved::PcmInternal {
+                                        dac, comp, eev, zcd_eev, dem,
+                                    },
+                                    outputs, fault,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        HrtimRole::PcmExternal { with_slow_dac, ext_zcd, dem } => {
+            let dac_options: Vec<Option<DacId>> = if with_slow_dac {
+                let mut v = Vec::new();
+                for &d in SLOW_DACS {
+                    if !used.contains(&Resource::Dac(d)) { v.push(Some(d)); }
+                }
+                v
+            } else {
+                vec![None]
+            };
+            for &peak_eev in ALL_EEVS {
+                if used.contains(&Resource::Eev(peak_eev)) { continue; }
+                let zcd_options: Vec<Option<CrossbarSource>> = if ext_zcd {
+                    ALL_EEVS.iter().copied()
+                        .filter(|e| *e != peak_eev && !used.contains(&Resource::Eev(*e)))
+                        .map(Some).collect()
+                } else {
+                    vec![None]
+                };
+                for &sub_timer in timers {
+                    if used.contains(&Resource::Timer(sub_timer)) { continue; }
+                    if dem && used.contains(&Resource::TimerSlot(sub_timer, TimerCompareSlot::Cr4)) { continue; }
+                    for &dac in &dac_options {
+                        for &zcd_eev in &zcd_options {
+                            out.push(Assignment::HrtimSub {
+                                sub_timer,
+                                resolved: HrtimResolved::PcmExternal {
+                                    dac, peak_eev, zcd_eev, dem,
+                                },
+                                outputs, fault,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        HrtimRole::VoltageModePwm => {
+            for &sub_timer in timers {
+                if used.contains(&Resource::Timer(sub_timer)) { continue; }
+                out.push(Assignment::HrtimSub {
+                    sub_timer,
+                    resolved: HrtimResolved::VoltageModePwm,
+                    outputs, fault,
+                });
+            }
+        }
+        HrtimRole::PhaseShift { peer_sub_timer } => {
+            let peers: Vec<HrtimId> = match peer_sub_timer {
+                Some(p) => vec![p],
+                None => ALL_TIMERS.to_vec(),
+            };
+            for &sub_timer in timers {
+                if used.contains(&Resource::Timer(sub_timer)) { continue; }
+                for &peer in &peers {
+                    if peer == sub_timer { continue; }
+                    if used.contains(&Resource::Timer(peer)) { continue; }
+                    out.push(Assignment::HrtimSub {
+                        sub_timer,
+                        resolved: HrtimResolved::PhaseShift { peer, phase_shift_q15: 16384 },
+                        outputs, fault,
                     });
                 }
+            }
+        }
+        HrtimRole::External => {
+            for &sub_timer in timers {
+                if used.contains(&Resource::Timer(sub_timer)) { continue; }
+                out.push(Assignment::HrtimSub {
+                    sub_timer,
+                    resolved: HrtimResolved::External,
+                    outputs, fault,
+                });
             }
         }
     }
     out
 }
 
-fn enumerate_pcm_phase_hybrid(
-    preferred_timer: Option<HrtimId>,
-    used: &ResourceBag,
-) -> Vec<Assignment> {
-    const EEVS: &[CrossbarSource] = &[
-        CrossbarSource::Eev1, CrossbarSource::Eev2, CrossbarSource::Eev3,
-        CrossbarSource::Eev4, CrossbarSource::Eev5, CrossbarSource::Eev6,
-        CrossbarSource::Eev7, CrossbarSource::Eev8, CrossbarSource::Eev9,
-        CrossbarSource::Eev10,
-    ];
-    let mut out = Vec::new();
-    for &zcd in EEVS {
-        if used.contains(&Resource::Eev(zcd)) { continue; }
-        for candidate in enumerate_pcm_phase_internal(true, Some(zcd), preferred_timer, used) {
-            if let Assignment::PcmPhase { alloc, .. } = &candidate {
-                if alloc.eev == zcd { continue; }
-            }
-            out.push(candidate);
-        }
-    }
-    out
-}
-
-fn enumerate_pcm_phase_external(
-    dem: bool,
-    preferred_timer: Option<HrtimId>,
-    used: &ResourceBag,
-) -> Vec<Assignment> {
-    const EEVS: &[CrossbarSource] = &[
-        CrossbarSource::Eev1, CrossbarSource::Eev2, CrossbarSource::Eev3,
-        CrossbarSource::Eev4, CrossbarSource::Eev5, CrossbarSource::Eev6,
-        CrossbarSource::Eev7, CrossbarSource::Eev8, CrossbarSource::Eev9,
-        CrossbarSource::Eev10,
-    ];
-    let mut out = Vec::new();
-    let dac_options: Vec<Option<DacId>> = {
-        let mut v = vec![None];
-        for &d in SLOW_DACS {
-            if !used.contains(&Resource::Dac(d)) { v.push(Some(d)); }
-        }
-        v
-    };
-    let pinned = preferred_timer.map(|t| [t]);
-    let timers: &[HrtimId] = match &pinned {
-        Some(arr) => arr,
-        None => ALL_TIMERS,
-    };
-    for &peak_eev in EEVS {
-        if used.contains(&Resource::Eev(peak_eev)) { continue; }
-        let zcd_options: Vec<Option<CrossbarSource>> = if dem {
-            EEVS.iter().copied()
-                .filter(|e| *e != peak_eev && !used.contains(&Resource::Eev(*e)))
-                .map(Some).collect()
-        } else { vec![None] };
-        for &timer in timers {
-            if used.contains(&Resource::Timer(timer)) { continue; }
-            if dem && used.contains(&Resource::TimerSlot(timer, TimerCompareSlot::Cr4)) { continue; }
-            for dac in &dac_options {
-                for zcd in &zcd_options {
-                    out.push(Assignment::PcmPhaseExternal {
-                        dac: *dac, peak_eev, zcd_eev: *zcd, timer, dem,
-                    });
-                }
-            }
-        }
-    }
-    out
-}
+const ALL_EEVS: &[CrossbarSource] = &[
+    CrossbarSource::Eev1, CrossbarSource::Eev2, CrossbarSource::Eev3,
+    CrossbarSource::Eev4, CrossbarSource::Eev5, CrossbarSource::Eev6,
+    CrossbarSource::Eev7, CrossbarSource::Eev8, CrossbarSource::Eev9,
+    CrossbarSource::Eev10,
+];
 
 fn enumerate_fault(used: &ResourceBag) -> Vec<Assignment> {
     let mut out = Vec::new();
@@ -1103,7 +1286,7 @@ fn default_format_version() -> u32 { DESIGN_FORMAT_VERSION }
 /// Bump whenever the Design schema changes in a way that can't safely
 /// round-trip older saves. The app's STORAGE_KEY is bumped in lockstep
 /// so old saves don't load under a newer schema.
-pub const DESIGN_FORMAT_VERSION: u32 = 2;
+pub const DESIGN_FORMAT_VERSION: u32 = 3;
 
 #[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Design {
@@ -1136,8 +1319,11 @@ impl Default for Design {
             variant: default_variant(),
         };
         for _ in 0..4 {
-            d.add(RequirementSpec::PcmPhase {
-                dem: false, threshold: ThresholdSource::Internal, preferred_timer: None,
+            d.add(RequirementSpec::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PcmInternal { ext_zcd: false, dem: false },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
             });
         }
         d.add(RequirementSpec::ShortCircuitFault);
@@ -1324,24 +1510,6 @@ impl Design {
             if i == exclude_idx { continue; }
             let Some(asn) = asn else { continue; };
             let signals: Vec<Signal> = match asn {
-                Assignment::PcmPhase { timer, zcd_eev, .. } => {
-                    let mut s = vec![
-                        Signal::HrtimChannel { timer: *timer, ch: HrtimCh::Ch1 },
-                        Signal::HrtimChannel { timer: *timer, ch: HrtimCh::Ch2 },
-                    ];
-                    if let Some(z) = zcd_eev { s.push(Signal::HrtimEev(*z)); }
-                    s
-                }
-                Assignment::PcmPhaseExternal { dac, peak_eev, zcd_eev, timer, .. } => {
-                    let mut s = vec![
-                        Signal::HrtimChannel { timer: *timer, ch: HrtimCh::Ch1 },
-                        Signal::HrtimChannel { timer: *timer, ch: HrtimCh::Ch2 },
-                        Signal::HrtimEev(*peak_eev),
-                    ];
-                    if let Some(z) = zcd_eev { s.push(Signal::HrtimEev(*z)); }
-                    if let Some(d) = dac { s.push(Signal::DacOut(*d)); }
-                    s
-                }
                 Assignment::ShortCircuitFault(f) => vec![Signal::HrtimFlt(f.flt)],
                 Assignment::ShareBusDrive(d) => vec![Signal::DacOut(d.dac)],
                 Assignment::Opamp { instance, external_vinp, external_vinm, external_vout } => {
@@ -1410,6 +1578,24 @@ impl Design {
                     if *etr { s.push(Signal::TimEtr(*instance)); }
                     s
                 }
+                Assignment::HrtimSub { sub_timer, outputs, resolved, .. } => {
+                    let mut s = vec![Signal::HrtimChannel { timer: *sub_timer, ch: HrtimCh::Ch1 }];
+                    if matches!(outputs, OutputMode::Ch1AndCh2) {
+                        s.push(Signal::HrtimChannel { timer: *sub_timer, ch: HrtimCh::Ch2 });
+                    }
+                    match resolved {
+                        HrtimResolved::PcmExternal { peak_eev, zcd_eev, dac, .. } => {
+                            s.push(Signal::HrtimEev(*peak_eev));
+                            if let Some(z) = zcd_eev { s.push(Signal::HrtimEev(*z)); }
+                            if let Some(d) = dac { s.push(Signal::DacOut(*d)); }
+                        }
+                        HrtimResolved::PcmInternal { zcd_eev, .. } => {
+                            if let Some(z) = zcd_eev { s.push(Signal::HrtimEev(*z)); }
+                        }
+                        _ => {}
+                    }
+                    s
+                }
                 _ => Vec::new(),
             };
             for sig in signals {
@@ -1453,7 +1639,10 @@ impl Design {
 
     pub fn phases(&self) -> Vec<PhaseAllocation> {
         self.assignments.iter().flatten().filter_map(|a| match a {
-            Assignment::PcmPhase { alloc, .. } => Some(*alloc),
+            Assignment::HrtimSub {
+                resolved: HrtimResolved::PcmInternal { dac, comp, eev, .. },
+                ..
+            } => Some(PhaseAllocation { dac: *dac, comp: *comp, eev: *eev }),
             _ => None,
         }).collect()
     }
@@ -1461,15 +1650,17 @@ impl Design {
     pub fn external_eevs(&self) -> Vec<CrossbarSource> {
         let mut out = Vec::new();
         for a in self.assignments.iter().flatten() {
-            match a {
-                Assignment::PcmPhaseExternal { peak_eev, zcd_eev, .. } => {
-                    out.push(*peak_eev);
-                    if let Some(z) = zcd_eev { out.push(*z); }
+            if let Assignment::HrtimSub { resolved, .. } = a {
+                match resolved {
+                    HrtimResolved::PcmExternal { peak_eev, zcd_eev, .. } => {
+                        out.push(*peak_eev);
+                        if let Some(z) = zcd_eev { out.push(*z); }
+                    }
+                    HrtimResolved::PcmInternal { zcd_eev: Some(z), .. } => {
+                        out.push(*z);
+                    }
+                    _ => {}
                 }
-                Assignment::PcmPhase { zcd_eev: Some(z), .. } => {
-                    out.push(*z);
-                }
-                _ => {}
             }
         }
         out
@@ -1478,20 +1669,22 @@ impl Design {
     pub fn phase_edges(&self) -> Vec<PhaseEdge> {
         let mut out = Vec::new();
         for a in self.assignments.iter().flatten() {
-            match a {
-                Assignment::PcmPhase { alloc, zcd_eev, timer, .. } => {
-                    out.push(PhaseEdge { eev: alloc.eev, timer: *timer, slot: TimerInputSlot::Rst1 });
-                    if let Some(z) = zcd_eev {
-                        out.push(PhaseEdge { eev: *z, timer: *timer, slot: TimerInputSlot::Rst2 });
+            if let Assignment::HrtimSub { sub_timer, resolved, .. } = a {
+                match resolved {
+                    HrtimResolved::PcmInternal { eev, zcd_eev, .. } => {
+                        out.push(PhaseEdge { eev: *eev, timer: *sub_timer, slot: TimerInputSlot::Rst1 });
+                        if let Some(z) = zcd_eev {
+                            out.push(PhaseEdge { eev: *z, timer: *sub_timer, slot: TimerInputSlot::Rst2 });
+                        }
                     }
-                }
-                Assignment::PcmPhaseExternal { peak_eev, zcd_eev, timer, .. } => {
-                    out.push(PhaseEdge { eev: *peak_eev, timer: *timer, slot: TimerInputSlot::Rst1 });
-                    if let Some(z) = zcd_eev {
-                        out.push(PhaseEdge { eev: *z, timer: *timer, slot: TimerInputSlot::Rst2 });
+                    HrtimResolved::PcmExternal { peak_eev, zcd_eev, .. } => {
+                        out.push(PhaseEdge { eev: *peak_eev, timer: *sub_timer, slot: TimerInputSlot::Rst1 });
+                        if let Some(z) = zcd_eev {
+                            out.push(PhaseEdge { eev: *z, timer: *sub_timer, slot: TimerInputSlot::Rst2 });
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         out
@@ -1499,15 +1692,22 @@ impl Design {
 
     pub fn phase_dac_timers(&self) -> Vec<(DacId, HrtimId)> {
         self.assignments.iter().flatten().filter_map(|a| match a {
-            Assignment::PcmPhase { alloc, timer, .. } => Some((alloc.dac, *timer)),
+            Assignment::HrtimSub {
+                sub_timer,
+                resolved: HrtimResolved::PcmInternal { dac, .. },
+                ..
+            } => Some((*dac, *sub_timer)),
             _ => None,
         }).collect()
     }
 
     pub fn phase_timers_and_dem(&self) -> Vec<(HrtimId, bool)> {
         self.assignments.iter().flatten().filter_map(|a| match a {
-            Assignment::PcmPhase { timer, dem, .. }
-            | Assignment::PcmPhaseExternal { timer, dem, .. } => Some((*timer, *dem)),
+            Assignment::HrtimSub { sub_timer, resolved, .. } => match resolved {
+                HrtimResolved::PcmInternal { dem, .. }
+                | HrtimResolved::PcmExternal { dem, .. } => Some((*sub_timer, *dem)),
+                _ => None,
+            },
             _ => None,
         }).collect()
     }
@@ -1542,18 +1742,6 @@ impl Design {
         let mut out = Vec::new();
         for a in self.assignments.iter().flatten() {
             match a {
-                Assignment::PcmPhase { timer, zcd_eev, .. } => {
-                    out.push(Signal::HrtimChannel { timer: *timer, ch: HrtimCh::Ch1 });
-                    out.push(Signal::HrtimChannel { timer: *timer, ch: HrtimCh::Ch2 });
-                    if let Some(z) = zcd_eev { out.push(Signal::HrtimEev(*z)); }
-                }
-                Assignment::PcmPhaseExternal { dac, peak_eev, zcd_eev, timer, .. } => {
-                    out.push(Signal::HrtimChannel { timer: *timer, ch: HrtimCh::Ch1 });
-                    out.push(Signal::HrtimChannel { timer: *timer, ch: HrtimCh::Ch2 });
-                    out.push(Signal::HrtimEev(*peak_eev));
-                    if let Some(z) = zcd_eev { out.push(Signal::HrtimEev(*z)); }
-                    if let Some(d) = dac { out.push(Signal::DacOut(*d)); }
-                }
                 Assignment::ShortCircuitFault(f) => { out.push(Signal::HrtimFlt(f.flt)); }
                 Assignment::ShareBusDrive(d) => { out.push(Signal::DacOut(d.dac)); }
                 Assignment::AdcConversion { adc, channel, .. } => {
@@ -1627,6 +1815,23 @@ impl Design {
                     if *bkin { out.push(Signal::TimBkin(*instance)); }
                     if *etr  { out.push(Signal::TimEtr(*instance)); }
                 }
+                Assignment::HrtimSub { sub_timer, outputs, resolved, .. } => {
+                    out.push(Signal::HrtimChannel { timer: *sub_timer, ch: HrtimCh::Ch1 });
+                    if matches!(outputs, OutputMode::Ch1AndCh2) {
+                        out.push(Signal::HrtimChannel { timer: *sub_timer, ch: HrtimCh::Ch2 });
+                    }
+                    match resolved {
+                        HrtimResolved::PcmExternal { peak_eev, zcd_eev, dac, .. } => {
+                            out.push(Signal::HrtimEev(*peak_eev));
+                            if let Some(z) = zcd_eev { out.push(Signal::HrtimEev(*z)); }
+                            if let Some(d) = dac { out.push(Signal::DacOut(*d)); }
+                        }
+                        HrtimResolved::PcmInternal { zcd_eev, .. } => {
+                            if let Some(z) = zcd_eev { out.push(Signal::HrtimEev(*z)); }
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
         out
@@ -1637,7 +1842,13 @@ impl Design {
         let (pcm_int, pcm_hybrid, pcm_ext) = self.pcm_architecture_breakdown();
         let pcm_total = pcm_int + pcm_hybrid + pcm_ext;
         let pcm_reqs = self.requirements.iter()
-            .filter(|r| matches!(r, RequirementSpec::PcmPhase { .. }))
+            .filter(|r| matches!(
+                r,
+                RequirementSpec::UseHrtimSub {
+                    role: HrtimRole::PcmInternal { .. } | HrtimRole::PcmExternal { .. },
+                    ..
+                }
+            ))
             .count();
         if pcm_reqs > 0 && pcm_total < pcm_reqs {
             out.push(warn(format!(
@@ -1646,7 +1857,9 @@ impl Design {
             )));
         }
         for (i, a) in self.assignments.iter().enumerate() {
-            if let Some(Assignment::PcmPhaseExternal { dem, .. }) = a {
+            if let Some(Assignment::HrtimSub {
+                resolved: HrtimResolved::PcmExternal { dem, .. }, ..
+            }) = a {
                 out.push(warn(format!(
                     "Phase #{}: external peak comp has no hardware slope comp. Verify D<0.5 or add external RC.{}",
                     i + 1,
@@ -1811,11 +2024,13 @@ impl Design {
         let mut hybrid = 0;
         let mut external = 0;
         for a in self.assignments.iter().flatten() {
-            match a {
-                Assignment::PcmPhase { zcd_eev: None, .. } => internal += 1,
-                Assignment::PcmPhase { zcd_eev: Some(_), .. } => hybrid += 1,
-                Assignment::PcmPhaseExternal { .. } => external += 1,
-                _ => {}
+            if let Assignment::HrtimSub { resolved, .. } = a {
+                match resolved {
+                    HrtimResolved::PcmInternal { zcd_eev: None, .. } => internal += 1,
+                    HrtimResolved::PcmInternal { zcd_eev: Some(_), .. } => hybrid += 1,
+                    HrtimResolved::PcmExternal { .. } => external += 1,
+                    _ => {}
+                }
             }
         }
         (internal, hybrid, external)
@@ -1882,5 +2097,104 @@ mod tests {
         // Second request for the same instance has no candidate.
         assert!(d.assignments[0].is_some());
         assert!(d.assignments[1].is_none());
+    }
+
+    fn empty_design() -> Design {
+        Design {
+            format_version: DESIGN_FORMAT_VERSION,
+            ids: Vec::new(),
+            requirements: Vec::new(),
+            assignments: Vec::new(),
+            locks: ResourceBag::new(),
+            pin_assignments: std::collections::HashMap::new(),
+            next_id: 1,
+            variant: default_variant(),
+        }
+    }
+
+    #[test]
+    fn four_pcm_dem_phases_allocate_distinct_resources() {
+        // The classic 4-phase DC/DC + DEM design: four UseHrtimSub
+        // PcmInternal + DEM requirements. Must allocate into four
+        // distinct sub-timers with four distinct (DAC, COMP, EEV) triples
+        // — the regression guard for the HRTIM refactor.
+        let mut d = empty_design();
+        for _ in 0..4 {
+            d.add(RequirementSpec::UseHrtimSub {
+                pinned_sub_timer: None,
+                role: HrtimRole::PcmInternal { ext_zcd: false, dem: true },
+                outputs: OutputMode::Ch1AndCh2,
+                fault: None,
+            });
+        }
+        d.normalize();
+        let tuples: Vec<(DacId, CompId, CrossbarSource, HrtimId)> = d
+            .assignments
+            .iter()
+            .filter_map(|a| match a {
+                Some(Assignment::HrtimSub {
+                    sub_timer,
+                    resolved: HrtimResolved::PcmInternal { dac, comp, eev, .. },
+                    ..
+                }) => Some((*dac, *comp, *eev, *sub_timer)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(tuples.len(), 4, "expected 4 PcmInternal allocations");
+        let mut timers: Vec<HrtimId> = tuples.iter().map(|t| t.3).collect();
+        timers.sort(); timers.dedup();
+        assert_eq!(timers.len(), 4, "sub-timers must be distinct");
+        let mut dacs: Vec<DacId> = tuples.iter().map(|t| t.0).collect();
+        dacs.sort(); dacs.dedup();
+        assert_eq!(dacs.len(), 4, "DACs must be distinct");
+    }
+
+    #[test]
+    fn hrtim_sub_pinned_sub_timer_is_honored() {
+        let mut d = empty_design();
+        d.add(RequirementSpec::UseHrtimSub {
+            pinned_sub_timer: Some(HrtimId::TimF),
+            role: HrtimRole::PcmInternal { ext_zcd: false, dem: false },
+            outputs: OutputMode::Ch1AndCh2,
+            fault: None,
+        });
+        d.normalize();
+        let Some(Assignment::HrtimSub { sub_timer, .. }) = d.assignments[0].clone() else {
+            panic!("expected HrtimSub");
+        };
+        assert_eq!(sub_timer, HrtimId::TimF);
+    }
+
+    #[test]
+    fn hrtim_sub_voltage_mode_claims_only_timer() {
+        let mut d = empty_design();
+        d.add(RequirementSpec::UseHrtimSub {
+            pinned_sub_timer: Some(HrtimId::TimA),
+            role: HrtimRole::VoltageModePwm,
+            outputs: OutputMode::Ch1Only,
+            fault: None,
+        });
+        d.normalize();
+        let asn = d.assignments[0].as_ref().expect("voltage-mode should resolve");
+        let consumed = asn.consumed();
+        // Must claim the timer — and nothing DAC/COMP/EEV-related.
+        assert!(consumed.contains(&Resource::Timer(HrtimId::TimA)));
+        assert!(!consumed.iter().any(|r| matches!(r, Resource::Dac(_))));
+        assert!(!consumed.iter().any(|r| matches!(r, Resource::Comp(_))));
+        assert!(!consumed.iter().any(|r| matches!(r, Resource::Eev(_))));
+    }
+
+    #[test]
+    fn hrtim_sub_dem_requires_ch1_and_ch2() {
+        // DEM + Ch1Only is invalid and should yield no candidates.
+        let mut d = empty_design();
+        d.add(RequirementSpec::UseHrtimSub {
+            pinned_sub_timer: None,
+            role: HrtimRole::PcmInternal { ext_zcd: false, dem: true },
+            outputs: OutputMode::Ch1Only,
+            fault: None,
+        });
+        d.normalize();
+        assert!(d.assignments[0].is_none());
     }
 }

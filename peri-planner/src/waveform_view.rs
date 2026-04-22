@@ -14,7 +14,7 @@ use eframe::egui::{
     Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2,
 };
 
-use crate::requirements::Assignment;
+use crate::requirements::{Assignment, HrtimResolved};
 
 const STRIP_H: f32 = 120.0;
 const STRIP_PAD: f32 = 10.0;
@@ -33,7 +33,13 @@ pub fn show(ui: &mut egui::Ui, assignments: &[Option<Assignment>]) {
     let phases: Vec<&Assignment> = assignments
         .iter()
         .flatten()
-        .filter(|a| matches!(a, Assignment::PcmPhase { .. } | Assignment::PcmPhaseExternal { .. }))
+        .filter(|a| matches!(
+            a,
+            Assignment::HrtimSub {
+                resolved: HrtimResolved::PcmInternal { .. } | HrtimResolved::PcmExternal { .. },
+                ..
+            }
+        ))
         .collect();
     if phases.is_empty() {
         ui.label(egui::RichText::new("(no PCM phases in this design)").weak());
@@ -111,8 +117,11 @@ fn draw_phase_strip(painter: &egui::Painter, strip: Rect, idx: usize, a: &Assign
     let duty_end = wave_left + wave_width * 0.30;
     let ls_start = duty_end + wave_width * 0.20;
     let (dem, _has_zcd) = match a {
-        Assignment::PcmPhase { dem, zcd_eev, .. } => (*dem, zcd_eev.is_some()),
-        Assignment::PcmPhaseExternal { dem, zcd_eev, .. } => (*dem, zcd_eev.is_some()),
+        Assignment::HrtimSub { resolved, .. } => match resolved {
+            HrtimResolved::PcmInternal { dem, zcd_eev, .. } => (*dem, zcd_eev.is_some()),
+            HrtimResolved::PcmExternal { dem, zcd_eev, .. } => (*dem, zcd_eev.is_some()),
+            _ => (false, false),
+        },
         _ => (false, false),
     };
     let ls_end = if dem {
@@ -153,8 +162,11 @@ fn draw_phase_strip(painter: &egui::Painter, strip: Rect, idx: usize, a: &Assign
     // Event markers.
     mark_event(painter, wave_left, counter_top, counter_bot, "SET CH1 (TimRst)", C_SET);
     let rst1_label = match a {
-        Assignment::PcmPhase { .. } => "RST CH1 (EEV: internal COMP peak)",
-        Assignment::PcmPhaseExternal { .. } => "RST CH1 (EEV: external COMP peak)",
+        Assignment::HrtimSub { resolved, .. } => match resolved {
+            HrtimResolved::PcmInternal { .. } => "RST CH1 (EEV: internal COMP peak)",
+            HrtimResolved::PcmExternal { .. } => "RST CH1 (EEV: external COMP peak)",
+            _ => "RST CH1",
+        },
         _ => "RST CH1",
     };
     mark_event(painter, duty_end, counter_top, counter_bot, rst1_label, C_RST);
@@ -171,15 +183,18 @@ fn draw_phase_strip(painter: &egui::Painter, strip: Rect, idx: usize, a: &Assign
 
     if dem {
         let rst2_label = match a {
-            Assignment::PcmPhase { zcd_eev: Some(_), .. } => {
-                "RST CH2 (EEV: external ZCD comp)"
-            }
-            Assignment::PcmPhase { zcd_eev: None, .. } => {
-                "RST CH2 (EEV: same COMP, DMA INM-swap to sensor Vzcr)"
-            }
-            Assignment::PcmPhaseExternal { .. } => {
-                "RST CH2 (EEV: external ZCD comp)"
-            }
+            Assignment::HrtimSub { resolved, .. } => match resolved {
+                HrtimResolved::PcmInternal { zcd_eev: Some(_), .. } => {
+                    "RST CH2 (EEV: external ZCD comp)"
+                }
+                HrtimResolved::PcmInternal { zcd_eev: None, .. } => {
+                    "RST CH2 (EEV: same COMP, DMA INM-swap to sensor Vzcr)"
+                }
+                HrtimResolved::PcmExternal { .. } => {
+                    "RST CH2 (EEV: external ZCD comp)"
+                }
+                _ => "RST CH2 (ZCD)",
+            },
             _ => "RST CH2 (ZCD)",
         };
         mark_event(painter, ls_end, ch2_top - 14.0, ch2_top, rst2_label, C_RST);
@@ -252,8 +267,11 @@ fn mark_event(painter: &egui::Painter, x: f32, y_top: f32, y_bot: f32, label: &s
 }
 
 fn phase_title(idx: usize, a: &Assignment) -> String {
-    match a {
-        Assignment::PcmPhase { alloc, timer, dem, zcd_eev } => {
+    let Assignment::HrtimSub { sub_timer, resolved, .. } = a else {
+        return format!("Phase {}: ?", idx + 1);
+    };
+    match resolved {
+        HrtimResolved::PcmInternal { dac, comp, eev, dem, zcd_eev } => {
             let mode = match (*dem, zcd_eev.is_some()) {
                 (false, _) => "internal, no DEM",
                 (true, false) => "internal + DEM (INM-swap)",
@@ -261,12 +279,12 @@ fn phase_title(idx: usize, a: &Assignment) -> String {
             };
             format!(
                 "Phase {}: {:?} ({})  [{:?}/{:?}/{:?}]",
-                idx + 1, timer, mode, alloc.dac, alloc.comp, alloc.eev
+                idx + 1, sub_timer, mode, dac, comp, eev
             )
         }
-        Assignment::PcmPhaseExternal { timer, dem, .. } => {
+        HrtimResolved::PcmExternal { dem, .. } => {
             let mode = if *dem { "external comp + DEM (ext ZCD)" } else { "external comp" };
-            format!("Phase {}: {:?} ({})", idx + 1, timer, mode)
+            format!("Phase {}: {:?} ({})", idx + 1, sub_timer, mode)
         }
         _ => format!("Phase {}: ?", idx + 1),
     }

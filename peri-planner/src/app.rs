@@ -8,7 +8,7 @@ use crate::pinout::{self, ChipVariant};
 use crate::requirements::*;
 use crate::solver::{TimerSlotUsage, ALL_CR_SLOTS_HELPER};
 
-const STORAGE_KEY: &str = "peri_planner_design_v2";
+const STORAGE_KEY: &str = "peri_planner_design_v3";
 const HISTORY_CAP: usize = 40;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -502,34 +502,33 @@ impl eframe::App for PeriPlannerApp {
                                         }
                                     }
                                 });
-                            // Preferred-timer selector for PCM phases. "auto" lets
-                            // the solver pick the first free sub-timer (current
-                            // default); locking to a specific sub-timer is useful
-                            // when e.g. reserving TimF for an aux topology.
-                            if let RequirementSpec::PcmPhase { dem, threshold, preferred_timer } = spec {
-                                let label = match preferred_timer {
+                            // Pinned-sub-timer selector for HRTIM uses. "auto" lets
+                            // the solver pick the first free sub-timer; pinning
+                            // reserves a specific sub-timer for this role.
+                            if let RequirementSpec::UseHrtimSub { pinned_sub_timer, role, outputs, fault } = spec {
+                                let label = match pinned_sub_timer {
                                     None => "auto".to_string(),
                                     Some(t) => format!("{:?}", t),
                                 };
-                                egui::ComboBox::from_id_salt(("pcm-t", i))
+                                egui::ComboBox::from_id_salt(("hrt-t", i))
                                     .width(70.0)
                                     .selected_text(label)
                                     .show_ui(ui, |ui| {
-                                        if ui.selectable_label(preferred_timer.is_none(), "auto").clicked() {
+                                        if ui.selectable_label(pinned_sub_timer.is_none(), "auto").clicked() {
                                             *to_set_spec = Some((
                                                 i,
-                                                RequirementSpec::PcmPhase {
-                                                    dem, threshold, preferred_timer: None,
+                                                RequirementSpec::UseHrtimSub {
+                                                    pinned_sub_timer: None, role, outputs, fault,
                                                 },
                                             ));
                                         }
                                         for &t in &[HrtimId::TimA, HrtimId::TimB, HrtimId::TimC, HrtimId::TimD, HrtimId::TimE, HrtimId::TimF] {
-                                            let sel = preferred_timer == Some(t);
+                                            let sel = pinned_sub_timer == Some(t);
                                             if ui.selectable_label(sel, format!("{:?}", t)).clicked() {
                                                 *to_set_spec = Some((
                                                     i,
-                                                    RequirementSpec::PcmPhase {
-                                                        dem, threshold, preferred_timer: Some(t),
+                                                    RequirementSpec::UseHrtimSub {
+                                                        pinned_sub_timer: Some(t), role, outputs, fault,
                                                     },
                                                 ));
                                             }
@@ -802,10 +801,23 @@ impl eframe::App for PeriPlannerApp {
                             HrtimAction::Remove(i) => self.mutate(|d| d.remove(i)),
                             HrtimAction::AddPhaseOn(t) => {
                                 self.mutate(|d| {
-                                    d.add(RequirementSpec::PcmPhase {
-                                        dem: false,
-                                        threshold: ThresholdSource::Internal,
-                                        preferred_timer: Some(t),
+                                    d.add(RequirementSpec::UseHrtimSub {
+                                        pinned_sub_timer: Some(t),
+                                        role: HrtimRole::PcmInternal { ext_zcd: false, dem: false },
+                                        outputs: OutputMode::Ch1AndCh2,
+                                        fault: None,
+                                    });
+                                });
+                            }
+                            HrtimAction::AddRoleOn(t, role) => {
+                                let outputs = match role {
+                                    HrtimRole::VoltageModePwm => OutputMode::Ch1Only,
+                                    _ => OutputMode::Ch1AndCh2,
+                                };
+                                self.mutate(|d| {
+                                    d.add(RequirementSpec::UseHrtimSub {
+                                        pinned_sub_timer: Some(t),
+                                        role, outputs, fault: None,
                                     });
                                 });
                             }

@@ -43,7 +43,7 @@ impl PeripheralKind {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum HrtimId {
     TimA,
     TimB,
@@ -53,7 +53,7 @@ pub enum HrtimId {
     TimF,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum DacId {
     Dac1Ch1,
     Dac1Ch2,
@@ -76,7 +76,7 @@ impl DacId {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum CompId {
     Comp1,
     Comp2,
@@ -205,7 +205,7 @@ impl TimCh {
 /// Sources that can drive HRTIM output set/reset crossbars and the ADC
 /// trigger crossbar. Two separate fabrics on the chip; kept in one enum
 /// because their source spaces overlap heavily and can be split later.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum CrossbarSource {
     Mcr1,
     Mcr2,
