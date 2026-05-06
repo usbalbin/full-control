@@ -4,6 +4,7 @@ use eframe::egui;
 
 use crate::fabric_view::{self, Selection};
 use crate::g474::*;
+use crate::mcu::Mcu;
 use crate::pinout::{self, ChipVariant};
 use crate::requirements::*;
 use crate::solver::{TimerSlotUsage, ALL_CR_SLOTS_HELPER};
@@ -23,6 +24,7 @@ enum ViewMode {
 
 pub struct PeriPlannerApp {
     design: Design,
+    mcu: Mcu,
     variant: ChipVariant,
     view: ViewMode,
     history: Vec<Design>,
@@ -36,6 +38,7 @@ impl Default for PeriPlannerApp {
     fn default() -> Self {
         Self {
             design: Design::default(),
+            mcu: Mcu::G474,
             variant: ChipVariant::G474R,
             view: ViewMode::Fabric,
             history: Vec::new(),
@@ -64,6 +67,9 @@ impl PeriPlannerApp {
             slf.variant = slf.design.variant;
             if let Some(v) = eframe::get_value::<ViewMode>(storage, "peri_planner_view_v1") {
                 slf.view = v;
+            }
+            if let Some(m) = eframe::get_value::<Mcu>(storage, "peri_planner_mcu_v1") {
+                slf.mcu = m;
             }
         }
         slf
@@ -94,6 +100,79 @@ impl PeriPlannerApp {
             let current = std::mem::replace(&mut self.design, next);
             self.history.push(current);
         }
+    }
+
+    fn render_top_bar(&mut self, ctx: &egui::Context, can_undo: bool, can_redo: bool) {
+        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Peripheral planner").strong());
+                ui.separator();
+                ui.label("MCU:");
+                let mut pending_mcu: Option<Mcu> = None;
+                egui::ComboBox::from_id_salt("mcu")
+                    .selected_text(self.mcu.label())
+                    .show_ui(ui, |ui| {
+                        for &m in Mcu::ALL {
+                            let label = if m.is_implemented() {
+                                m.label().to_string()
+                            } else {
+                                format!("{} (preview)", m.label())
+                            };
+                            if ui.selectable_label(m == self.mcu, label).clicked() {
+                                pending_mcu = Some(m);
+                            }
+                        }
+                    });
+                if let Some(m) = pending_mcu {
+                    self.mcu = m;
+                    if m != Mcu::G474 && matches!(self.view, ViewMode::Hrtim | ViewMode::Package) {
+                        self.view = ViewMode::Comms;
+                    }
+                }
+                if self.mcu == Mcu::G474 {
+                    ui.separator();
+                    ui.label("Chip:");
+                    let mut pending_variant: Option<ChipVariant> = None;
+                    egui::ComboBox::from_id_salt("variant")
+                        .selected_text(self.variant.display_label())
+                        .show_ui(ui, |ui| {
+                            for &v in ChipVariant::ALL {
+                                if ui.selectable_label(v == self.variant, v.display_label()).clicked() {
+                                    pending_variant = Some(v);
+                                }
+                            }
+                        });
+                    if let Some(v) = pending_variant {
+                        self.variant = v;
+                        self.mutate(|d| d.set_variant(v));
+                    }
+                }
+                ui.separator();
+                if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
+                    self.undo();
+                }
+                if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
+                    self.redo_op();
+                }
+                ui.separator();
+                ui.label("View:");
+                ui.selectable_value(&mut self.view, ViewMode::Fabric, "Power fabric");
+                if self.mcu == Mcu::G474 {
+                    ui.selectable_value(&mut self.view, ViewMode::Hrtim, "HRTIM");
+                }
+                ui.selectable_value(&mut self.view, ViewMode::Comms, "Comms");
+                ui.selectable_value(&mut self.view, ViewMode::Timers, "Timers");
+                ui.selectable_value(&mut self.view, ViewMode::Waveforms, "Waveforms");
+                if self.mcu == Mcu::G474 {
+                    ui.selectable_value(&mut self.view, ViewMode::Package, "Package");
+                }
+                ui.separator();
+                if ui.button("Export").clicked() {
+                    let text = self.design.export_summary();
+                    ui.ctx().copy_text(text);
+                }
+            });
+        });
     }
 
     fn handle_package_action(&mut self, action: Option<crate::package_view::Action>) {
@@ -136,6 +215,7 @@ impl eframe::App for PeriPlannerApp {
         eframe::set_value(storage, STORAGE_KEY, &self.design);
         eframe::set_value(storage, "peri_planner_variant_v1", &self.variant);
         eframe::set_value(storage, "peri_planner_view_v1", &self.view);
+        eframe::set_value(storage, "peri_planner_mcu_v1", &self.mcu);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -147,6 +227,29 @@ impl eframe::App for PeriPlannerApp {
         if ctrl && ctx.input(|i| i.key_pressed(egui::Key::Y)) {
             self.redo_op();
         }
+
+        let can_undo = !self.history.is_empty();
+        let can_redo = !self.redo.is_empty();
+
+        if self.mcu != Mcu::G474 {
+            self.render_top_bar(ctx, can_undo, can_redo);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(48.0);
+                    ui.heading(format!("{} support — preview", self.mcu.label()));
+                    ui.add_space(8.0);
+                    ui.label(
+                        "Peripheral data, pinout AF table, and planning views land in subsequent slices.",
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        "Switch back to STM32G474 in the top bar to use the full planner today.",
+                    );
+                });
+            });
+            return;
+        }
+
         self.design.normalize();
 
         let phases = self.design.phases();
@@ -376,51 +479,7 @@ impl eframe::App for PeriPlannerApp {
                 }
             });
 
-        let can_undo = !self.history.is_empty();
-        let can_redo = !self.redo.is_empty();
-
-        // Top toolbar: heading, chip, undo/redo, view tabs.
-        egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("STM32G474 planner").strong());
-                ui.separator();
-                ui.label("Chip:");
-                let mut pending_variant: Option<ChipVariant> = None;
-                egui::ComboBox::from_id_salt("variant")
-                    .selected_text(self.variant.display_label())
-                    .show_ui(ui, |ui| {
-                        for &v in ChipVariant::ALL {
-                            if ui.selectable_label(v == self.variant, v.display_label()).clicked() {
-                                pending_variant = Some(v);
-                            }
-                        }
-                    });
-                if let Some(v) = pending_variant {
-                    self.variant = v;
-                    self.mutate(|d| d.set_variant(v));
-                }
-                ui.separator();
-                if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
-                    self.undo();
-                }
-                if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
-                    self.redo_op();
-                }
-                ui.separator();
-                ui.label("View:");
-                ui.selectable_value(&mut self.view, ViewMode::Fabric, "Power fabric");
-                ui.selectable_value(&mut self.view, ViewMode::Hrtim, "HRTIM");
-                ui.selectable_value(&mut self.view, ViewMode::Comms, "Comms");
-                ui.selectable_value(&mut self.view, ViewMode::Timers, "Timers");
-                ui.selectable_value(&mut self.view, ViewMode::Waveforms, "Waveforms");
-                ui.selectable_value(&mut self.view, ViewMode::Package, "Package");
-                ui.separator();
-                if ui.button("Export").clicked() {
-                    let text = self.design.export_summary();
-                    ui.ctx().copy_text(text);
-                }
-            });
-        });
+        self.render_top_bar(ctx, can_undo, can_redo);
 
         // Requirements + Add + Locks in a resizable top panel. User can
         // drag to give more or less room to the fabric view below.
