@@ -90,14 +90,14 @@ fn render_comms(ui: &mut egui::Ui, mcu: &McuDescriptor) {
     ui.group(|ui| {
         ui.label(egui::RichText::new("Communications").strong());
         let c = &mcu.comms;
-        list(ui, "SPI",    c.spi,    "SPI");
-        list(ui, "I2C",    c.i2c,    "I2C");
-        list(ui, "I3C",    c.i3c,    "I3C");
-        list(ui, "USART",  c.usart,  "USART");
-        list(ui, "UART",   c.uart,   "UART");
-        list(ui, "LPUART", c.lpuart, "LPUART");
-        list(ui, "FDCAN",  c.fdcan,  "FDCAN");
-        list(ui, "UCPD",   c.ucpd,   "UCPD");
+        list(ui, "SPI",    &c.spi,    "SPI");
+        list(ui, "I2C",    &c.i2c,    "I2C");
+        list(ui, "I3C",    &c.i3c,    "I3C");
+        list(ui, "USART",  &c.usart,  "USART");
+        list(ui, "UART",   &c.uart,   "UART");
+        list(ui, "LPUART", &c.lpuart, "LPUART");
+        list(ui, "FDCAN",  &c.fdcan,  "FDCAN");
+        list(ui, "UCPD",   &c.ucpd,   "UCPD");
         if c.has_usb { ui.label("  USB"); }
         match c.octospi {
             0 => {}

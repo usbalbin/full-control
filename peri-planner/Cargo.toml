@@ -11,6 +11,15 @@ crate-type = ["cdylib", "rlib"]
 name = "peri-planner"
 path = "src/main.rs"
 
+# One-shot extractor: pulls peripheral / pin-AF tables from `stm32-metapac`
+# and writes a `src/mcu_data/<chip>.rs` file. Run per-chip; commit output.
+# Not part of the regular build — only built when an `extract-*` feature
+# is enabled, which activates the optional metapac dep.
+[[bin]]
+name = "extract"
+path = "tools/extract.rs"
+required-features = ["extract"]
+
 [dependencies]
 # egui + eframe + egui_plot must use the same major.minor version.
 eframe    = { version = "0.33", features = ["glow", "persistence"] }
@@ -19,6 +28,16 @@ egui_plot = "0.34"
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# Optional, only pulled in when an `extract-*` feature is enabled. The
+# regular `cargo build` does not depend on this — it's used solely by the
+# `extract` bin to dump chip metadata into `src/mcu_data/`.
+stm32-metapac = { git = "https://github.com/embassy-rs/stm32-data-generated", tag = "stm32-data-631122a41c0d22b3ba452c1717ca1dd61ef45881", default-features = false, features = ["metadata"], optional = true }
+
+[features]
+extract       = ["dep:stm32-metapac"]
+extract-g474  = ["extract", "stm32-metapac/stm32g474re"]
+extract-h523  = ["extract", "stm32-metapac/stm32h523re"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Pinned to match trunk 0.21.x's supported wasm-bindgen runtime — newer

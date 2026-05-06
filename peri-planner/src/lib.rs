@@ -5,6 +5,8 @@ pub mod g474;
 pub mod hrtim_view;
 pub mod inventory_view;
 pub mod mcu;
+pub mod mcu_data;
+pub mod mcu_raw;
 pub mod package_view;
 pub mod picker;
 pub mod pinout;
