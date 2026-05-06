@@ -3,6 +3,7 @@ pub mod comms_view;
 pub mod fabric_view;
 pub mod g474;
 pub mod hrtim_view;
+pub mod inventory_view;
 pub mod mcu;
 pub mod package_view;
 pub mod picker;

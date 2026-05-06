@@ -233,19 +233,17 @@ impl eframe::App for PeriPlannerApp {
 
         if self.mcu != Mcu::G474 {
             self.render_top_bar(ctx, can_undo, can_redo);
+            let descriptor = self.mcu.descriptor();
             egui::CentralPanel::default().show(ctx, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(48.0);
-                    ui.heading(format!("{} support — preview", self.mcu.label()));
-                    ui.add_space(8.0);
-                    ui.label(
-                        "Peripheral data, pinout AF table, and planning views land in subsequent slices.",
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        "Switch back to STM32G474 in the top bar to use the full planner today.",
-                    );
-                });
+                crate::inventory_view::show(ui, descriptor);
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(
+                        "Pinout AF table and planning views land in subsequent slices — \
+                         switch to STM32G474 for the full planner today.",
+                    )
+                    .weak(),
+                );
             });
             return;
         }
