@@ -7,10 +7,10 @@
 //! The generated file defines `pub static RAW: RawMcuData = ...;` against
 //! the schema in `peri_planner::mcu_raw`. Generated files are committed.
 
-#[cfg(not(any(feature = "extract-g474", feature = "extract-h523")))]
+#[cfg(not(feature = "extract"))]
 compile_error!(
-    "Enable one of: --features extract-g474, --features extract-h523. \
-     Each maps to a single stm32-metapac chip feature."
+    "Enable one of the per-chip extract features (e.g. --features extract-g474r, \
+     --features extract-h523z). Each maps to a single stm32-metapac chip feature."
 );
 
 use std::fs;

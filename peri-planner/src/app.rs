@@ -4,7 +4,7 @@ use eframe::egui;
 
 use crate::fabric_view::{self, Selection};
 use crate::g474::*;
-use crate::mcu::Mcu;
+use crate::mcu::{Mcu, Package};
 use crate::pinout::{self, ChipVariant};
 use crate::requirements::*;
 use crate::solver::{TimerSlotUsage, ALL_CR_SLOTS_HELPER};
@@ -27,6 +27,7 @@ enum ViewMode {
 pub struct PeriPlannerApp {
     design: Design,
     mcu: Mcu,
+    package: Package,
     variant: ChipVariant,
     view: ViewMode,
     history: Vec<Design>,
@@ -43,6 +44,7 @@ impl Default for PeriPlannerApp {
         Self {
             design: Design::default(),
             mcu: Mcu::G474,
+            package: Package::G474R,
             variant: ChipVariant::G474R,
             view: ViewMode::Fabric,
             history: Vec::new(),
@@ -75,6 +77,17 @@ impl PeriPlannerApp {
             }
             if let Some(m) = eframe::get_value::<Mcu>(storage, "peri_planner_mcu_v1") {
                 slf.mcu = m;
+            }
+            if let Some(p) = eframe::get_value::<Package>(storage, "peri_planner_package_v1") {
+                slf.package = p;
+            } else {
+                // First load after schema bump — derive package from the
+                // legacy G474-only ChipVariant.
+                slf.package = Package::from_g474_variant(slf.variant);
+            }
+            // Keep mcu / package consistent if storage drifted.
+            if slf.package.mcu() != slf.mcu {
+                slf.package = slf.mcu.default_package();
             }
         }
         slf
@@ -130,29 +143,35 @@ impl PeriPlannerApp {
                     });
                 if let Some(m) = pending_mcu {
                     self.mcu = m;
-                    // Bump off any view that's not yet supported on the new
-                    // MCU. Inventory/AfTable always work; G474-only views
-                    // get redirected to Inventory.
+                    // Reset package to the new MCU's default; keeps
+                    // self.variant stale on H523 (only consumed by G474
+                    // legacy code, which doesn't render on H523).
+                    self.package = m.default_package();
+                    if let Some(v) = self.package.to_g474_variant() {
+                        self.variant = v;
+                        self.mutate(|d| d.set_variant(v));
+                    }
                     if m != Mcu::G474
                         && !matches!(self.view, ViewMode::Inventory | ViewMode::AfTable)
                     {
                         self.view = ViewMode::Inventory;
                     }
                 }
-                if self.mcu == Mcu::G474 {
-                    ui.separator();
-                    ui.label("Chip:");
-                    let mut pending_variant: Option<ChipVariant> = None;
-                    egui::ComboBox::from_id_salt("variant")
-                        .selected_text(self.variant.display_label())
-                        .show_ui(ui, |ui| {
-                            for &v in ChipVariant::ALL {
-                                if ui.selectable_label(v == self.variant, v.display_label()).clicked() {
-                                    pending_variant = Some(v);
-                                }
+                ui.separator();
+                ui.label("Package:");
+                let mut pending_package: Option<Package> = None;
+                egui::ComboBox::from_id_salt("package")
+                    .selected_text(self.package.display_label())
+                    .show_ui(ui, |ui| {
+                        for &p in self.mcu.packages() {
+                            if ui.selectable_label(p == self.package, p.display_label()).clicked() {
+                                pending_package = Some(p);
                             }
-                        });
-                    if let Some(v) = pending_variant {
+                        }
+                    });
+                if let Some(p) = pending_package {
+                    self.package = p;
+                    if let Some(v) = p.to_g474_variant() {
                         self.variant = v;
                         self.mutate(|d| d.set_variant(v));
                     }
@@ -226,6 +245,7 @@ impl eframe::App for PeriPlannerApp {
         eframe::set_value(storage, "peri_planner_variant_v1", &self.variant);
         eframe::set_value(storage, "peri_planner_view_v1", &self.view);
         eframe::set_value(storage, "peri_planner_mcu_v1", &self.mcu);
+        eframe::set_value(storage, "peri_planner_package_v1", &self.package);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -243,7 +263,7 @@ impl eframe::App for PeriPlannerApp {
 
         if self.mcu != Mcu::G474 {
             self.render_top_bar(ctx, can_undo, can_redo);
-            let descriptor = self.mcu.descriptor();
+            let descriptor = self.package.descriptor();
             let view = self.view;
             let af_filter = &mut self.af_filter;
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -963,10 +983,10 @@ impl eframe::App for PeriPlannerApp {
                     self.handle_package_action(action);
                 }
                 ViewMode::Inventory => {
-                    crate::inventory_view::show(ui, self.mcu.descriptor());
+                    crate::inventory_view::show(ui, self.package.descriptor());
                 }
                 ViewMode::AfTable => {
-                    crate::af_view::show(ui, self.mcu.descriptor().raw, &mut self.af_filter);
+                    crate::af_view::show(ui, self.package.descriptor().raw, &mut self.af_filter);
                 }
             }
         });

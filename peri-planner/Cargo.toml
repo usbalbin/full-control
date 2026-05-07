@@ -36,8 +36,21 @@ stm32-metapac = { git = "https://github.com/embassy-rs/stm32-data-generated", ta
 
 [features]
 extract       = ["dep:stm32-metapac"]
-extract-g474  = ["extract", "stm32-metapac/stm32g474re"]
-extract-h523  = ["extract", "stm32-metapac/stm32h523re"]
+# One feature per package letter. The flash-size suffix doesn't affect
+# pinout — `<letter>e` (max flash) is what we extract. Letter mapping:
+# G474: C=LQFP48, M=WLCSP81, P=TFBGA100, Q=UFBGA121, R=LQFP64, V=LQFP100
+# H523: C=LQFP48, H=UFBGA100, R=LQFP64, V=LQFP100, Z=LQFP144
+extract-g474c = ["extract", "stm32-metapac/stm32g474ce"]
+extract-g474m = ["extract", "stm32-metapac/stm32g474me"]
+extract-g474p = ["extract", "stm32-metapac/stm32g474pe"]
+extract-g474q = ["extract", "stm32-metapac/stm32g474qe"]
+extract-g474r = ["extract", "stm32-metapac/stm32g474re"]
+extract-g474v = ["extract", "stm32-metapac/stm32g474ve"]
+extract-h523c = ["extract", "stm32-metapac/stm32h523ce"]
+extract-h523h = ["extract", "stm32-metapac/stm32h523he"]
+extract-h523r = ["extract", "stm32-metapac/stm32h523re"]
+extract-h523v = ["extract", "stm32-metapac/stm32h523ve"]
+extract-h523z = ["extract", "stm32-metapac/stm32h523ze"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Pinned to match trunk 0.21.x's supported wasm-bindgen runtime — newer
