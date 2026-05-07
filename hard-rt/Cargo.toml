@@ -1,0 +1,18 @@
+[package]
+name = "hard-rt"
+version = "0.1.0"
+edition = "2024"
+description = "Two-tier priority architecture for Cortex-M: keep hard-real-time ISRs free of soft-async crate critical sections."
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+critical-section = { version = "1", features = ["restore-state-u8"] }
+cortex-m = "0.7"
+
+[features]
+# Enable to register hard_rt's BASEPRI-based critical_section::Impl globally.
+# Off by default so the crate can be linked without choosing — only one
+# critical_section impl is allowed per binary, so the choice is the user's.
+# Mutually exclusive with `cortex-m/critical-section-single-core` and any
+# other crate that registers an Impl.
+critical-section-impl = []
