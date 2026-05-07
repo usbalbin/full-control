@@ -3,6 +3,7 @@ pub mod app;
 pub mod comms_view;
 pub mod fabric_view;
 pub mod g474;
+pub mod h523_design;
 pub mod hrtim_view;
 pub mod inventory_view;
 pub mod mcu;

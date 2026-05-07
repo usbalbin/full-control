@@ -4,6 +4,7 @@ use eframe::egui;
 
 use crate::fabric_view::{self, Selection};
 use crate::g474::*;
+use crate::h523_design::H523Design;
 use crate::mcu::{Mcu, Package};
 use crate::pinout::{self, ChipVariant};
 use crate::requirements::*;
@@ -26,6 +27,10 @@ enum ViewMode {
 
 pub struct PeriPlannerApp {
     design: Design,
+    /// Pin-lock state for non-G474 MCUs. Lives separately from `design`
+    /// because `Design` is HRTIM/COMP/OPAMP-shaped and would be all-empty
+    /// fields here. Future H523 features extend this struct.
+    h523_design: H523Design,
     mcu: Mcu,
     package: Package,
     variant: ChipVariant,
@@ -43,6 +48,7 @@ impl Default for PeriPlannerApp {
     fn default() -> Self {
         Self {
             design: Design::default(),
+            h523_design: H523Design::new(),
             mcu: Mcu::G474,
             package: Package::G474R,
             variant: ChipVariant::G474R,
@@ -77,6 +83,9 @@ impl PeriPlannerApp {
             }
             if let Some(m) = eframe::get_value::<Mcu>(storage, "peri_planner_mcu_v1") {
                 slf.mcu = m;
+            }
+            if let Some(d) = eframe::get_value::<H523Design>(storage, "peri_planner_h523_design_v1") {
+                slf.h523_design = d;
             }
             if let Some(p) = eframe::get_value::<Package>(storage, "peri_planner_package_v1") {
                 slf.package = p;
@@ -246,6 +255,7 @@ impl eframe::App for PeriPlannerApp {
         eframe::set_value(storage, "peri_planner_view_v1", &self.view);
         eframe::set_value(storage, "peri_planner_mcu_v1", &self.mcu);
         eframe::set_value(storage, "peri_planner_package_v1", &self.package);
+        eframe::set_value(storage, "peri_planner_h523_design_v1", &self.h523_design);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -266,9 +276,12 @@ impl eframe::App for PeriPlannerApp {
             let descriptor = self.package.descriptor();
             let view = self.view;
             let af_filter = &mut self.af_filter;
+            let h523 = &mut self.h523_design;
             egui::CentralPanel::default().show(ctx, |ui| {
                 match view {
-                    ViewMode::AfTable => crate::af_view::show(ui, descriptor.raw, af_filter),
+                    ViewMode::AfTable => {
+                        crate::af_view::show(ui, descriptor.raw, af_filter, Some(h523));
+                    }
                     _ => crate::inventory_view::show(ui, descriptor),
                 }
             });
@@ -986,7 +999,10 @@ impl eframe::App for PeriPlannerApp {
                     crate::inventory_view::show(ui, self.package.descriptor());
                 }
                 ViewMode::AfTable => {
-                    crate::af_view::show(ui, self.package.descriptor().raw, &mut self.af_filter);
+                    // G474 path doesn't expose the lock UI yet — pin
+                    // locking flows through the existing pin_assignments
+                    // map on `Design`. Pass None.
+                    crate::af_view::show(ui, self.package.descriptor().raw, &mut self.af_filter, None);
                 }
             }
         });

@@ -1,9 +1,11 @@
 //! Pin/AF browser, descriptor-driven. Shows every (pin, peripheral, signal,
 //! AF) tuple from the selected MCU's metapac-extracted data with two
 //! orthogonal filters: by peripheral and by pin port. Works on any MCU.
+//! When invoked with an `H523Design` it lets the user lock pins per signal.
 
 use eframe::egui;
 
+use crate::h523_design::H523Design;
 use crate::mcu_pinout::{af_rows, peripherals_with_pins, AfRow};
 use crate::mcu_raw::RawMcuData;
 
@@ -12,9 +14,15 @@ pub struct AfFilter {
     pub peripheral: Option<&'static str>,
     pub port: Option<char>,
     pub query: String,
+    pub locked_only: bool,
 }
 
-pub fn show(ui: &mut egui::Ui, raw: &'static RawMcuData, filter: &mut AfFilter) {
+pub fn show(
+    ui: &mut egui::Ui,
+    raw: &'static RawMcuData,
+    filter: &mut AfFilter,
+    design: Option<&mut H523Design>,
+) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{} — pin / AF table", raw.name)).strong());
         ui.label(egui::RichText::new("(from stm32-metapac)").weak());
@@ -60,11 +68,14 @@ pub fn show(ui: &mut egui::Ui, raw: &'static RawMcuData, filter: &mut AfFilter) 
         if !filter.query.is_empty() && ui.small_button("clear").clicked() {
             filter.query.clear();
         }
+        if design.is_some() {
+            ui.checkbox(&mut filter.locked_only, "Locked only");
+        }
     });
     ui.separator();
 
     let q = filter.query.to_ascii_lowercase();
-    let rows: Vec<AfRow> = af_rows(raw)
+    let mut rows: Vec<AfRow> = af_rows(raw)
         .filter(|r| filter.peripheral.is_none_or(|p| r.signal.peripheral == p))
         .filter(|r| filter.port.is_none_or(|c| r.pin.port == c))
         .filter(|r| {
@@ -75,26 +86,98 @@ pub fn show(ui: &mut egui::Ui, raw: &'static RawMcuData, filter: &mut AfFilter) 
         })
         .collect();
 
-    ui.label(egui::RichText::new(format!("{} entries", rows.len())).weak());
+    if let Some(d) = design.as_deref() {
+        if filter.locked_only {
+            rows.retain(|r| {
+                d.locked_pin(r.signal.peripheral, r.signal.role) == Some(r.pin)
+            });
+        }
+        let lock_count = d.pin_locks.len();
+        let entries_label = if lock_count == 0 {
+            format!("{} entries", rows.len())
+        } else {
+            format!("{} entries · {} locked", rows.len(), lock_count)
+        };
+        ui.label(egui::RichText::new(entries_label).weak());
+    } else {
+        ui.label(egui::RichText::new(format!("{} entries", rows.len())).weak());
+    }
 
+    let mut pending: Option<LockAction> = None;
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new("af_table").striped(true).show(ui, |ui| {
             ui.label(egui::RichText::new("Pin").strong());
             ui.label(egui::RichText::new("Peripheral").strong());
             ui.label(egui::RichText::new("Signal").strong());
             ui.label(egui::RichText::new("AF").strong());
+            if design.is_some() {
+                ui.label(egui::RichText::new("Lock").strong());
+            }
             ui.end_row();
 
             for r in &rows {
-                ui.label(r.pin.name());
+                let row_state = design.as_deref().map(|d| {
+                    let signal_locked_to = d.locked_pin(r.signal.peripheral, r.signal.role);
+                    let pin_taken_by = d.occupant_of(r.pin);
+                    (signal_locked_to, pin_taken_by)
+                });
+
+                let pin_text = match row_state {
+                    Some((Some(p), _)) if p == r.pin => {
+                        egui::RichText::new(r.pin.name())
+                            .color(egui::Color32::from_rgb(140, 220, 140)).strong()
+                    }
+                    _ => egui::RichText::new(r.pin.name()),
+                };
+                ui.label(pin_text);
                 ui.label(r.signal.peripheral);
                 ui.label(r.signal.role);
                 ui.label(match r.af {
-                    Some(n) => format!("AF{}", n),
-                    None => "—".to_string(),
+                    Some(n) => format!("AF{}", n), None => "—".to_string(),
                 });
+
+                if let Some((sig_locked, pin_taken_by)) = row_state {
+                    let is_this_lock = sig_locked == Some(r.pin);
+                    if is_this_lock {
+                        if ui.small_button("✓ unlock").clicked() {
+                            pending = Some(LockAction::Unlock {
+                                peripheral: r.signal.peripheral.to_string(),
+                                role: r.signal.role.to_string(),
+                            });
+                        }
+                    } else {
+                        let other_signal_pin = sig_locked;
+                        let label = match (other_signal_pin, pin_taken_by) {
+                            (Some(p), _) if p != r.pin => format!("(at {})", p.name()),
+                            (_, Some((per, role))) =>
+                                format!("(used by {} {})", per, role),
+                            _ => "lock".to_string(),
+                        };
+                        let enabled = pin_taken_by.is_none() || pin_taken_by ==
+                            Some((r.signal.peripheral, r.signal.role));
+                        if ui.add_enabled(enabled, egui::Button::new(label).small()).clicked() {
+                            pending = Some(LockAction::Lock {
+                                peripheral: r.signal.peripheral.to_string(),
+                                role: r.signal.role.to_string(),
+                                pin: r.pin,
+                            });
+                        }
+                    }
+                }
                 ui.end_row();
             }
         });
     });
+
+    if let (Some(d), Some(action)) = (design, pending) {
+        match action {
+            LockAction::Lock { peripheral, role, pin } => d.lock(&peripheral, &role, pin),
+            LockAction::Unlock { peripheral, role } => d.unlock(&peripheral, &role),
+        }
+    }
+}
+
+enum LockAction {
+    Lock { peripheral: String, role: String, pin: crate::mcu_pinout::PinId },
+    Unlock { peripheral: String, role: String },
 }
