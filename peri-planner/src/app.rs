@@ -20,6 +20,8 @@ enum ViewMode {
     Timers,
     Waveforms,
     Package,
+    Inventory,
+    AfTable,
 }
 
 pub struct PeriPlannerApp {
@@ -32,6 +34,8 @@ pub struct PeriPlannerApp {
     /// Role "picked up" in the package view, waiting to be dropped on a
     /// candidate pin. Not persisted — ephemeral interaction state.
     picked: Option<crate::picker::PickedRole>,
+    /// Filter state for the AfTable view. Ephemeral.
+    af_filter: crate::af_view::AfFilter,
 }
 
 impl Default for PeriPlannerApp {
@@ -44,6 +48,7 @@ impl Default for PeriPlannerApp {
             history: Vec::new(),
             redo: Vec::new(),
             picked: None,
+            af_filter: Default::default(),
         }
     }
 }
@@ -125,8 +130,13 @@ impl PeriPlannerApp {
                     });
                 if let Some(m) = pending_mcu {
                     self.mcu = m;
-                    if m != Mcu::G474 && matches!(self.view, ViewMode::Hrtim | ViewMode::Package) {
-                        self.view = ViewMode::Comms;
+                    // Bump off any view that's not yet supported on the new
+                    // MCU. Inventory/AfTable always work; G474-only views
+                    // get redirected to Inventory.
+                    if m != Mcu::G474
+                        && !matches!(self.view, ViewMode::Inventory | ViewMode::AfTable)
+                    {
+                        self.view = ViewMode::Inventory;
                     }
                 }
                 if self.mcu == Mcu::G474 {
@@ -156,16 +166,16 @@ impl PeriPlannerApp {
                 }
                 ui.separator();
                 ui.label("View:");
-                ui.selectable_value(&mut self.view, ViewMode::Fabric, "Power fabric");
                 if self.mcu == Mcu::G474 {
+                    ui.selectable_value(&mut self.view, ViewMode::Fabric, "Power fabric");
                     ui.selectable_value(&mut self.view, ViewMode::Hrtim, "HRTIM");
-                }
-                ui.selectable_value(&mut self.view, ViewMode::Comms, "Comms");
-                ui.selectable_value(&mut self.view, ViewMode::Timers, "Timers");
-                ui.selectable_value(&mut self.view, ViewMode::Waveforms, "Waveforms");
-                if self.mcu == Mcu::G474 {
+                    ui.selectable_value(&mut self.view, ViewMode::Comms, "Comms");
+                    ui.selectable_value(&mut self.view, ViewMode::Timers, "Timers");
+                    ui.selectable_value(&mut self.view, ViewMode::Waveforms, "Waveforms");
                     ui.selectable_value(&mut self.view, ViewMode::Package, "Package");
                 }
+                ui.selectable_value(&mut self.view, ViewMode::Inventory, "Inventory");
+                ui.selectable_value(&mut self.view, ViewMode::AfTable, "Pin / AF");
                 ui.separator();
                 if ui.button("Export").clicked() {
                     let text = self.design.export_summary();
@@ -234,16 +244,13 @@ impl eframe::App for PeriPlannerApp {
         if self.mcu != Mcu::G474 {
             self.render_top_bar(ctx, can_undo, can_redo);
             let descriptor = self.mcu.descriptor();
+            let view = self.view;
+            let af_filter = &mut self.af_filter;
             egui::CentralPanel::default().show(ctx, |ui| {
-                crate::inventory_view::show(ui, descriptor);
-                ui.separator();
-                ui.label(
-                    egui::RichText::new(
-                        "Pinout AF table and planning views land in subsequent slices — \
-                         switch to STM32G474 for the full planner today.",
-                    )
-                    .weak(),
-                );
+                match view {
+                    ViewMode::AfTable => crate::af_view::show(ui, descriptor.raw, af_filter),
+                    _ => crate::inventory_view::show(ui, descriptor),
+                }
             });
             return;
         }
@@ -954,6 +961,12 @@ impl eframe::App for PeriPlannerApp {
                     );
                     let action = crate::package_view::show(ui, self.variant, &paints);
                     self.handle_package_action(action);
+                }
+                ViewMode::Inventory => {
+                    crate::inventory_view::show(ui, self.mcu.descriptor());
+                }
+                ViewMode::AfTable => {
+                    crate::af_view::show(ui, self.mcu.descriptor().raw, &mut self.af_filter);
                 }
             }
         });

@@ -1,3 +1,4 @@
+pub mod af_view;
 pub mod app;
 pub mod comms_view;
 pub mod fabric_view;
@@ -6,6 +7,7 @@ pub mod hrtim_view;
 pub mod inventory_view;
 pub mod mcu;
 pub mod mcu_data;
+pub mod mcu_pinout;
 pub mod mcu_raw;
 pub mod package_view;
 pub mod picker;
