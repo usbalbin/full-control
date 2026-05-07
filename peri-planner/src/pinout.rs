@@ -62,41 +62,7 @@ impl ChipVariant {
         format!("{}x ({})", self.part_family(), self.package())
     }
 
-    const fn bit(self) -> u32 {
-        1u32 << self as u8
-    }
 }
-
-const ALL_V: u32 = {
-    ChipVariant::G474C.bit()
-        | ChipVariant::G474M.bit()
-        | ChipVariant::G474P.bit()
-        | ChipVariant::G474Q.bit()
-        | ChipVariant::G474R.bit()
-        | ChipVariant::G474V.bit()
-};
-/// Everything except the C class. Per metapac, the C-class is the only
-/// G474 pinout that drops several PC-port HRTIM pins; M/P/Q/R/V all carry
-/// the full PC-port HRTIM pin set.
-const NON_C: u32 = ALL_V & !ChipVariant::G474C.bit();
-/// PC pins kept on the C class (PC6, PC10, PC11).
-const PC_KEPT_ON_C: u32 = ALL_V;
-
-// Extra package-subset masks used by the generated Comms/Timers block
-// below. Kept alongside NON_C so the AF table stays dense and scannable.
-/// Pins that land on P/Q/V only (typical for PE*/PF* pins that the LQFP64
-/// and LQFP48 packages don't break out, but WLCSP81 also lacks).
-const LARGE_PQV: u32 =
-    ChipVariant::G474P.bit() | ChipVariant::G474Q.bit() | ChipVariant::G474V.bit();
-/// BGA-only pins (TFBGA100 + UFBGA121). LQFP variants don't break these out.
-const BGA_PQ: u32 = ChipVariant::G474P.bit() | ChipVariant::G474Q.bit();
-/// Everything except the two LQFP-only classes (C = LQFP48, R = LQFP64).
-const NON_CR: u32 = ChipVariant::G474M.bit()
-    | ChipVariant::G474P.bit()
-    | ChipVariant::G474Q.bit()
-    | ChipVariant::G474V.bit();
-/// Pins that only the UFBGA121 (Q) exposes — typically PG-port pins.
-const BGA_Q: u32 = ChipVariant::G474Q.bit();
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct Pin {
@@ -231,649 +197,357 @@ impl Signal {
     }
 }
 
-pub struct AfOption {
-    pub pin: Pin,
-    pub af: u8,
-    pub signal: Signal,
-    pub variants: u32,
+/// Translate a typed `Signal` to its (peripheral name, role) form used by
+/// metapac. Used by `pins_for` / `signals_on` to drive descriptor lookups.
+fn signal_to_metapac(s: Signal) -> (&'static str, String) {
+    use Signal::*;
+    match s {
+        HrtimChannel { timer, ch } => {
+            let t = match timer {
+                HrtimId::TimA => 'A', HrtimId::TimB => 'B', HrtimId::TimC => 'C',
+                HrtimId::TimD => 'D', HrtimId::TimE => 'E', HrtimId::TimF => 'F',
+            };
+            let c = match ch { HrtimCh::Ch1 => '1', HrtimCh::Ch2 => '2' };
+            ("HRTIM1", format!("CH{}{}", t, c))
+        }
+        HrtimEev(ev) => {
+            let n = match ev {
+                CrossbarSource::Eev1 => 1, CrossbarSource::Eev2 => 2,
+                CrossbarSource::Eev3 => 3, CrossbarSource::Eev4 => 4,
+                CrossbarSource::Eev5 => 5, CrossbarSource::Eev6 => 6,
+                CrossbarSource::Eev7 => 7, CrossbarSource::Eev8 => 8,
+                CrossbarSource::Eev9 => 9, CrossbarSource::Eev10 => 10,
+                _ => return ("HRTIM1", String::new()), // master/sub-timer cross-bar — no pin
+            };
+            ("HRTIM1", format!("EEV{}", n))
+        }
+        HrtimFlt(f) => {
+            let n = match f {
+                HrtimFltId::Flt1 => 1, HrtimFltId::Flt2 => 2, HrtimFltId::Flt3 => 3,
+                HrtimFltId::Flt4 => 4, HrtimFltId::Flt5 => 5, HrtimFltId::Flt6 => 6,
+            };
+            ("HRTIM1", format!("FLT{}", n))
+        }
+        HrtimScin  => ("HRTIM1", "SCIN".to_string()),
+        HrtimScout => ("HRTIM1", "SCOUT".to_string()),
+        CompInp(c) => (comp_name(c), "INP".to_string()),
+        CompInm(c) => (comp_name(c), "INM".to_string()),
+        CompOut(c) => (comp_name(c), "OUT".to_string()),
+        DacOut(d) => {
+            let (inst, ch) = match d {
+                DacId::Dac1Ch1 => (1, 1), DacId::Dac1Ch2 => (1, 2),
+                DacId::Dac2Ch1 => (2, 1),
+                DacId::Dac3Ch1 => (3, 1), DacId::Dac3Ch2 => (3, 2),
+                DacId::Dac4Ch1 => (4, 1), DacId::Dac4Ch2 => (4, 2),
+            };
+            (dac_name(inst), format!("OUT{}", ch))
+        }
+        AdcIn { adc, channel } => (adc_name(adc), format!("IN{}", channel)),
+        OpampVinp(o) => (opamp_name(o), "VINP".to_string()),
+        OpampVinm(o) => (opamp_name(o), "VINM".to_string()),
+        OpampVout(o) => (opamp_name(o), "VOUT".to_string()),
+        SpiMosi(s) => (spi_name(s), "MOSI".to_string()),
+        SpiMiso(s) => (spi_name(s), "MISO".to_string()),
+        SpiSck(s)  => (spi_name(s), "SCK".to_string()),
+        SpiNss(s)  => (spi_name(s), "NSS".to_string()),
+        I2cSda(i)  => (i2c_name(i), "SDA".to_string()),
+        I2cScl(i)  => (i2c_name(i), "SCL".to_string()),
+        I2cSmba(i) => (i2c_name(i), "SMBA".to_string()),
+        UsartTx(u)  => (usart_name(u), "TX".to_string()),
+        UsartRx(u)  => (usart_name(u), "RX".to_string()),
+        UsartCts(u) => (usart_name(u), "CTS".to_string()),
+        UsartRts(u) => (usart_name(u), "RTS".to_string()),
+        UsartCk(u)  => (usart_name(u), "CK".to_string()),
+        UartTx(u)  => (uart_name(u), "TX".to_string()),
+        UartRx(u)  => (uart_name(u), "RX".to_string()),
+        UartCts(u) => (uart_name(u), "CTS".to_string()),
+        UartRts(u) => (uart_name(u), "RTS".to_string()),
+        LpuartTx(_)  => ("LPUART1", "TX".to_string()),
+        LpuartRx(_)  => ("LPUART1", "RX".to_string()),
+        LpuartCts(_) => ("LPUART1", "CTS".to_string()),
+        LpuartRts(_) => ("LPUART1", "RTS".to_string()),
+        CanTx(c) => (fdcan_name(c), "TX".to_string()),
+        CanRx(c) => (fdcan_name(c), "RX".to_string()),
+        UsbDp => ("USB", "DP".to_string()),
+        UsbDm => ("USB", "DM".to_string()),
+        UcpdCc1(_) => ("UCPD1", "CC1".to_string()),
+        UcpdCc2(_) => ("UCPD1", "CC2".to_string()),
+        TimCh(t, ch)  => (tim_name(t), format!("CH{}", ch.number())),
+        TimChN(t, ch) => (tim_name(t), format!("CH{}N", ch.number())),
+        TimBkin(t)    => (tim_name(t), "BKIN".to_string()),
+        TimBkin2(t)   => (tim_name(t), "BKIN2".to_string()),
+        TimEtr(t)     => (tim_name(t), "ETR".to_string()),
+    }
 }
 
-macro_rules! af {
-    ($port:expr, $num:expr, $af:expr, $signal:expr, $vs:expr) => {
-        AfOption { pin: Pin::new($port, $num), af: $af, signal: $signal, variants: $vs }
-    };
+fn comp_name(c: CompId) -> &'static str {
+    match c {
+        CompId::Comp1 => "COMP1", CompId::Comp2 => "COMP2", CompId::Comp3 => "COMP3",
+        CompId::Comp4 => "COMP4", CompId::Comp5 => "COMP5", CompId::Comp6 => "COMP6",
+        CompId::Comp7 => "COMP7",
+    }
+}
+fn dac_name(n: u8) -> &'static str {
+    match n { 1 => "DAC1", 2 => "DAC2", 3 => "DAC3", 4 => "DAC4", _ => "" }
+}
+fn adc_name(a: AdcInstance) -> &'static str {
+    match a {
+        AdcInstance::Adc1 => "ADC1", AdcInstance::Adc2 => "ADC2",
+        AdcInstance::Adc3 => "ADC3", AdcInstance::Adc4 => "ADC4",
+        AdcInstance::Adc5 => "ADC5",
+    }
+}
+fn opamp_name(o: OpampId) -> &'static str {
+    match o {
+        OpampId::Opamp1 => "OPAMP1", OpampId::Opamp2 => "OPAMP2",
+        OpampId::Opamp3 => "OPAMP3", OpampId::Opamp4 => "OPAMP4",
+        OpampId::Opamp5 => "OPAMP5", OpampId::Opamp6 => "OPAMP6",
+    }
+}
+fn spi_name(s: SpiId) -> &'static str {
+    match s { SpiId::Spi1 => "SPI1", SpiId::Spi2 => "SPI2", SpiId::Spi3 => "SPI3" }
+}
+fn i2c_name(i: I2cId) -> &'static str {
+    match i { I2cId::I2c1 => "I2C1", I2cId::I2c2 => "I2C2", I2cId::I2c3 => "I2C3", I2cId::I2c4 => "I2C4" }
+}
+fn usart_name(u: UsartId) -> &'static str {
+    match u { UsartId::Usart1 => "USART1", UsartId::Usart2 => "USART2", UsartId::Usart3 => "USART3" }
+}
+fn uart_name(u: UartId) -> &'static str {
+    match u { UartId::Uart4 => "UART4", UartId::Uart5 => "UART5" }
+}
+fn fdcan_name(c: CanId) -> &'static str {
+    match c { CanId::Fdcan1 => "FDCAN1", CanId::Fdcan2 => "FDCAN2", CanId::Fdcan3 => "FDCAN3" }
+}
+fn tim_name(t: TimId) -> &'static str {
+    match t {
+        TimId::Tim1 => "TIM1",   TimId::Tim2 => "TIM2",   TimId::Tim3 => "TIM3",
+        TimId::Tim4 => "TIM4",   TimId::Tim5 => "TIM5",   TimId::Tim6 => "TIM6",
+        TimId::Tim7 => "TIM7",   TimId::Tim8 => "TIM8",
+        TimId::Tim15 => "TIM15", TimId::Tim16 => "TIM16",
+        TimId::Tim17 => "TIM17", TimId::Tim20 => "TIM20",
+    }
 }
 
-/// HRTIM AF table. Cross-checked against stm32-metapac 19.0.0 — 34 entries
-/// match exactly; 1 (PB1 SCOUT AF13, not AF12 as the datasheet AF-table row
-/// appears) was fixed during cross-check.
-const HRTIM_AF: &[AfOption] = &[
-    // HRTIM channels
-    af!('A', 8,  13, Signal::HrtimChannel { timer: HrtimId::TimA, ch: HrtimCh::Ch1 }, ALL_V),
-    af!('A', 9,  13, Signal::HrtimChannel { timer: HrtimId::TimA, ch: HrtimCh::Ch2 }, ALL_V),
-    af!('A', 10, 13, Signal::HrtimChannel { timer: HrtimId::TimB, ch: HrtimCh::Ch1 }, ALL_V),
-    af!('A', 11, 13, Signal::HrtimChannel { timer: HrtimId::TimB, ch: HrtimCh::Ch2 }, ALL_V),
-    af!('B', 12, 13, Signal::HrtimChannel { timer: HrtimId::TimC, ch: HrtimCh::Ch1 }, ALL_V),
-    af!('B', 13, 13, Signal::HrtimChannel { timer: HrtimId::TimC, ch: HrtimCh::Ch2 }, ALL_V),
-    af!('B', 14, 13, Signal::HrtimChannel { timer: HrtimId::TimD, ch: HrtimCh::Ch1 }, ALL_V),
-    af!('B', 15, 13, Signal::HrtimChannel { timer: HrtimId::TimD, ch: HrtimCh::Ch2 }, ALL_V),
-    af!('C', 8,  3,  Signal::HrtimChannel { timer: HrtimId::TimE, ch: HrtimCh::Ch1 }, NON_C),
-    af!('C', 9,  3,  Signal::HrtimChannel { timer: HrtimId::TimE, ch: HrtimCh::Ch2 }, NON_C),
-    af!('C', 6,  13, Signal::HrtimChannel { timer: HrtimId::TimF, ch: HrtimCh::Ch1 }, PC_KEPT_ON_C),
-    af!('C', 7,  13, Signal::HrtimChannel { timer: HrtimId::TimF, ch: HrtimCh::Ch2 }, NON_C),
-    // FLT inputs
-    af!('A', 12, 13, Signal::HrtimFlt(HrtimFltId::Flt1), ALL_V),
-    af!('A', 15, 13, Signal::HrtimFlt(HrtimFltId::Flt2), ALL_V),
-    af!('B', 10, 13, Signal::HrtimFlt(HrtimFltId::Flt3), ALL_V),
-    af!('B', 11, 13, Signal::HrtimFlt(HrtimFltId::Flt4), ALL_V),
-    af!('B', 0,  13, Signal::HrtimFlt(HrtimFltId::Flt5), ALL_V),
-    af!('C', 7,  3,  Signal::HrtimFlt(HrtimFltId::Flt5), NON_C), // alt
-    af!('C', 10, 13, Signal::HrtimFlt(HrtimFltId::Flt6), PC_KEPT_ON_C),
-    // EEV inputs
-    af!('C', 12, 3,  Signal::HrtimEev(CrossbarSource::Eev1),  NON_C),
-    af!('C', 11, 3,  Signal::HrtimEev(CrossbarSource::Eev2),  PC_KEPT_ON_C),
-    af!('B', 7,  13, Signal::HrtimEev(CrossbarSource::Eev3),  ALL_V),
-    af!('B', 6,  13, Signal::HrtimEev(CrossbarSource::Eev4),  ALL_V),
-    af!('B', 9,  13, Signal::HrtimEev(CrossbarSource::Eev5),  ALL_V),
-    af!('B', 5,  13, Signal::HrtimEev(CrossbarSource::Eev6),  ALL_V),
-    af!('B', 4,  13, Signal::HrtimEev(CrossbarSource::Eev7),  ALL_V),
-    af!('B', 8,  13, Signal::HrtimEev(CrossbarSource::Eev8),  ALL_V),
-    af!('B', 3,  13, Signal::HrtimEev(CrossbarSource::Eev9),  ALL_V),
-    af!('C', 5,  13, Signal::HrtimEev(CrossbarSource::Eev10), NON_C),
-    af!('C', 6,  3,  Signal::HrtimEev(CrossbarSource::Eev10), PC_KEPT_ON_C), // alt
-    // Sync
-    af!('B', 1,  13, Signal::HrtimScout, ALL_V),
-    af!('B', 3,  12, Signal::HrtimScout, ALL_V), // alt (conflicts w/ EEV9)
-    af!('B', 2,  13, Signal::HrtimScin,  ALL_V),
-    af!('B', 6,  12, Signal::HrtimScin,  ALL_V), // alt (conflicts w/ EEV4)
+/// Reverse translate a metapac (peripheral, role) to a `Signal`. Returns
+/// `None` for signals not represented in the typed enum (OPAMP secondary
+/// inputs, ADC negative pins, GPIO, etc.).
+fn metapac_to_signal(peripheral: &str, role: &str) -> Option<Signal> {
+    // HRTIM channels and fabric.
+    if peripheral == "HRTIM1" {
+        if let Some(rest) = role.strip_prefix("CH") {
+            let mut chars = rest.chars();
+            let t_ch = chars.next()?;
+            let c_ch = chars.next()?;
+            if chars.next().is_some() { return None; }
+            let timer = match t_ch {
+                'A' => HrtimId::TimA, 'B' => HrtimId::TimB, 'C' => HrtimId::TimC,
+                'D' => HrtimId::TimD, 'E' => HrtimId::TimE, 'F' => HrtimId::TimF,
+                _ => return None,
+            };
+            let ch = match c_ch { '1' => HrtimCh::Ch1, '2' => HrtimCh::Ch2, _ => return None };
+            return Some(Signal::HrtimChannel { timer, ch });
+        }
+        if let Some(n) = role.strip_prefix("EEV").and_then(|s| s.parse::<u8>().ok()) {
+            let ev = match n {
+                1 => CrossbarSource::Eev1, 2 => CrossbarSource::Eev2, 3 => CrossbarSource::Eev3,
+                4 => CrossbarSource::Eev4, 5 => CrossbarSource::Eev5, 6 => CrossbarSource::Eev6,
+                7 => CrossbarSource::Eev7, 8 => CrossbarSource::Eev8, 9 => CrossbarSource::Eev9,
+                10 => CrossbarSource::Eev10, _ => return None,
+            };
+            return Some(Signal::HrtimEev(ev));
+        }
+        if let Some(n) = role.strip_prefix("FLT").and_then(|s| s.parse::<u8>().ok()) {
+            let f = match n {
+                1 => HrtimFltId::Flt1, 2 => HrtimFltId::Flt2, 3 => HrtimFltId::Flt3,
+                4 => HrtimFltId::Flt4, 5 => HrtimFltId::Flt5, 6 => HrtimFltId::Flt6,
+                _ => return None,
+            };
+            return Some(Signal::HrtimFlt(f));
+        }
+        return Some(match role {
+            "SCIN"  => Signal::HrtimScin,
+            "SCOUT" => Signal::HrtimScout,
+            _ => return None,
+        });
+    }
 
-    // ---- Analog: COMP inputs / outputs, DAC outputs ----
-    //
-    // AF==0 marker for pure-analog pins (no GPIO_AFR slot; peripheral
-    // register enables the pin). Cross-checked against stm32-metapac.
-    // Package availability for these: low-port pins (PA*, PB*) are on all
-    // variants; where metapac lists a pin on one class and not another,
-    // mark NON_C accordingly.
+    // COMP1..COMP7
+    if let Some(n) = peripheral.strip_prefix("COMP").and_then(|s| s.parse::<u8>().ok()) {
+        let c = match n {
+            1 => CompId::Comp1, 2 => CompId::Comp2, 3 => CompId::Comp3, 4 => CompId::Comp4,
+            5 => CompId::Comp5, 6 => CompId::Comp6, 7 => CompId::Comp7, _ => return None,
+        };
+        return Some(match role {
+            "INP" => Signal::CompInp(c), "INM" => Signal::CompInm(c), "OUT" => Signal::CompOut(c),
+            _ => return None,
+        });
+    }
 
-    // DAC outputs (only slow DACs have pins; DAC3/DAC4 are internal-only)
-    af!('A', 4, 0, Signal::DacOut(DacId::Dac1Ch1), ALL_V),
-    af!('A', 5, 0, Signal::DacOut(DacId::Dac1Ch2), ALL_V),
-    af!('A', 6, 0, Signal::DacOut(DacId::Dac2Ch1), ALL_V),
+    // DAC1/2/3/4 channels
+    if let Some(n) = peripheral.strip_prefix("DAC").and_then(|s| s.parse::<u8>().ok()) {
+        let ch = role.strip_prefix("OUT").and_then(|s| s.parse::<u8>().ok())?;
+        let id = match (n, ch) {
+            (1, 1) => DacId::Dac1Ch1, (1, 2) => DacId::Dac1Ch2,
+            (2, 1) => DacId::Dac2Ch1,
+            (3, 1) => DacId::Dac3Ch1, (3, 2) => DacId::Dac3Ch2,
+            (4, 1) => DacId::Dac4Ch1, (4, 2) => DacId::Dac4Ch2,
+            _ => return None,
+        };
+        return Some(Signal::DacOut(id));
+    }
 
-    // COMP1 inputs / output
-    af!('A', 1, 0, Signal::CompInp(CompId::Comp1), ALL_V),
-    af!('B', 1, 0, Signal::CompInp(CompId::Comp1), ALL_V),
-    af!('A', 0, 0, Signal::CompInm(CompId::Comp1), ALL_V),
-    af!('A', 4, 0, Signal::CompInm(CompId::Comp1), ALL_V),
-    af!('A', 0,  8, Signal::CompOut(CompId::Comp1), ALL_V),
-    af!('A', 6,  8, Signal::CompOut(CompId::Comp1), ALL_V),
-    af!('A', 11, 8, Signal::CompOut(CompId::Comp1), ALL_V),
-    af!('B', 8,  8, Signal::CompOut(CompId::Comp1), ALL_V),
+    // ADCs — only the positive `IN<n>` channels are represented in Signal.
+    if let Some(n) = peripheral.strip_prefix("ADC").and_then(|s| s.parse::<u8>().ok()) {
+        let adc = match n {
+            1 => AdcInstance::Adc1, 2 => AdcInstance::Adc2, 3 => AdcInstance::Adc3,
+            4 => AdcInstance::Adc4, 5 => AdcInstance::Adc5, _ => return None,
+        };
+        let channel = role.strip_prefix("IN").filter(|s| !s.starts_with('N'))
+            .and_then(|s| s.parse::<u8>().ok())?;
+        return Some(Signal::AdcIn { adc, channel });
+    }
 
-    // COMP2 inputs / output
-    af!('A', 3, 0, Signal::CompInp(CompId::Comp2), ALL_V),
-    af!('A', 7, 0, Signal::CompInp(CompId::Comp2), ALL_V),
-    af!('A', 2, 0, Signal::CompInm(CompId::Comp2), ALL_V),
-    af!('A', 5, 0, Signal::CompInm(CompId::Comp2), ALL_V),
-    af!('A', 2,  8, Signal::CompOut(CompId::Comp2), ALL_V),
-    af!('A', 7,  8, Signal::CompOut(CompId::Comp2), ALL_V),
-    af!('A', 12, 8, Signal::CompOut(CompId::Comp2), ALL_V),
-    af!('B', 9,  8, Signal::CompOut(CompId::Comp2), ALL_V),
+    // OPAMPs — ignore the *_SEC variants and numbered VINP0/VINP1 selectors;
+    // only the bare VINP/VINM/VOUT roles map to a Signal.
+    if let Some(n) = peripheral.strip_prefix("OPAMP").and_then(|s| s.parse::<u8>().ok()) {
+        let o = match n {
+            1 => OpampId::Opamp1, 2 => OpampId::Opamp2, 3 => OpampId::Opamp3,
+            4 => OpampId::Opamp4, 5 => OpampId::Opamp5, 6 => OpampId::Opamp6,
+            _ => return None,
+        };
+        return Some(match role {
+            "VINP" => Signal::OpampVinp(o), "VINM" => Signal::OpampVinm(o), "VOUT" => Signal::OpampVout(o),
+            _ => return None,
+        });
+    }
 
-    // COMP3 inputs / output
-    af!('B', 14, 0, Signal::CompInp(CompId::Comp3), ALL_V),
-    af!('C', 1,  0, Signal::CompInp(CompId::Comp3), PC_KEPT_ON_C),
-    af!('C', 0,  0, Signal::CompInm(CompId::Comp3), PC_KEPT_ON_C),
-    af!('F', 1,  0, Signal::CompInm(CompId::Comp3), ALL_V),
-    af!('B', 7,  8, Signal::CompOut(CompId::Comp3), ALL_V),
-    af!('B', 15, 3, Signal::CompOut(CompId::Comp3), ALL_V),
+    // SPI / I2C / USART / UART / LPUART / FDCAN / USB / UCPD / TIMx
+    if let Some(n) = peripheral.strip_prefix("SPI").and_then(|s| s.parse::<u8>().ok()) {
+        let s = match n { 1 => SpiId::Spi1, 2 => SpiId::Spi2, 3 => SpiId::Spi3, _ => return None };
+        return Some(match role {
+            "MOSI" => Signal::SpiMosi(s), "MISO" => Signal::SpiMiso(s),
+            "SCK"  => Signal::SpiSck(s),  "NSS"  => Signal::SpiNss(s),
+            _ => return None,
+        });
+    }
+    if let Some(n) = peripheral.strip_prefix("I2C").and_then(|s| s.parse::<u8>().ok()) {
+        let i = match n {
+            1 => I2cId::I2c1, 2 => I2cId::I2c2, 3 => I2cId::I2c3, 4 => I2cId::I2c4, _ => return None,
+        };
+        return Some(match role {
+            "SDA" => Signal::I2cSda(i), "SCL" => Signal::I2cScl(i), "SMBA" => Signal::I2cSmba(i),
+            _ => return None,
+        });
+    }
+    if let Some(n) = peripheral.strip_prefix("USART").and_then(|s| s.parse::<u8>().ok()) {
+        let u = match n { 1 => UsartId::Usart1, 2 => UsartId::Usart2, 3 => UsartId::Usart3, _ => return None };
+        return Some(match role {
+            "TX"  => Signal::UsartTx(u), "RX"  => Signal::UsartRx(u),
+            "CTS" => Signal::UsartCts(u), "RTS" => Signal::UsartRts(u),
+            "CK"  => Signal::UsartCk(u),
+            _ => return None,
+        });
+    }
+    if let Some(n) = peripheral.strip_prefix("UART").and_then(|s| s.parse::<u8>().ok()) {
+        let u = match n { 4 => UartId::Uart4, 5 => UartId::Uart5, _ => return None };
+        return Some(match role {
+            "TX"  => Signal::UartTx(u), "RX"  => Signal::UartRx(u),
+            "CTS" => Signal::UartCts(u), "RTS" => Signal::UartRts(u),
+            _ => return None,
+        });
+    }
+    if peripheral == "LPUART1" {
+        return Some(match role {
+            "TX" => Signal::LpuartTx(LpuartId::Lpuart1),
+            "RX" => Signal::LpuartRx(LpuartId::Lpuart1),
+            "CTS" => Signal::LpuartCts(LpuartId::Lpuart1),
+            "RTS" => Signal::LpuartRts(LpuartId::Lpuart1),
+            _ => return None,
+        });
+    }
+    if let Some(n) = peripheral.strip_prefix("FDCAN").and_then(|s| s.parse::<u8>().ok()) {
+        let c = match n { 1 => CanId::Fdcan1, 2 => CanId::Fdcan2, 3 => CanId::Fdcan3, _ => return None };
+        return Some(match role {
+            "TX" => Signal::CanTx(c), "RX" => Signal::CanRx(c), _ => return None,
+        });
+    }
+    if peripheral == "USB" {
+        return Some(match role {
+            "DP" => Signal::UsbDp, "DM" => Signal::UsbDm, _ => return None,
+        });
+    }
+    if peripheral == "UCPD1" {
+        return Some(match role {
+            "CC1" => Signal::UcpdCc1(UcpdId::Ucpd1),
+            "CC2" => Signal::UcpdCc2(UcpdId::Ucpd1),
+            _ => return None,
+        });
+    }
+    if let Some(n) = peripheral.strip_prefix("TIM").and_then(|s| s.parse::<u8>().ok()) {
+        let t = match n {
+            1 => TimId::Tim1, 2 => TimId::Tim2, 3 => TimId::Tim3, 4 => TimId::Tim4,
+            5 => TimId::Tim5, 6 => TimId::Tim6, 7 => TimId::Tim7, 8 => TimId::Tim8,
+            15 => TimId::Tim15, 16 => TimId::Tim16, 17 => TimId::Tim17, 20 => TimId::Tim20,
+            _ => return None,
+        };
+        if let Some(rest) = role.strip_prefix("CH") {
+            // "1", "2", "3", "4" or "1N", "2N", "3N"
+            let (n_str, complementary) = match rest.strip_suffix('N') {
+                Some(s) => (s, true),
+                None => (rest, false),
+            };
+            let ch = match n_str.parse::<u8>().ok()? {
+                1 => TimCh::Ch1, 2 => TimCh::Ch2, 3 => TimCh::Ch3, 4 => TimCh::Ch4, _ => return None,
+            };
+            return Some(if complementary { Signal::TimChN(t, ch) } else { Signal::TimCh(t, ch) });
+        }
+        return Some(match role {
+            "BKIN"  => Signal::TimBkin(t),
+            "BKIN2" => Signal::TimBkin2(t),
+            "ETR"   => Signal::TimEtr(t),
+            _ => return None,
+        });
+    }
 
-    // COMP4 inputs / output
-    af!('B', 0,  0, Signal::CompInp(CompId::Comp4), ALL_V),
-    af!('E', 7,  0, Signal::CompInp(CompId::Comp4), NON_C),
-    af!('B', 2,  0, Signal::CompInm(CompId::Comp4), ALL_V),
-    af!('E', 8,  0, Signal::CompInm(CompId::Comp4), NON_C),
-    af!('B', 1,  8, Signal::CompOut(CompId::Comp4), ALL_V),
-    af!('B', 6,  8, Signal::CompOut(CompId::Comp4), ALL_V),
-    af!('B', 14, 8, Signal::CompOut(CompId::Comp4), ALL_V),
-
-    // COMP5 inputs / output (not all variants have this)
-    af!('B', 13, 0, Signal::CompInp(CompId::Comp5), ALL_V),
-    af!('D', 12, 0, Signal::CompInp(CompId::Comp5), NON_C),
-    af!('B', 10, 0, Signal::CompInm(CompId::Comp5), ALL_V),
-    af!('D', 13, 0, Signal::CompInm(CompId::Comp5), NON_C),
-    af!('A', 9,  8, Signal::CompOut(CompId::Comp5), ALL_V),
-    af!('C', 7,  7, Signal::CompOut(CompId::Comp5), NON_C),
-
-    // COMP6 inputs / output
-    af!('B', 11, 0, Signal::CompInp(CompId::Comp6), ALL_V),
-    af!('D', 11, 0, Signal::CompInp(CompId::Comp6), NON_C),
-    af!('B', 15, 0, Signal::CompInm(CompId::Comp6), ALL_V),
-    af!('D', 10, 0, Signal::CompInm(CompId::Comp6), NON_C),
-    af!('A', 10, 8, Signal::CompOut(CompId::Comp6), ALL_V),
-    af!('C', 6,  7, Signal::CompOut(CompId::Comp6), PC_KEPT_ON_C),
-
-    // COMP7 inputs / output
-    af!('B', 14, 0, Signal::CompInp(CompId::Comp7), ALL_V),
-    af!('B', 12, 0, Signal::CompInm(CompId::Comp7), ALL_V),
-    af!('A', 8,  8, Signal::CompOut(CompId::Comp7), ALL_V),
-    af!('C', 8,  7, Signal::CompOut(CompId::Comp7), NON_C),
-
-    // ---- ADC single-ended input pins (ADC1..5) ----
-    // Extracted from stm32-metapac; each ADC-channel-number has a
-    // specific GPIO pin on each ADC instance.
-
-    // ADC1 (14 inputs — channel-13 routed from internal VREFINT+, not a pin)
-    af!('A', 0, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 1 }, ALL_V),
-    af!('A', 1, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 2 }, ALL_V),
-    af!('A', 2, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 3 }, ALL_V),
-    af!('A', 3, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 4 }, ALL_V),
-    af!('B', 14, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 5 }, ALL_V),
-    af!('C', 0, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 6 }, PC_KEPT_ON_C),
-    af!('C', 1, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 7 }, PC_KEPT_ON_C),
-    af!('C', 2, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 8 }, PC_KEPT_ON_C),
-    af!('C', 3, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 9 }, PC_KEPT_ON_C),
-    af!('F', 0, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 10 }, ALL_V),
-    af!('B', 12, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 11 }, ALL_V),
-    af!('B', 1, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 12 }, ALL_V),
-    af!('B', 11, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 14 }, ALL_V),
-    af!('B', 0, 0, Signal::AdcIn { adc: AdcInstance::Adc1, channel: 15 }, ALL_V),
-
-    // ADC2 (16 inputs)
-    af!('A', 0, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 1 }, ALL_V),
-    af!('A', 1, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 2 }, ALL_V),
-    af!('A', 6, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 3 }, ALL_V),
-    af!('A', 7, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 4 }, ALL_V),
-    af!('C', 4, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 5 }, NON_C),
-    af!('C', 0, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 6 }, PC_KEPT_ON_C),
-    af!('C', 1, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 7 }, PC_KEPT_ON_C),
-    af!('C', 2, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 8 }, PC_KEPT_ON_C),
-    af!('C', 3, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 9 }, PC_KEPT_ON_C),
-    af!('F', 1, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 10 }, ALL_V),
-    af!('C', 5, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 11 }, NON_C),
-    af!('B', 2, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 12 }, ALL_V),
-    af!('A', 5, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 13 }, ALL_V),
-    af!('B', 11, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 14 }, ALL_V),
-    af!('B', 15, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 15 }, ALL_V),
-    af!('A', 4, 0, Signal::AdcIn { adc: AdcInstance::Adc2, channel: 17 }, ALL_V),
-
-    // ADC3 (3 external inputs)
-    af!('B', 1, 0, Signal::AdcIn { adc: AdcInstance::Adc3, channel: 1 }, ALL_V),
-    af!('B', 13, 0, Signal::AdcIn { adc: AdcInstance::Adc3, channel: 5 }, ALL_V),
-    af!('B', 0, 0, Signal::AdcIn { adc: AdcInstance::Adc3, channel: 12 }, ALL_V),
-
-    // ADC4 (3 external inputs)
-    af!('B', 12, 0, Signal::AdcIn { adc: AdcInstance::Adc4, channel: 3 }, ALL_V),
-    af!('B', 14, 0, Signal::AdcIn { adc: AdcInstance::Adc4, channel: 4 }, ALL_V),
-    af!('B', 15, 0, Signal::AdcIn { adc: AdcInstance::Adc4, channel: 5 }, ALL_V),
-
-    // ADC5 (2 external inputs)
-    af!('A', 8, 0, Signal::AdcIn { adc: AdcInstance::Adc5, channel: 1 }, ALL_V),
-    af!('A', 9, 0, Signal::AdcIn { adc: AdcInstance::Adc5, channel: 2 }, ALL_V),
-
-    // ---- OPAMP inputs / outputs ----
-    //
-    // Sourced from stm32-metapac 19.0.0 for STM32G474RE (LQFP64).
-    // Each OPAMP has up to 3 VINP options, 1-2 VINM options, 1 VOUT.
-    // Signals treated as analog "additional functions" (AF=0) matching the
-    // existing COMP/DAC/ADC handling in this table. PC5 is not on LQFP48
-    // (C class); PD*/PE* VINP options on larger packages aren't added here
-    // pending a full per-package pass.
-
-    // OPAMP1
-    af!('A', 1, 0, Signal::OpampVinp(OpampId::Opamp1), ALL_V),
-    af!('A', 3, 0, Signal::OpampVinp(OpampId::Opamp1), ALL_V),
-    af!('A', 7, 0, Signal::OpampVinp(OpampId::Opamp1), ALL_V),
-    af!('A', 3, 0, Signal::OpampVinm(OpampId::Opamp1), ALL_V),
-    af!('C', 5, 0, Signal::OpampVinm(OpampId::Opamp1), NON_C),
-    af!('A', 2, 0, Signal::OpampVout(OpampId::Opamp1), ALL_V),
-
-    // OPAMP2
-    af!('A', 7, 0, Signal::OpampVinp(OpampId::Opamp2), ALL_V),
-    af!('B', 0, 0, Signal::OpampVinp(OpampId::Opamp2), ALL_V),
-    af!('B', 14, 0, Signal::OpampVinp(OpampId::Opamp2), ALL_V),
-    af!('A', 5, 0, Signal::OpampVinm(OpampId::Opamp2), ALL_V),
-    af!('C', 5, 0, Signal::OpampVinm(OpampId::Opamp2), NON_C),
-    af!('A', 6, 0, Signal::OpampVout(OpampId::Opamp2), ALL_V),
-
-    // OPAMP3
-    af!('A', 1, 0, Signal::OpampVinp(OpampId::Opamp3), ALL_V),
-    af!('B', 0, 0, Signal::OpampVinp(OpampId::Opamp3), ALL_V),
-    af!('B', 13, 0, Signal::OpampVinp(OpampId::Opamp3), ALL_V),
-    af!('B', 2, 0, Signal::OpampVinm(OpampId::Opamp3), ALL_V),
-    af!('B', 10, 0, Signal::OpampVinm(OpampId::Opamp3), ALL_V),
-    af!('B', 1, 0, Signal::OpampVout(OpampId::Opamp3), ALL_V),
-
-    // OPAMP4
-    af!('B', 11, 0, Signal::OpampVinp(OpampId::Opamp4), ALL_V),
-    af!('B', 13, 0, Signal::OpampVinp(OpampId::Opamp4), ALL_V),
-    af!('B', 10, 0, Signal::OpampVinm(OpampId::Opamp4), ALL_V),
-    af!('B', 12, 0, Signal::OpampVout(OpampId::Opamp4), ALL_V),
-
-    // OPAMP5
-    af!('B', 14, 0, Signal::OpampVinp(OpampId::Opamp5), ALL_V),
-    af!('C', 3, 0, Signal::OpampVinp(OpampId::Opamp5), PC_KEPT_ON_C),
-    af!('A', 3, 0, Signal::OpampVinm(OpampId::Opamp5), ALL_V),
-    af!('B', 15, 0, Signal::OpampVinm(OpampId::Opamp5), ALL_V),
-    af!('A', 8, 0, Signal::OpampVout(OpampId::Opamp5), ALL_V),
-
-    // OPAMP6
-    af!('B', 12, 0, Signal::OpampVinp(OpampId::Opamp6), ALL_V),
-    af!('B', 13, 0, Signal::OpampVinp(OpampId::Opamp6), ALL_V),
-    af!('A', 1, 0, Signal::OpampVinm(OpampId::Opamp6), ALL_V),
-    af!('B', 1, 0, Signal::OpampVinm(OpampId::Opamp6), ALL_V),
-    af!('B', 11, 0, Signal::OpampVout(OpampId::Opamp6), ALL_V),
-
-    // ---- Comms + Timers (SPI / I2C / (L)(US)ART / FDCAN / TIM / USB / UCPD) ----
-    //
-    // Generated per-package from stm32-metapac 19.0.0 across all six
-    // G474 pinout classes (C/M/P/Q/R/V). Each entry's variant bitmask
-    // reflects which packages actually expose that pin — LQFP48 drops
-    // most PC-port pins and all PD/PE/PF/PG, WLCSP81 drops PE/PF/PG,
-    // LQFP64 drops PE/PF/PG, LQFP100 keeps PD/PE but drops PF high pins
-    // and PG, UFBGA121 is the only package with the full PG-port set.
-    //
-    // Deduplicated: USART DE aliases RTS pin; SPI I2S_* aliases skipped;
-    // UCPD DBCCx / FRSTXx not modeled yet.
-    // FDCAN1
-    af!('A', 11,  9, Signal::CanRx(CanId::Fdcan1), ALL_V),
-    af!('A', 12,  9, Signal::CanTx(CanId::Fdcan1), ALL_V),
-    af!('B',  8,  9, Signal::CanRx(CanId::Fdcan1), ALL_V),
-    af!('B',  9,  9, Signal::CanTx(CanId::Fdcan1), ALL_V),
-    af!('D',  0,  9, Signal::CanRx(CanId::Fdcan1), NON_CR),
-    af!('D',  1,  9, Signal::CanTx(CanId::Fdcan1), NON_CR),
-    // FDCAN2
-    af!('B', 12,  9, Signal::CanRx(CanId::Fdcan2), ALL_V),
-    af!('B', 13,  9, Signal::CanTx(CanId::Fdcan2), ALL_V),
-    af!('B',  5,  9, Signal::CanRx(CanId::Fdcan2), ALL_V),
-    af!('B',  6,  9, Signal::CanTx(CanId::Fdcan2), ALL_V),
-    // FDCAN3
-    af!('A', 15, 11, Signal::CanTx(CanId::Fdcan3), ALL_V),
-    af!('A',  8, 11, Signal::CanRx(CanId::Fdcan3), ALL_V),
-    af!('B',  3, 11, Signal::CanRx(CanId::Fdcan3), ALL_V),
-    af!('B',  4, 11, Signal::CanTx(CanId::Fdcan3), ALL_V),
-    // I2C1
-    af!('A', 13,  4, Signal::I2cScl(I2cId::I2c1), ALL_V),
-    af!('A', 14,  4, Signal::I2cSda(I2cId::I2c1), ALL_V),
-    af!('A', 15,  4, Signal::I2cScl(I2cId::I2c1), ALL_V),
-    af!('B',  5,  4, Signal::I2cSmba(I2cId::I2c1), ALL_V),
-    af!('B',  7,  4, Signal::I2cSda(I2cId::I2c1), ALL_V),
-    af!('B',  8,  4, Signal::I2cScl(I2cId::I2c1), ALL_V),
-    af!('B',  9,  4, Signal::I2cSda(I2cId::I2c1), ALL_V),
-    // I2C2
-    af!('A', 10,  4, Signal::I2cSmba(I2cId::I2c2), ALL_V),
-    af!('A',  8,  4, Signal::I2cSda(I2cId::I2c2), ALL_V),
-    af!('A',  9,  4, Signal::I2cScl(I2cId::I2c2), ALL_V),
-    af!('B', 12,  4, Signal::I2cSmba(I2cId::I2c2), ALL_V),
-    af!('C',  4,  4, Signal::I2cScl(I2cId::I2c2), ALL_V),
-    af!('F',  0,  4, Signal::I2cSda(I2cId::I2c2), ALL_V),
-    af!('F',  2,  4, Signal::I2cSmba(I2cId::I2c2), LARGE_PQV),
-    af!('F',  6,  4, Signal::I2cScl(I2cId::I2c2), BGA_PQ),
-    // I2C3
-    af!('A',  8,  2, Signal::I2cScl(I2cId::I2c3), ALL_V),
-    af!('A',  9,  2, Signal::I2cSmba(I2cId::I2c3), ALL_V),
-    af!('B',  2,  4, Signal::I2cSmba(I2cId::I2c3), ALL_V),
-    af!('B',  5,  8, Signal::I2cSda(I2cId::I2c3), ALL_V),
-    af!('C', 11,  8, Signal::I2cSda(I2cId::I2c3), ALL_V),
-    af!('C',  8,  8, Signal::I2cScl(I2cId::I2c3), NON_C),
-    af!('C',  9,  8, Signal::I2cSda(I2cId::I2c3), NON_C),
-    af!('F',  3,  4, Signal::I2cScl(I2cId::I2c3), BGA_PQ),
-    af!('F',  4,  4, Signal::I2cSda(I2cId::I2c3), BGA_PQ),
-    af!('G',  6,  4, Signal::I2cSmba(I2cId::I2c3), BGA_Q),
-    af!('G',  7,  4, Signal::I2cScl(I2cId::I2c3), BGA_Q),
-    af!('G',  8,  4, Signal::I2cSda(I2cId::I2c3), BGA_Q),
-    // I2C4
-    af!('A', 13,  3, Signal::I2cScl(I2cId::I2c4), ALL_V),
-    af!('A', 14,  3, Signal::I2cSmba(I2cId::I2c4), ALL_V),
-    af!('B',  7,  3, Signal::I2cSda(I2cId::I2c4), ALL_V),
-    af!('C',  6,  8, Signal::I2cScl(I2cId::I2c4), ALL_V),
-    af!('C',  7,  8, Signal::I2cSda(I2cId::I2c4), NON_C),
-    af!('D', 11,  4, Signal::I2cSmba(I2cId::I2c4), NON_CR),
-    af!('F', 13,  4, Signal::I2cSmba(I2cId::I2c4), BGA_PQ),
-    af!('F', 14,  4, Signal::I2cScl(I2cId::I2c4), BGA_PQ),
-    af!('F', 15,  4, Signal::I2cSda(I2cId::I2c4), BGA_PQ),
-    af!('G',  3,  4, Signal::I2cScl(I2cId::I2c4), BGA_PQ),
-    af!('G',  4,  4, Signal::I2cSda(I2cId::I2c4), BGA_PQ),
-    // LPUART1
-    af!('A',  2, 12, Signal::LpuartTx(LpuartId::Lpuart1), ALL_V),
-    af!('A',  3, 12, Signal::LpuartRx(LpuartId::Lpuart1), ALL_V),
-    af!('A',  6, 12, Signal::LpuartCts(LpuartId::Lpuart1), ALL_V),
-    af!('B',  1, 12, Signal::LpuartRts(LpuartId::Lpuart1), ALL_V),
-    af!('B', 10,  8, Signal::LpuartRx(LpuartId::Lpuart1), ALL_V),
-    af!('B', 11,  8, Signal::LpuartTx(LpuartId::Lpuart1), ALL_V),
-    af!('B', 12,  8, Signal::LpuartRts(LpuartId::Lpuart1), ALL_V),
-    af!('B', 13,  8, Signal::LpuartCts(LpuartId::Lpuart1), ALL_V),
-    af!('C',  0,  8, Signal::LpuartRx(LpuartId::Lpuart1), NON_C),
-    af!('C',  1,  8, Signal::LpuartTx(LpuartId::Lpuart1), NON_C),
-    af!('G',  5,  8, Signal::LpuartCts(LpuartId::Lpuart1), BGA_Q),
-    af!('G',  6,  8, Signal::LpuartRts(LpuartId::Lpuart1), BGA_Q),
-    af!('G',  7,  8, Signal::LpuartTx(LpuartId::Lpuart1), BGA_Q),
-    af!('G',  8,  8, Signal::LpuartRx(LpuartId::Lpuart1), BGA_Q),
-    // SPI1
-    af!('A', 15,  5, Signal::SpiNss(SpiId::Spi1), ALL_V),
-    af!('A',  4,  5, Signal::SpiNss(SpiId::Spi1), ALL_V),
-    af!('A',  5,  5, Signal::SpiSck(SpiId::Spi1), ALL_V),
-    af!('A',  6,  5, Signal::SpiMiso(SpiId::Spi1), ALL_V),
-    af!('A',  7,  5, Signal::SpiMosi(SpiId::Spi1), ALL_V),
-    af!('B',  3,  5, Signal::SpiSck(SpiId::Spi1), ALL_V),
-    af!('B',  4,  5, Signal::SpiMiso(SpiId::Spi1), ALL_V),
-    af!('B',  5,  5, Signal::SpiMosi(SpiId::Spi1), ALL_V),
-    af!('G',  2,  5, Signal::SpiSck(SpiId::Spi1), BGA_PQ),
-    af!('G',  3,  5, Signal::SpiMiso(SpiId::Spi1), BGA_PQ),
-    af!('G',  4,  5, Signal::SpiMosi(SpiId::Spi1), BGA_PQ),
-    af!('G',  5,  5, Signal::SpiNss(SpiId::Spi1), BGA_Q),
-    // SPI2
-    af!('A', 10,  5, Signal::SpiMiso(SpiId::Spi2), ALL_V),
-    af!('A', 11,  5, Signal::SpiMosi(SpiId::Spi2), ALL_V),
-    af!('B', 12,  5, Signal::SpiNss(SpiId::Spi2), ALL_V),
-    af!('B', 13,  5, Signal::SpiSck(SpiId::Spi2), ALL_V),
-    af!('B', 14,  5, Signal::SpiMiso(SpiId::Spi2), ALL_V),
-    af!('B', 15,  5, Signal::SpiMosi(SpiId::Spi2), ALL_V),
-    af!('D', 15,  6, Signal::SpiNss(SpiId::Spi2), LARGE_PQV),
-    af!('F',  0,  5, Signal::SpiNss(SpiId::Spi2), ALL_V),
-    af!('F',  1,  5, Signal::SpiSck(SpiId::Spi2), ALL_V),
-    af!('F', 10,  5, Signal::SpiSck(SpiId::Spi2), LARGE_PQV),
-    af!('F',  9,  5, Signal::SpiSck(SpiId::Spi2), LARGE_PQV),
-    // SPI3
-    af!('A', 15,  6, Signal::SpiNss(SpiId::Spi3), ALL_V),
-    af!('A',  4,  6, Signal::SpiNss(SpiId::Spi3), ALL_V),
-    af!('B',  3,  6, Signal::SpiSck(SpiId::Spi3), ALL_V),
-    af!('B',  4,  6, Signal::SpiMiso(SpiId::Spi3), ALL_V),
-    af!('B',  5,  6, Signal::SpiMosi(SpiId::Spi3), ALL_V),
-    af!('C', 10,  6, Signal::SpiSck(SpiId::Spi3), ALL_V),
-    af!('C', 11,  6, Signal::SpiMiso(SpiId::Spi3), ALL_V),
-    af!('C', 12,  6, Signal::SpiMosi(SpiId::Spi3), NON_C),
-    af!('G',  9,  6, Signal::SpiSck(SpiId::Spi3), BGA_Q),
-    // TIM1
-    af!('A', 10,  6, Signal::TimCh(TimId::Tim1, TimCh::Ch3), ALL_V),
-    af!('A', 11,  6, Signal::TimChN(TimId::Tim1, TimCh::Ch1), ALL_V),
-    af!('A', 11, 11, Signal::TimCh(TimId::Tim1, TimCh::Ch4), ALL_V),
-    af!('A', 11, 12, Signal::TimBkin2(TimId::Tim1), ALL_V),
-    af!('A', 12,  6, Signal::TimChN(TimId::Tim1, TimCh::Ch2), ALL_V),
-    af!('A', 12, 11, Signal::TimEtr(TimId::Tim1), ALL_V),
-    af!('A', 14,  6, Signal::TimBkin(TimId::Tim1), ALL_V),
-    af!('A', 15,  9, Signal::TimBkin(TimId::Tim1), ALL_V),
-    af!('A',  6,  6, Signal::TimBkin(TimId::Tim1), ALL_V),
-    af!('A',  7,  6, Signal::TimChN(TimId::Tim1, TimCh::Ch1), ALL_V),
-    af!('A',  8,  6, Signal::TimCh(TimId::Tim1, TimCh::Ch1), ALL_V),
-    af!('A',  9,  6, Signal::TimCh(TimId::Tim1, TimCh::Ch2), ALL_V),
-    af!('B',  0,  6, Signal::TimChN(TimId::Tim1, TimCh::Ch2), ALL_V),
-    af!('B',  1,  6, Signal::TimChN(TimId::Tim1, TimCh::Ch3), ALL_V),
-    af!('B', 10, 12, Signal::TimBkin(TimId::Tim1), ALL_V),
-    af!('B', 12,  6, Signal::TimBkin(TimId::Tim1), ALL_V),
-    af!('B', 13,  6, Signal::TimChN(TimId::Tim1, TimCh::Ch1), ALL_V),
-    af!('B', 14,  6, Signal::TimChN(TimId::Tim1, TimCh::Ch2), ALL_V),
-    af!('B', 15,  4, Signal::TimChN(TimId::Tim1, TimCh::Ch3), ALL_V),
-    af!('B',  8, 12, Signal::TimBkin(TimId::Tim1), ALL_V),
-    af!('B',  9, 12, Signal::TimChN(TimId::Tim1, TimCh::Ch3), ALL_V),
-    af!('C',  0,  2, Signal::TimCh(TimId::Tim1, TimCh::Ch1), NON_C),
-    af!('C',  1,  2, Signal::TimCh(TimId::Tim1, TimCh::Ch2), NON_C),
-    af!('C', 13,  2, Signal::TimBkin(TimId::Tim1), ALL_V),
-    af!('C', 13,  4, Signal::TimChN(TimId::Tim1, TimCh::Ch1), ALL_V),
-    af!('C',  2,  2, Signal::TimCh(TimId::Tim1, TimCh::Ch3), NON_C),
-    af!('C',  3,  2, Signal::TimCh(TimId::Tim1, TimCh::Ch4), NON_C),
-    af!('C',  3,  6, Signal::TimBkin2(TimId::Tim1), NON_C),
-    af!('C',  4,  2, Signal::TimEtr(TimId::Tim1), ALL_V),
-    af!('C',  5,  6, Signal::TimChN(TimId::Tim1, TimCh::Ch4), NON_C),
-    af!('E', 10,  2, Signal::TimChN(TimId::Tim1, TimCh::Ch2), NON_CR),
-    af!('E', 11,  2, Signal::TimCh(TimId::Tim1, TimCh::Ch2), NON_CR),
-    af!('E', 12,  2, Signal::TimChN(TimId::Tim1, TimCh::Ch3), NON_CR),
-    af!('E', 13,  2, Signal::TimCh(TimId::Tim1, TimCh::Ch3), NON_CR),
-    af!('E', 14,  2, Signal::TimCh(TimId::Tim1, TimCh::Ch4), NON_CR),
-    af!('E', 14,  6, Signal::TimBkin2(TimId::Tim1), NON_CR),
-    af!('E', 15,  2, Signal::TimBkin(TimId::Tim1), NON_CR),
-    af!('E', 15,  6, Signal::TimChN(TimId::Tim1, TimCh::Ch4), NON_CR),
-    af!('E',  7,  2, Signal::TimEtr(TimId::Tim1), NON_CR),
-    af!('E',  8,  2, Signal::TimChN(TimId::Tim1, TimCh::Ch1), NON_CR),
-    af!('E',  9,  2, Signal::TimCh(TimId::Tim1, TimCh::Ch1), NON_CR),
-    af!('F',  0,  6, Signal::TimChN(TimId::Tim1, TimCh::Ch3), ALL_V),
-    // TIM15
-    af!('A',  1,  9, Signal::TimChN(TimId::Tim15, TimCh::Ch1), ALL_V),
-    af!('A',  2,  9, Signal::TimCh(TimId::Tim15, TimCh::Ch1), ALL_V),
-    af!('A',  3,  9, Signal::TimCh(TimId::Tim15, TimCh::Ch2), ALL_V),
-    af!('A',  9,  9, Signal::TimBkin(TimId::Tim15), ALL_V),
-    af!('B', 14,  1, Signal::TimCh(TimId::Tim15, TimCh::Ch1), ALL_V),
-    af!('B', 15,  1, Signal::TimCh(TimId::Tim15, TimCh::Ch2), ALL_V),
-    af!('B', 15,  2, Signal::TimChN(TimId::Tim15, TimCh::Ch1), ALL_V),
-    af!('C',  5,  2, Signal::TimBkin(TimId::Tim15), NON_C),
-    af!('F', 10,  3, Signal::TimCh(TimId::Tim15, TimCh::Ch2), LARGE_PQV),
-    af!('F',  9,  3, Signal::TimCh(TimId::Tim15, TimCh::Ch1), LARGE_PQV),
-    af!('G',  9, 14, Signal::TimChN(TimId::Tim15, TimCh::Ch1), BGA_Q),
-    // TIM16
-    af!('A', 12,  1, Signal::TimCh(TimId::Tim16, TimCh::Ch1), ALL_V),
-    af!('A', 13,  1, Signal::TimChN(TimId::Tim16, TimCh::Ch1), ALL_V),
-    af!('A',  6,  1, Signal::TimCh(TimId::Tim16, TimCh::Ch1), ALL_V),
-    af!('B',  4,  1, Signal::TimCh(TimId::Tim16, TimCh::Ch1), ALL_V),
-    af!('B',  5,  1, Signal::TimBkin(TimId::Tim16), ALL_V),
-    af!('B',  6,  1, Signal::TimChN(TimId::Tim16, TimCh::Ch1), ALL_V),
-    af!('B',  8,  1, Signal::TimCh(TimId::Tim16, TimCh::Ch1), ALL_V),
-    af!('E',  0,  4, Signal::TimCh(TimId::Tim16, TimCh::Ch1), LARGE_PQV),
-    // TIM17
-    af!('A', 10,  1, Signal::TimBkin(TimId::Tim17), ALL_V),
-    af!('A',  7,  1, Signal::TimCh(TimId::Tim17, TimCh::Ch1), ALL_V),
-    af!('B',  4, 10, Signal::TimBkin(TimId::Tim17), ALL_V),
-    af!('B',  5, 10, Signal::TimCh(TimId::Tim17, TimCh::Ch1), ALL_V),
-    af!('B',  7,  1, Signal::TimChN(TimId::Tim17, TimCh::Ch1), ALL_V),
-    af!('B',  9,  1, Signal::TimCh(TimId::Tim17, TimCh::Ch1), ALL_V),
-    af!('E',  1,  4, Signal::TimCh(TimId::Tim17, TimCh::Ch1), LARGE_PQV),
-    // TIM2
-    af!('A',  0,  1, Signal::TimCh(TimId::Tim2, TimCh::Ch1), ALL_V),
-    af!('A',  0, 14, Signal::TimEtr(TimId::Tim2), ALL_V),
-    af!('A',  1,  1, Signal::TimCh(TimId::Tim2, TimCh::Ch2), ALL_V),
-    af!('A', 10, 10, Signal::TimCh(TimId::Tim2, TimCh::Ch4), ALL_V),
-    af!('A', 15,  1, Signal::TimCh(TimId::Tim2, TimCh::Ch1), ALL_V),
-    af!('A', 15, 14, Signal::TimEtr(TimId::Tim2), ALL_V),
-    af!('A',  2,  1, Signal::TimCh(TimId::Tim2, TimCh::Ch3), ALL_V),
-    af!('A',  3,  1, Signal::TimCh(TimId::Tim2, TimCh::Ch4), ALL_V),
-    af!('A',  5,  1, Signal::TimCh(TimId::Tim2, TimCh::Ch1), ALL_V),
-    af!('A',  5,  2, Signal::TimEtr(TimId::Tim2), ALL_V),
-    af!('A',  9, 10, Signal::TimCh(TimId::Tim2, TimCh::Ch3), ALL_V),
-    af!('B', 10,  1, Signal::TimCh(TimId::Tim2, TimCh::Ch3), ALL_V),
-    af!('B', 11,  1, Signal::TimCh(TimId::Tim2, TimCh::Ch4), ALL_V),
-    af!('B',  3,  1, Signal::TimCh(TimId::Tim2, TimCh::Ch2), ALL_V),
-    af!('D',  3,  2, Signal::TimCh(TimId::Tim2, TimCh::Ch1), LARGE_PQV),
-    af!('D',  3,  2, Signal::TimEtr(TimId::Tim2), LARGE_PQV),
-    af!('D',  4,  2, Signal::TimCh(TimId::Tim2, TimCh::Ch2), LARGE_PQV),
-    af!('D',  6,  2, Signal::TimCh(TimId::Tim2, TimCh::Ch4), LARGE_PQV),
-    af!('D',  7,  2, Signal::TimCh(TimId::Tim2, TimCh::Ch3), LARGE_PQV),
-    // TIM20
-    af!('B',  2,  3, Signal::TimCh(TimId::Tim20, TimCh::Ch1), ALL_V),
-    af!('C',  2,  6, Signal::TimCh(TimId::Tim20, TimCh::Ch2), NON_C),
-    af!('C',  8,  6, Signal::TimCh(TimId::Tim20, TimCh::Ch3), NON_C),
-    af!('E',  0,  3, Signal::TimChN(TimId::Tim20, TimCh::Ch4), LARGE_PQV),
-    af!('E',  0,  6, Signal::TimEtr(TimId::Tim20), LARGE_PQV),
-    af!('E',  1,  6, Signal::TimCh(TimId::Tim20, TimCh::Ch4), LARGE_PQV),
-    af!('E',  2,  6, Signal::TimCh(TimId::Tim20, TimCh::Ch1), LARGE_PQV),
-    af!('E',  3,  6, Signal::TimCh(TimId::Tim20, TimCh::Ch2), LARGE_PQV),
-    af!('E',  4,  6, Signal::TimChN(TimId::Tim20, TimCh::Ch1), LARGE_PQV),
-    af!('E',  5,  6, Signal::TimChN(TimId::Tim20, TimCh::Ch2), LARGE_PQV),
-    af!('E',  6,  6, Signal::TimChN(TimId::Tim20, TimCh::Ch3), LARGE_PQV),
-    af!('F', 10,  2, Signal::TimBkin2(TimId::Tim20), LARGE_PQV),
-    af!('F', 11,  2, Signal::TimEtr(TimId::Tim20), BGA_PQ),
-    af!('F', 12,  2, Signal::TimCh(TimId::Tim20, TimCh::Ch1), BGA_PQ),
-    af!('F', 13,  2, Signal::TimCh(TimId::Tim20, TimCh::Ch2), BGA_PQ),
-    af!('F', 14,  2, Signal::TimCh(TimId::Tim20, TimCh::Ch3), BGA_PQ),
-    af!('F', 15,  2, Signal::TimCh(TimId::Tim20, TimCh::Ch4), BGA_PQ),
-    af!('F',  2,  2, Signal::TimCh(TimId::Tim20, TimCh::Ch3), LARGE_PQV),
-    af!('F',  3,  2, Signal::TimCh(TimId::Tim20, TimCh::Ch4), BGA_PQ),
-    af!('F',  4,  3, Signal::TimChN(TimId::Tim20, TimCh::Ch1), BGA_PQ),
-    af!('F',  5,  2, Signal::TimChN(TimId::Tim20, TimCh::Ch2), BGA_PQ),
-    af!('F',  7,  2, Signal::TimBkin(TimId::Tim20), BGA_PQ),
-    af!('F',  8,  2, Signal::TimBkin2(TimId::Tim20), BGA_PQ),
-    af!('F',  9,  2, Signal::TimBkin(TimId::Tim20), LARGE_PQV),
-    af!('G',  0,  2, Signal::TimChN(TimId::Tim20, TimCh::Ch1), BGA_PQ),
-    af!('G',  1,  2, Signal::TimChN(TimId::Tim20, TimCh::Ch2), BGA_PQ),
-    af!('G',  2,  2, Signal::TimChN(TimId::Tim20, TimCh::Ch3), BGA_PQ),
-    af!('G',  3,  2, Signal::TimBkin(TimId::Tim20), BGA_PQ),
-    af!('G',  3,  6, Signal::TimChN(TimId::Tim20, TimCh::Ch4), BGA_PQ),
-    af!('G',  4,  2, Signal::TimBkin2(TimId::Tim20), BGA_PQ),
-    af!('G',  5,  2, Signal::TimEtr(TimId::Tim20), BGA_Q),
-    af!('G',  6,  2, Signal::TimBkin(TimId::Tim20), BGA_Q),
-    // TIM3
-    af!('A',  4,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch2), ALL_V),
-    af!('A',  6,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch1), ALL_V),
-    af!('A',  7,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch2), ALL_V),
-    af!('B',  0,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch3), ALL_V),
-    af!('B',  1,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch4), ALL_V),
-    af!('B',  3, 10, Signal::TimEtr(TimId::Tim3), ALL_V),
-    af!('B',  4,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch1), ALL_V),
-    af!('B',  5,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch2), ALL_V),
-    af!('B',  7, 10, Signal::TimCh(TimId::Tim3, TimCh::Ch4), ALL_V),
-    af!('C',  6,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch1), ALL_V),
-    af!('C',  7,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch2), NON_C),
-    af!('C',  8,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch3), NON_C),
-    af!('C',  9,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch4), NON_C),
-    af!('D',  2,  2, Signal::TimEtr(TimId::Tim3), NON_C),
-    af!('E',  2,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch1), LARGE_PQV),
-    af!('E',  3,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch2), LARGE_PQV),
-    af!('E',  4,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch3), LARGE_PQV),
-    af!('E',  5,  2, Signal::TimCh(TimId::Tim3, TimCh::Ch4), LARGE_PQV),
-    // TIM4
-    af!('A', 11, 10, Signal::TimCh(TimId::Tim4, TimCh::Ch1), ALL_V),
-    af!('A', 12, 10, Signal::TimCh(TimId::Tim4, TimCh::Ch2), ALL_V),
-    af!('A', 13, 10, Signal::TimCh(TimId::Tim4, TimCh::Ch3), ALL_V),
-    af!('A',  8, 10, Signal::TimEtr(TimId::Tim4), ALL_V),
-    af!('B',  3,  2, Signal::TimEtr(TimId::Tim4), ALL_V),
-    af!('B',  6,  2, Signal::TimCh(TimId::Tim4, TimCh::Ch1), ALL_V),
-    af!('B',  7,  2, Signal::TimCh(TimId::Tim4, TimCh::Ch2), ALL_V),
-    af!('B',  8,  2, Signal::TimCh(TimId::Tim4, TimCh::Ch3), ALL_V),
-    af!('B',  9,  2, Signal::TimCh(TimId::Tim4, TimCh::Ch4), ALL_V),
-    af!('D', 12,  2, Signal::TimCh(TimId::Tim4, TimCh::Ch1), LARGE_PQV),
-    af!('D', 13,  2, Signal::TimCh(TimId::Tim4, TimCh::Ch2), LARGE_PQV),
-    af!('D', 14,  2, Signal::TimCh(TimId::Tim4, TimCh::Ch3), LARGE_PQV),
-    af!('D', 15,  2, Signal::TimCh(TimId::Tim4, TimCh::Ch4), LARGE_PQV),
-    af!('E',  0,  2, Signal::TimEtr(TimId::Tim4), LARGE_PQV),
-    af!('F',  6,  2, Signal::TimCh(TimId::Tim4, TimCh::Ch4), BGA_PQ),
-    // TIM5
-    af!('A',  0,  2, Signal::TimCh(TimId::Tim5, TimCh::Ch1), ALL_V),
-    af!('A',  1,  2, Signal::TimCh(TimId::Tim5, TimCh::Ch2), ALL_V),
-    af!('A',  2,  2, Signal::TimCh(TimId::Tim5, TimCh::Ch3), ALL_V),
-    af!('A',  3,  2, Signal::TimCh(TimId::Tim5, TimCh::Ch4), ALL_V),
-    af!('B', 12,  2, Signal::TimEtr(TimId::Tim5), ALL_V),
-    af!('B',  2,  2, Signal::TimCh(TimId::Tim5, TimCh::Ch1), ALL_V),
-    af!('C', 12,  1, Signal::TimCh(TimId::Tim5, TimCh::Ch2), NON_C),
-    af!('D', 11,  1, Signal::TimEtr(TimId::Tim5), NON_CR),
-    af!('E',  8,  1, Signal::TimCh(TimId::Tim5, TimCh::Ch3), NON_CR),
-    af!('E',  9,  1, Signal::TimCh(TimId::Tim5, TimCh::Ch4), NON_CR),
-    af!('F',  6,  1, Signal::TimEtr(TimId::Tim5), BGA_PQ),
-    af!('F',  6,  6, Signal::TimCh(TimId::Tim5, TimCh::Ch1), BGA_PQ),
-    af!('F',  7,  6, Signal::TimCh(TimId::Tim5, TimCh::Ch2), BGA_PQ),
-    af!('F',  8,  6, Signal::TimCh(TimId::Tim5, TimCh::Ch3), BGA_PQ),
-    af!('F',  9,  6, Signal::TimCh(TimId::Tim5, TimCh::Ch4), LARGE_PQV),
-    // TIM8
-    af!('A',  0,  9, Signal::TimBkin(TimId::Tim8), ALL_V),
-    af!('A',  0, 10, Signal::TimEtr(TimId::Tim8), ALL_V),
-    af!('A', 10, 11, Signal::TimBkin(TimId::Tim8), ALL_V),
-    af!('A', 14,  5, Signal::TimCh(TimId::Tim8, TimCh::Ch2), ALL_V),
-    af!('A', 15,  2, Signal::TimCh(TimId::Tim8, TimCh::Ch1), ALL_V),
-    af!('A',  6,  4, Signal::TimBkin(TimId::Tim8), ALL_V),
-    af!('A',  7,  4, Signal::TimChN(TimId::Tim8, TimCh::Ch1), ALL_V),
-    af!('B',  0,  4, Signal::TimChN(TimId::Tim8, TimCh::Ch2), ALL_V),
-    af!('B',  1,  4, Signal::TimChN(TimId::Tim8, TimCh::Ch3), ALL_V),
-    af!('B',  3,  4, Signal::TimChN(TimId::Tim8, TimCh::Ch1), ALL_V),
-    af!('B',  4,  4, Signal::TimChN(TimId::Tim8, TimCh::Ch2), ALL_V),
-    af!('B',  5,  3, Signal::TimChN(TimId::Tim8, TimCh::Ch3), ALL_V),
-    af!('B',  6,  5, Signal::TimCh(TimId::Tim8, TimCh::Ch1), ALL_V),
-    af!('B',  6,  6, Signal::TimEtr(TimId::Tim8), ALL_V),
-    af!('B',  6, 10, Signal::TimBkin2(TimId::Tim8), ALL_V),
-    af!('B',  7,  5, Signal::TimBkin(TimId::Tim8), ALL_V),
-    af!('B',  8, 10, Signal::TimCh(TimId::Tim8, TimCh::Ch2), ALL_V),
-    af!('B',  9, 10, Signal::TimCh(TimId::Tim8, TimCh::Ch3), ALL_V),
-    af!('C', 10,  4, Signal::TimChN(TimId::Tim8, TimCh::Ch1), ALL_V),
-    af!('C', 11,  4, Signal::TimChN(TimId::Tim8, TimCh::Ch2), ALL_V),
-    af!('C', 12,  4, Signal::TimChN(TimId::Tim8, TimCh::Ch3), NON_C),
-    af!('C', 13,  6, Signal::TimChN(TimId::Tim8, TimCh::Ch4), ALL_V),
-    af!('C',  6,  4, Signal::TimCh(TimId::Tim8, TimCh::Ch1), ALL_V),
-    af!('C',  7,  4, Signal::TimCh(TimId::Tim8, TimCh::Ch2), NON_C),
-    af!('C',  8,  4, Signal::TimCh(TimId::Tim8, TimCh::Ch3), NON_C),
-    af!('C',  9,  4, Signal::TimCh(TimId::Tim8, TimCh::Ch4), NON_C),
-    af!('C',  9,  6, Signal::TimBkin2(TimId::Tim8), NON_C),
-    af!('D',  0,  6, Signal::TimChN(TimId::Tim8, TimCh::Ch4), NON_CR),
-    af!('D',  1,  4, Signal::TimCh(TimId::Tim8, TimCh::Ch4), NON_CR),
-    af!('D',  1,  6, Signal::TimBkin2(TimId::Tim8), NON_CR),
-    af!('D',  2,  4, Signal::TimBkin(TimId::Tim8), NON_C),
-    // UART4
-    af!('A', 15,  8, Signal::UartRts(UartId::Uart4), ALL_V),
-    af!('B',  7, 14, Signal::UartCts(UartId::Uart4), ALL_V),
-    af!('C', 10,  5, Signal::UartTx(UartId::Uart4), ALL_V),
-    af!('C', 11,  5, Signal::UartRx(UartId::Uart4), ALL_V),
-    // UART5
-    af!('B',  4,  8, Signal::UartRts(UartId::Uart5), NON_C),
-    af!('B',  5, 14, Signal::UartCts(UartId::Uart5), NON_C),
-    af!('C', 12,  5, Signal::UartTx(UartId::Uart5), NON_C),
-    af!('D',  2,  5, Signal::UartRx(UartId::Uart5), NON_C),
-    // UCPD1
-    af!('B',  4,  0, Signal::UcpdCc2(UcpdId::Ucpd1), ALL_V),
-    af!('B',  6,  0, Signal::UcpdCc1(UcpdId::Ucpd1), ALL_V),
-    // USART1
-    af!('A', 10,  7, Signal::UsartRx(UsartId::Usart1), ALL_V),
-    af!('A', 11,  7, Signal::UsartCts(UsartId::Usart1), ALL_V),
-    af!('A', 12,  7, Signal::UsartRts(UsartId::Usart1), ALL_V),
-    af!('A',  8,  7, Signal::UsartCk(UsartId::Usart1), ALL_V),
-    af!('A',  9,  7, Signal::UsartTx(UsartId::Usart1), ALL_V),
-    af!('B',  6,  7, Signal::UsartTx(UsartId::Usart1), ALL_V),
-    af!('B',  7,  7, Signal::UsartRx(UsartId::Usart1), ALL_V),
-    af!('C',  4,  7, Signal::UsartTx(UsartId::Usart1), ALL_V),
-    af!('C',  5,  7, Signal::UsartRx(UsartId::Usart1), NON_C),
-    af!('E',  0,  7, Signal::UsartTx(UsartId::Usart1), LARGE_PQV),
-    af!('E',  1,  7, Signal::UsartRx(UsartId::Usart1), LARGE_PQV),
-    af!('G',  9,  7, Signal::UsartTx(UsartId::Usart1), BGA_Q),
-    // USART2
-    af!('A',  0,  7, Signal::UsartCts(UsartId::Usart2), ALL_V),
-    af!('A',  1,  7, Signal::UsartRts(UsartId::Usart2), ALL_V),
-    af!('A', 14,  7, Signal::UsartTx(UsartId::Usart2), ALL_V),
-    af!('A', 15,  7, Signal::UsartRx(UsartId::Usart2), ALL_V),
-    af!('A',  2,  7, Signal::UsartTx(UsartId::Usart2), ALL_V),
-    af!('A',  3,  7, Signal::UsartRx(UsartId::Usart2), ALL_V),
-    af!('A',  4,  7, Signal::UsartCk(UsartId::Usart2), ALL_V),
-    af!('B',  3,  7, Signal::UsartTx(UsartId::Usart2), ALL_V),
-    af!('B',  4,  7, Signal::UsartRx(UsartId::Usart2), ALL_V),
-    af!('B',  5,  7, Signal::UsartCk(UsartId::Usart2), ALL_V),
-    af!('D',  3,  7, Signal::UsartCts(UsartId::Usart2), LARGE_PQV),
-    af!('D',  4,  7, Signal::UsartRts(UsartId::Usart2), LARGE_PQV),
-    af!('D',  5,  7, Signal::UsartTx(UsartId::Usart2), LARGE_PQV),
-    af!('D',  6,  7, Signal::UsartRx(UsartId::Usart2), LARGE_PQV),
-    af!('D',  7,  7, Signal::UsartCk(UsartId::Usart2), LARGE_PQV),
-    // USART3
-    af!('A', 13,  7, Signal::UsartCts(UsartId::Usart3), ALL_V),
-    af!('B', 10,  7, Signal::UsartTx(UsartId::Usart3), ALL_V),
-    af!('B', 11,  7, Signal::UsartRx(UsartId::Usart3), ALL_V),
-    af!('B', 12,  7, Signal::UsartCk(UsartId::Usart3), ALL_V),
-    af!('B', 13,  7, Signal::UsartCts(UsartId::Usart3), ALL_V),
-    af!('B', 14,  7, Signal::UsartRts(UsartId::Usart3), ALL_V),
-    af!('B',  8,  7, Signal::UsartRx(UsartId::Usart3), ALL_V),
-    af!('B',  9,  7, Signal::UsartTx(UsartId::Usart3), ALL_V),
-    af!('C', 10,  7, Signal::UsartTx(UsartId::Usart3), ALL_V),
-    af!('C', 11,  7, Signal::UsartRx(UsartId::Usart3), ALL_V),
-    af!('C', 12,  7, Signal::UsartCk(UsartId::Usart3), NON_C),
-    af!('D', 10,  7, Signal::UsartCk(UsartId::Usart3), NON_CR),
-    af!('D', 11,  7, Signal::UsartCts(UsartId::Usart3), NON_CR),
-    af!('D', 12,  7, Signal::UsartRts(UsartId::Usart3), LARGE_PQV),
-    af!('D',  8,  7, Signal::UsartTx(UsartId::Usart3), NON_CR),
-    af!('D',  9,  7, Signal::UsartRx(UsartId::Usart3), NON_CR),
-    af!('E', 15,  7, Signal::UsartRx(UsartId::Usart3), NON_CR),
-    af!('F',  6,  7, Signal::UsartRts(UsartId::Usart3), BGA_PQ),
-    // USB
-    af!('A', 11,  0, Signal::UsbDm, ALL_V),
-    af!('A', 12,  0, Signal::UsbDp, ALL_V),
-];
-
-fn pin_on(opt: &AfOption, variant: ChipVariant) -> bool {
-    opt.variants & variant.bit() != 0
+    None
 }
 
 pub fn pins_for(signal: Signal, variant: ChipVariant) -> Vec<Pin> {
-    HRTIM_AF.iter()
-        .filter(|o| o.signal == signal && pin_on(o, variant))
-        .map(|o| o.pin)
+    let pkg = crate::mcu::Package::from_g474_variant(variant);
+    let raw = pkg.raw();
+    let (peripheral, role) = signal_to_metapac(signal);
+    if role.is_empty() { return Vec::new(); }
+    raw.peripherals.iter()
+        .filter(|p| p.name == peripheral)
+        .flat_map(|p| p.pins.iter())
+        .filter(|pp| pp.signal == role.as_str())
+        .filter_map(|pp| {
+            let port = pp.pin.as_bytes().get(1).copied()? as char;
+            let num: u8 = pp.pin.get(2..)?.parse().ok()?;
+            Some(Pin::new(port, num))
+        })
         .collect()
 }
 
 pub fn signals_on(pin: Pin, variant: ChipVariant) -> Vec<(u8, Signal)> {
-    HRTIM_AF.iter()
-        .filter(|o| o.pin == pin && pin_on(o, variant))
-        .map(|o| (o.af, o.signal))
-        .collect()
+    let pkg = crate::mcu::Package::from_g474_variant(variant);
+    let raw = pkg.raw();
+    let pin_name = pin.name();
+    let mut out = Vec::new();
+    for p in raw.peripherals {
+        for pp in p.pins {
+            if pp.pin != pin_name { continue; }
+            let Some(sig) = metapac_to_signal(p.name, pp.signal) else { continue; };
+            // Analog signals (af = None) are reported as AF=0 to match the
+            // existing `(u8, Signal)` API where 0 stands for "no AF".
+            let af = pp.af.unwrap_or(0);
+            if !out.contains(&(af, sig)) {
+                out.push((af, sig));
+            }
+        }
+    }
+    out
 }
 
 pub fn conflicting_signal_pairs(
