@@ -3,6 +3,7 @@ pub mod bode;
 pub mod pfc_bode;
 pub mod pfc_sim;
 pub mod sim;
+pub mod zvs;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;
