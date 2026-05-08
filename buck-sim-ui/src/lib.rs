@@ -1,5 +1,6 @@
 pub mod app;
 pub mod bode;
+pub mod monte_carlo;
 pub mod pfc_bode;
 pub mod pfc_sim;
 pub mod sim;
