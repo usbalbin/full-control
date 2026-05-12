@@ -400,10 +400,11 @@ mod tests {
         // the report to flag full ZVS (zero residual since V_SW
         // body-diode-clamps at V_in well before the dt elapses).
         let l_loop = 5e-9;
-        let coss = 1.2e-9;
+        // EPC2306 datasheet typ C_OSS = 616 pF; HS + LS pair → 1.232 nF.
+        let coss = 2.0 * 616e-12;
         let t_opt = optimal_deadtime_s(24.0, 50.0, l_loop, coss);
         let r = zvs_report(24.0, 50.0, 1e6, l_loop, &hs, &ls, t_opt);
-        assert!((r.coss_total_f - 1.2e-9).abs() < 1e-12);
+        assert!((r.coss_total_f - coss).abs() < 1e-12);
         // At I=50A, optimal deadtime is much shorter than T/4
         // (≈0.57 ns vs ≈1.92 ns).
         assert!(r.optimal_deadtime_s > 0.4e-9 && r.optimal_deadtime_s < 0.8e-9,

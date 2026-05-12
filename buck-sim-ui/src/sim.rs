@@ -139,39 +139,51 @@ impl FetProfile {
     }
 
     pub fn epc2306() -> Self {
-        // EPC2306 GaN: no body diode → Q_rr ≈ 0. (eGaN HEMTs have a
-        // ~0 reverse-conduction stored charge; the input-current spike
-        // comes only from i_L, not from a body-diode recovery.)
+        // EPC2306 — 100 V / 3.1 mΩ eGaN HEMT.
+        // Source: EPC2306 datasheet, revised 2025-11-20 (page 2, the
+        // Dynamic Characteristics table at V_DS = 50 V, V_GS = 5 V,
+        // I_D = 25 A, T_J = 25 °C). Figure 7 (Gate Charge plot)
+        // shows the Miller plateau at V_GS ≈ 2.2 V. R_G is the
+        // internal gate resistance — total R_g on a real design is
+        // this plus the external gate resistor (here we use the
+        // internal value as a representative lower bound).
+        // GaN has *no body diode*, so Q_RR = 0 → no input-current
+        // recovery spike at HS turn-on.
         Self {
             name: "EPC2306".into(),
-            rds_on_mohm: 3.1,
-            coss_pf: 600.0,
-            qg_nc: 1.1,
-            vgs_v: 5.0,
-            t_rise_ns: 1.5,
+            rds_on_mohm: 3.1,    // V_GS = 5 V, I_D = 25 A (typ)
+            coss_pf: 616.0,      // V_DS = 50 V (typ)
+            qg_nc: 12.3,         // total gate charge (datasheet typ; preset was wrong — used Q_GD)
+            vgs_v: 5.0,          // recommended drive
+            t_rise_ns: 1.5,      // representative current-rise time (driver-dependent)
             t_fall_ns: 1.5,
-            qrr_nc: 0.0,
+            qrr_nc: 0.0,         // eGaN: zero reverse-recovery charge
             trr_ns: 0.0,
-            qgd_nc: 0.0,
-            rg_ohm: 0.0,
-            v_miller_v: 0.0,
+            qgd_nc: 1.1,         // gate-to-drain (Miller) charge — datasheet typ
+            rg_ohm: 0.4,         // internal R_G (datasheet typ)
+            v_miller_v: 2.2,     // plateau voltage — datasheet Figure 7
         }
     }
 
     pub fn epc23102() -> Self {
+        // EPC23102 — 100 V eGaN half-bridge with integrated gate
+        // drivers in a single QFN. Datasheet not currently in the
+        // repo; values below are representative for the EPC2310x
+        // family with integrated driver. Update once a local copy
+        // of the datasheet is checked in.
         Self {
             name: "EPC23102".into(),
             rds_on_mohm: 5.2,
             coss_pf: 370.0,
-            qg_nc: 12.0,
+            qg_nc: 12.0,         // family-typical total gate charge
             vgs_v: 5.0,
             t_rise_ns: 2.0,
             t_fall_ns: 2.0,
-            qrr_nc: 0.0,
+            qrr_nc: 0.0,         // eGaN: no body diode
             trr_ns: 0.0,
-            qgd_nc: 0.0,
-            rg_ohm: 0.0,
-            v_miller_v: 0.0,
+            qgd_nc: 3.0,         // family-typical Q_GD (larger die than EPC2306)
+            rg_ohm: 1.0,         // integrated driver — total gate-loop impedance
+            v_miller_v: 2.2,     // typical for eGaN at I_D ~ 25 A
         }
     }
 
