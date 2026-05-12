@@ -17,9 +17,22 @@
 //!   `duty × T_sw`, inductor-current ramp from `i_L_min` to `i_L_max`;
 //!   HS off at zero), then FFT. Spectrum covers DC – N×fsw/2. Picks
 //!   up fsw and its harmonics — the dominant conducted-EM content
-//!   for a synchronous buck. Does *not* model FET dV/dt rise/fall
-//!   broadband content (that's path 3 future work, requires sub-cycle
-//!   sampling inside `sim::run_simulation`).
+//!   for a synchronous buck.
+//!
+//!   Two sub-modes: with `trapezoidal: false` the input current
+//!   has instantaneous transitions (perfect rectangular pulse). With
+//!   `trapezoidal: true` the HS turn-on ramps the input current 0 →
+//!   `i_L_min` over `SimParams.hs_fet.t_rise_ns` and the HS turn-off
+//!   ramps `i_L_max` → 0 over `t_fall_ns`. Trapezoidal mode
+//!   bandlimits the harmonic content above ~`1/(π·t_rise)`, the
+//!   dominant first-order effect distinguishing a real switching
+//!   spectrum from a perfect square wave. Note that the trapezoidal
+//!   model *reduces* the cycle-average input current — physically
+//!   correct, since at HS turn-on the input current rises from 0
+//!   rather than instantaneously jumping to `i_L_min` — so DC bin
+//!   readings move a few percent lower than the sharp-edge mode.
+//!   Models *do not* include commutation-loop ringing from
+//!   `LoopExtraction::l_self_henry`; that's a future enhancement.
 //!
 //! Both modes apply a Hann window over the steady-state half of the
 //! captured cycles, divide by the window's coherent gain so a pure
@@ -37,7 +50,17 @@ use crate::sim::{SimParams, SimPoint};
 #[derive(Debug, Clone, Copy)]
 pub enum ExportMode {
     Envelope,
-    PwmReconstructed { samples_per_cycle: u32 },
+    /// Reconstruct idealized PWM at `samples_per_cycle` samples per
+    /// switching cycle, with optional trapezoidal rise/fall edges
+    /// modelling the FET's finite transition time. When `trapezoidal`
+    /// is `true`, the rise/fall times come from `SimParams.hs_fet`
+    /// and bandlimit the harmonics above ~`1/(π·t_rise)`, which is
+    /// the dominant first-order effect that distinguishes a real
+    /// switching spectrum from a perfect square wave.
+    PwmReconstructed {
+        samples_per_cycle: u32,
+        trapezoidal: bool,
+    },
 }
 
 /// FFT the input-port current over the steady-state half of a buck
@@ -84,40 +107,82 @@ pub fn export_input_current_spectrum(
                 .collect();
             (s, fsw, "mode=envelope".to_string())
         }
-        ExportMode::PwmReconstructed { samples_per_cycle } => {
+        ExportMode::PwmReconstructed {
+            samples_per_cycle,
+            trapezoidal,
+        } => {
             if samples_per_cycle < 4 {
                 return Err("samples_per_cycle must be >= 4".into());
             }
             let m = samples_per_cycle as usize;
+            let t_sw_s = 1.0 / fsw;
+            // Trapezoidal edges from SimParams.hs_fet rise/fall.
+            // Clamp to ≤ 25 % of the cycle each so an absurd
+            // rise+fall doesn't exceed the on-time and produce
+            // ill-defined geometry.
+            let (t_rise_s, t_fall_s) = if trapezoidal {
+                let r = (p.hs_fet.t_rise_ns * 1e-9).max(0.0);
+                let f = (p.hs_fet.t_fall_ns * 1e-9).max(0.0);
+                (r.min(0.25 * t_sw_s), f.min(0.25 * t_sw_s))
+            } else {
+                (0.0, 0.0)
+            };
             let mut s: Vec<f64> = Vec::with_capacity(m * cycles.len());
             for c in cycles {
                 let duty = (c.duty_pct_avg() as f64 / 100.0).clamp(0.0, 1.0);
-                // Per-phase ramp; for multi-phase the i_total min/max
-                // are interleaved sums, divide back out. Approximation:
-                // assumes all phases share the same duty + ramp shape,
-                // which is true for steady-state symmetric phase
-                // interleaving but lossy for transient asymmetry.
                 let n_phases = c.phases.len().max(1) as f64;
                 let i_min = c.i_total_min as f64 / n_phases;
                 let i_max = c.i_total_max as f64 / n_phases;
+                let t_on_s = duty * t_sw_s;
+                let t_flat_start = t_rise_s.min(t_on_s);
+                let t_flat_end = (t_on_s - t_fall_s).max(t_flat_start);
                 for k in 0..m {
-                    let tau = (k as f64) / (m as f64); // ∈ [0, 1)
-                    let v = if tau < duty && duty > 0.0 {
-                        let frac = tau / duty;
-                        // Multiply by num_phases to recover the
-                        // interleaved-sum input current seen by the
-                        // shared input cap.
-                        n_phases * (i_min + frac * (i_max - i_min))
+                    let tau_s = (k as f64) / (m as f64) * t_sw_s;
+                    let v = if duty <= 0.0 {
+                        0.0
+                    } else if tau_s < t_flat_start {
+                        // Rising edge: linear ramp 0 → i_min.
+                        let frac = if t_flat_start > 0.0 {
+                            tau_s / t_flat_start
+                        } else {
+                            1.0
+                        };
+                        frac * i_min
+                    } else if tau_s < t_flat_end {
+                        // HS conducting; inductor ramps i_min → i_max.
+                        let denom = (t_flat_end - t_flat_start).max(1e-18);
+                        let frac = ((tau_s - t_flat_start) / denom).clamp(0.0, 1.0);
+                        i_min + frac * (i_max - i_min)
+                    } else if tau_s < t_on_s {
+                        // Falling edge: linear ramp i_max → 0.
+                        let denom = (t_on_s - t_flat_end).max(1e-18);
+                        let frac = ((tau_s - t_flat_end) / denom).clamp(0.0, 1.0);
+                        i_max * (1.0 - frac)
                     } else {
+                        // HS off.
                         0.0
                     };
-                    s.push(v);
+                    // Multiply by num_phases to recover the
+                    // interleaved-sum input current seen by the
+                    // shared input cap.
+                    s.push(n_phases * v);
                 }
             }
+            let edge_tag = if trapezoidal {
+                format!(
+                    ",trapezoidal=t_rise={:.2}ns,t_fall={:.2}ns",
+                    p.hs_fet.t_rise_ns, p.hs_fet.t_fall_ns,
+                )
+            } else {
+                ",trapezoidal=off".to_string()
+            };
             (
                 s,
                 fsw * m as f64,
-                format!("mode=pwm-reconstructed,samples_per_cycle={}", m),
+                format!(
+                    "mode=pwm-reconstructed,samples_per_cycle={}{}",
+                    m, edge_tag,
+                ),
             )
         }
     };
@@ -252,7 +317,10 @@ mod tests {
         let spec = export_input_current_spectrum(
             &stream,
             &default_params(),
-            ExportMode::PwmReconstructed { samples_per_cycle: 32 },
+            ExportMode::PwmReconstructed {
+                samples_per_cycle: 32,
+                trapezoidal: false,
+            },
         )
         .unwrap();
         // fsw bin = (n_window_cycles × samples_per_cycle / 2) /
@@ -282,6 +350,53 @@ mod tests {
             m_fsw,
         );
         assert!(m_dc > 1.0, "DC bin {} too small", m_dc);
+    }
+
+    #[test]
+    fn trapezoidal_mode_runs_and_differs_from_sharp() {
+        // Smoke test: trapezoidal mode produces a spectrum that
+        // (a) is finite, (b) differs from sharp-edge mode in the
+        // high-frequency band (the precise physics — DC shift from
+        // edge-area-correction vs band-energy attenuation — depends
+        // on the chosen rise/fall ratio and is documented in
+        // spectrum_export.rs's module docs).
+        let n_cycles = 64;
+        let m = 128;
+        let stream = const_stream(n_cycles, 0.5, 10.0);
+        let mut p_slow = default_params();
+        p_slow.hs_fet.t_rise_ns = 200.0;
+        p_slow.hs_fet.t_fall_ns = 200.0;
+        let spec_sharp = export_input_current_spectrum(
+            &stream,
+            &default_params(),
+            ExportMode::PwmReconstructed {
+                samples_per_cycle: m,
+                trapezoidal: false,
+            },
+        )
+        .unwrap();
+        let spec_trap = export_input_current_spectrum(
+            &stream,
+            &p_slow,
+            ExportMode::PwmReconstructed {
+                samples_per_cycle: m,
+                trapezoidal: true,
+            },
+        )
+        .unwrap();
+        assert!(spec_trap.i_re_amp.iter().all(|x| x.is_finite()));
+        assert!(spec_trap.i_im_amp.iter().all(|x| x.is_finite()));
+        // The spectra must differ — if they didn't, trapezoidal mode
+        // would be a no-op.
+        let mut total_diff = 0.0_f64;
+        for k in 0..spec_sharp.freqs_hz.len() {
+            total_diff += (spec_sharp.i_re_amp[k] - spec_trap.i_re_amp[k]).abs();
+        }
+        assert!(
+            total_diff > 1e-3,
+            "trapezoidal mode should differ from sharp mode, total |Δ| = {}",
+            total_diff,
+        );
     }
 
     #[test]

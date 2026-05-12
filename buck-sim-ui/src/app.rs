@@ -116,11 +116,16 @@ pub struct BuckSimApp {
 
     // ── Spectrum export (input-port current → PortCurrentSpectrum JSON) ──
     // Hands the FFT of the steady-state input current off to
-    // kicad_field_solver's `current-injection` and `emc-radiated-injection`
-    // CLI modes. Envelope mode → DC–fsw/2; PWM mode → DC–N×fsw/2.
+    // kicad_field_solver's `current-injection`, `emc-radiated-injection`,
+    // and `emc-conducted` modes. Envelope mode → DC–fsw/2; PWM mode →
+    // DC–N×fsw/2. PWM has a trapezoidal-edge toggle that bandlimits
+    // the harmonics using SimParams.hs_fet rise/fall — the dominant
+    // first-order effect distinguishing a real switching spectrum
+    // from a perfect square wave.
     spectrum_export_path: String,
     spectrum_pwm_samples_per_cycle: u32,
     spectrum_use_pwm: bool,
+    spectrum_pwm_trapezoidal: bool,
     spectrum_export_status: Option<Result<String, String>>,
 
     // ── UI state ─────────────────────────────────────────────────────────────
@@ -494,6 +499,7 @@ impl BuckSimApp {
             spectrum_export_path: String::new(),
             spectrum_pwm_samples_per_cycle: 64,
             spectrum_use_pwm: true,
+            spectrum_pwm_trapezoidal: true,
             spectrum_export_status: None,
             converter_mode: ConverterMode::BuckPcmc,
             tab: Tab::Simulation,
@@ -1735,6 +1741,14 @@ impl BuckSimApp {
                         .range(4..=512)
                         .speed(1.0),
                 );
+                ui.checkbox(&mut self.spectrum_pwm_trapezoidal, "trapezoidal edges")
+                    .on_hover_text(
+                        "On: use HS-FET rise/fall times (SimParams.hs_fet.t_*_ns) \
+                         to give the input-current waveform finite slopes at \
+                         transitions. Bandlimits the harmonics above ~1/(π·t_rise) \
+                         — gets you closer to a real switching spectrum than the \
+                         idealized square-wave approximation.",
+                    );
             }
             let export_clicked = ui.button("Export").clicked();
             #[cfg(target_arch = "wasm32")]
@@ -1776,6 +1790,7 @@ impl BuckSimApp {
         let mode = if self.spectrum_use_pwm {
             ExportMode::PwmReconstructed {
                 samples_per_cycle: self.spectrum_pwm_samples_per_cycle,
+                trapezoidal: self.spectrum_pwm_trapezoidal,
             }
         } else {
             ExportMode::Envelope
