@@ -94,6 +94,30 @@ pub struct FetProfile {
     /// GaN HEMTs have no body diode → set both to 0.
     #[serde(default)]
     pub trr_ns: f64,
+    /// Gate-to-drain ("Miller") charge [nC]. Datasheet Q_gd. Sets
+    /// the Miller plateau duration via
+    ///     t_miller = Q_gd · R_g / (V_drive − V_miller)
+    /// During the plateau, drain current is held constant while
+    /// V_DS swings; on the input rail this looks like a flat
+    /// "shoulder" of duration `t_miller` after the current rise and
+    /// another before the current fall. Negligible for fast
+    /// low-voltage GaN (~1 ns) but matters for slow Si MOSFETs at
+    /// high V_in (10–50 ns at 400 V). Set to 0 to disable.
+    #[serde(default)]
+    pub qgd_nc: f64,
+    /// Total gate-loop resistance [Ω] — internal R_g plus the
+    /// external gate resistor. Multiplies into the Miller plateau
+    /// width above. Typical: 1–10 Ω.
+    #[serde(default)]
+    pub rg_ohm: f64,
+    /// Miller plateau gate voltage [V]. From the datasheet's
+    /// transfer characteristic at the operating I_D, or estimate
+    /// as `V_th + I_D/g_m`. Defaults to `vgs_v / 2` when unset,
+    /// which is the rule of thumb for symmetric drive (V_th + half-
+    /// way overdrive). Used as the denominator in the Miller
+    /// formula.
+    #[serde(default)]
+    pub v_miller_v: f64,
 }
 
 impl FetProfile {
@@ -108,6 +132,9 @@ impl FetProfile {
             t_fall_ns: 0.0,
             qrr_nc: 0.0,
             trr_ns: 0.0,
+            qgd_nc: 0.0,
+            rg_ohm: 0.0,
+            v_miller_v: 0.0,
         }
     }
 
@@ -125,6 +152,9 @@ impl FetProfile {
             t_fall_ns: 1.5,
             qrr_nc: 0.0,
             trr_ns: 0.0,
+            qgd_nc: 0.0,
+            rg_ohm: 0.0,
+            v_miller_v: 0.0,
         }
     }
 
@@ -139,6 +169,9 @@ impl FetProfile {
             t_fall_ns: 2.0,
             qrr_nc: 0.0,
             trr_ns: 0.0,
+            qgd_nc: 0.0,
+            rg_ohm: 0.0,
+            v_miller_v: 0.0,
         }
     }
 

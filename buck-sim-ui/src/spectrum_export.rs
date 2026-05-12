@@ -39,12 +39,19 @@
 //!       Adds the broadband sinc content that real Si MOSFETs
 //!       inject on the input rail.
 //!
-//!   **Not modeled** (negligible relative to the above): Miller
-//!   plateau in the gate drive — it adds a brief constant-current
-//!   "shoulder" at i_L_min and i_L_max around each transition,
-//!   typically ~1 ns wide for modern Si/GaN FETs vs ~1 µs cycle
-//!   period (0.1% of the cycle). Spectral impact is well below the
-//!   ringing / Q_rr / input-cap effects.
+//!   **Miller plateau** is now modeled when `hs_fet.qgd_nc > 0`
+//!   and `hs_fet.rg_ohm > 0`. The plateau width
+//!     t_miller = Q_gd · R_g / (V_drive − V_miller)
+//!   is inserted as a constant-current shoulder at `i_L_min` right
+//!   after the rising edge (drain current held while V_DS swings
+//!   high→low) and at `i_L_max` right before the falling edge.
+//!   Negligible (~1 ns) for fast low-voltage GaN/Si at 12 V; 10–
+//!   50 ns at 400 V or with slow drivers — relevant for offline
+//!   PFC / high-voltage designs. The inductor-ramp window between
+//!   the two plateaus is shortened to fit. If the on-time can't
+//!   accommodate both plateaus + a ramp, Miller modelling is
+//!   skipped silently for that cycle (the trapezoidal-only shape
+//!   remains).
 //!
 //! Both modes apply a Hann window over the steady-state half of the
 //! captured cycles, divide by the window's coherent gain so a pure
@@ -224,6 +231,25 @@ pub fn export_input_current_spectrum(
             } else {
                 (0.0, 0.0)
             };
+            // Miller plateau width from the HS-FET's Q_gd / R_g /
+            // (V_drive - V_miller). Skip if any required field is
+            // unset. Defaults `v_miller` to `vgs_v / 2` per the
+            // typical "symmetric drive" rule when v_miller_v == 0.
+            let t_miller_s = {
+                let qgd = p.hs_fet.qgd_nc * 1e-9;
+                let rg = p.hs_fet.rg_ohm;
+                let v_miller_eff = if p.hs_fet.v_miller_v > 0.0 {
+                    p.hs_fet.v_miller_v
+                } else {
+                    0.5 * p.hs_fet.vgs_v
+                };
+                let v_overdrive = p.hs_fet.vgs_v - v_miller_eff;
+                if trapezoidal && qgd > 0.0 && rg > 0.0 && v_overdrive > 0.0 {
+                    (qgd * rg / v_overdrive).min(0.15 * t_sw_s)
+                } else {
+                    0.0
+                }
+            };
             let qrr_c = (qrr_nc * 1e-9).max(0.0);
             // Recovery time t_rr from datasheet. If unset (0) but
             // Q_rr is > 0, fall back to 20 ns — typical for slower
@@ -262,6 +288,18 @@ pub fn export_input_current_spectrum(
                 let t_on_s = duty * t_sw_s;
                 let t_flat_start = t_rise_s.min(t_on_s);
                 let t_flat_end = (t_on_s - t_fall_s).max(t_flat_start);
+                // Miller plateaus eat into the inductor-ramp section.
+                // Skip them entirely if the on-time can't fit both
+                // shoulders + the ramp.
+                let total_miller = 2.0 * t_miller_s;
+                let ramp_budget = (t_flat_end - t_flat_start).max(0.0);
+                let t_miller_eff = if ramp_budget > total_miller {
+                    t_miller_s
+                } else {
+                    0.0
+                };
+                let t_miller_on_end = t_flat_start + t_miller_eff;
+                let t_miller_off_start = t_flat_end - t_miller_eff;
 
                 if duty > 0.0 && ringing.is_some() {
                     // HS turn-on midpoint (start of "switch node is
@@ -276,21 +314,34 @@ pub fn export_input_current_spectrum(
                     let tau_s = (k as f64) / (m as f64) * t_sw_s;
                     let abs_t = cycle_start_s + tau_s;
 
-                    // 1. Trapezoidal base.
+                    // 1. Trapezoidal base + Miller plateaus.
+                    // Sequence within HS-on: ramp → Miller @ i_min →
+                    // inductor ramp → Miller @ i_max → fall.
                     let mut v = if duty <= 0.0 {
                         0.0
                     } else if tau_s < t_flat_start {
+                        // Current rise.
                         let frac = if t_flat_start > 0.0 {
                             tau_s / t_flat_start
                         } else {
                             1.0
                         };
                         frac * i_min
-                    } else if tau_s < t_flat_end {
-                        let denom = (t_flat_end - t_flat_start).max(1e-18);
-                        let frac = ((tau_s - t_flat_start) / denom).clamp(0.0, 1.0);
+                    } else if tau_s < t_miller_on_end {
+                        // Turn-on Miller plateau: drain current is
+                        // held at i_min while V_DS swings high → low.
+                        i_min
+                    } else if tau_s < t_miller_off_start {
+                        // Inductor ramp.
+                        let denom = (t_miller_off_start - t_miller_on_end).max(1e-18);
+                        let frac = ((tau_s - t_miller_on_end) / denom).clamp(0.0, 1.0);
                         i_min + frac * (i_max - i_min)
+                    } else if tau_s < t_flat_end {
+                        // Turn-off Miller plateau: held at i_max
+                        // while V_DS swings low → high.
+                        i_max
                     } else if tau_s < t_on_s {
+                        // Current fall.
                         let denom = (t_on_s - t_flat_end).max(1e-18);
                         let frac = ((tau_s - t_flat_end) / denom).clamp(0.0, 1.0);
                         i_max * (1.0 - frac)
@@ -334,9 +385,14 @@ pub fn export_input_current_spectrum(
                 }
             }
             let edge_tag = if trapezoidal {
+                let miller_tag = if t_miller_s > 0.0 {
+                    format!(",miller={:.2}ns", t_miller_s * 1e9)
+                } else {
+                    String::new()
+                };
                 format!(
-                    ",trapezoidal=t_rise={:.2}ns,t_fall={:.2}ns",
-                    p.hs_fet.t_rise_ns, p.hs_fet.t_fall_ns,
+                    ",trapezoidal=t_rise={:.2}ns,t_fall={:.2}ns{}",
+                    p.hs_fet.t_rise_ns, p.hs_fet.t_fall_ns, miller_tag,
                 )
             } else {
                 ",trapezoidal=off".to_string()
@@ -572,6 +628,94 @@ mod tests {
             "ringing should boost f_ring bin: ring={} vs no_ring={}",
             mag_at_fring_ring,
             mag_at_fring_no_ring,
+        );
+    }
+
+    #[test]
+    fn miller_plateau_changes_waveform_at_high_voltage() {
+        // 400 V offline PFC scenario where Miller plateau is real:
+        // Q_gd = 30 nC, R_g = 5 Ω, V_drive = 12 V, V_miller = 6 V
+        //   → t_miller = 30e-9 · 5 / 6 = 25 ns
+        // That's a measurable shoulder relative to T_sw = 10 µs
+        // (100 kHz typical PFC fsw).
+        let mut p = default_params();
+        p.f_sw_khz = 100.0;
+        p.hs_fet.t_rise_ns = 50.0;
+        p.hs_fet.t_fall_ns = 50.0;
+        p.hs_fet.qgd_nc = 30.0;
+        p.hs_fet.rg_ohm = 5.0;
+        p.hs_fet.vgs_v = 12.0;
+        p.hs_fet.v_miller_v = 6.0;
+
+        let stream = const_stream(64, 0.5, 10.0);
+        let mut p_no_miller = p.clone();
+        p_no_miller.hs_fet.qgd_nc = 0.0;
+        let spec_no = export_input_current_spectrum(
+            &stream,
+            &p_no_miller,
+            ExportMode::PwmReconstructed {
+                samples_per_cycle: 256,
+                trapezoidal: true,
+                ringing: None,
+                qrr_nc: 0.0,
+                trr_ns: 0.0,
+            },
+        )
+        .unwrap();
+        let spec_miller = export_input_current_spectrum(
+            &stream,
+            &p,
+            ExportMode::PwmReconstructed {
+                samples_per_cycle: 256,
+                trapezoidal: true,
+                ringing: None,
+                qrr_nc: 0.0,
+                trr_ns: 0.0,
+            },
+        )
+        .unwrap();
+        // Spectra must differ somewhere — Miller adds two constant-
+        // current shoulders, which redistribute spectral energy
+        // (the inductor-ramp section shrinks).
+        let total_diff: f64 = spec_no
+            .i_re_amp
+            .iter()
+            .zip(spec_miller.i_re_amp.iter())
+            .map(|(a, b)| (a - b).abs())
+            .sum();
+        assert!(
+            total_diff > 1e-2,
+            "Miller plateau should change the spectrum; total |Δ| = {}",
+            total_diff,
+        );
+        // Stamped tag should report the t_miller computation.
+        assert!(
+            spec_miller.source.contains("miller="),
+            "source string should record the t_miller width: {}",
+            spec_miller.source,
+        );
+    }
+
+    #[test]
+    fn miller_plateau_disabled_when_qgd_zero() {
+        let stream = const_stream(64, 0.5, 10.0);
+        let spec = export_input_current_spectrum(
+            &stream,
+            &default_params(),
+            ExportMode::PwmReconstructed {
+                samples_per_cycle: 64,
+                trapezoidal: true,
+                ringing: None,
+                qrr_nc: 0.0,
+                trr_ns: 0.0,
+            },
+        )
+        .unwrap();
+        // Default FetProfile has qgd_nc = 0 → no Miller tag.
+        assert!(
+            !spec.source.contains("miller="),
+            "no miller tag expected when qgd_nc = 0: {}",
+            spec.source,
         );
     }
 
