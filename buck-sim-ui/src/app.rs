@@ -1,5 +1,5 @@
 use egui::Color32;
-use egui_plot::{HLine, Line, Plot, PlotPoints};
+use egui_plot::{HLine, Line, Plot, PlotPoints, Text, VLine};
 use full_control::control_2p2z::Topology as ControlTopology;
 
 use crate::bode::{BodeData, NonIdealParams, show_bode};
@@ -17,6 +17,7 @@ enum ConverterMode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
     Simulation,
+    Scope,
     Bode,
 }
 
@@ -127,6 +128,12 @@ pub struct BuckSimApp {
     spectrum_use_pwm: bool,
     spectrum_pwm_trapezoidal: bool,
     spectrum_export_status: Option<Result<String, String>>,
+
+    // ── Scope view (single-cycle steady-state oscilloscope) ──────────────
+    // Re-uses spectrum_export's synthesis primitive so the scope and
+    // the FFT'd export are guaranteed bit-identical. Sample count
+    // independent from the export's; defaults higher for crisp edges.
+    scope_samples_per_cycle: u32,
 
     // ── UI state ─────────────────────────────────────────────────────────────
     converter_mode: ConverterMode,
@@ -501,6 +508,7 @@ impl BuckSimApp {
             spectrum_use_pwm: true,
             spectrum_pwm_trapezoidal: true,
             spectrum_export_status: None,
+            scope_samples_per_cycle: 2048,
             converter_mode: ConverterMode::BuckPcmc,
             tab: Tab::Simulation,
             plot_option: PlotOption::Average,
@@ -1497,12 +1505,14 @@ impl BuckSimApp {
         // Tab bar
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tab, Tab::Simulation, "Simulation");
+            ui.selectable_value(&mut self.tab, Tab::Scope, "Scope");
             ui.selectable_value(&mut self.tab, Tab::Bode, "Bode");
         });
         ui.separator();
 
         match self.tab {
             Tab::Simulation => self.show_simulation(ui),
+            Tab::Scope => self.show_scope(ui),
             Tab::Bode => {
                 self.show_pdn_loader(ui);
                 self.show_loop_loader(ui);
@@ -2682,5 +2692,187 @@ impl BuckSimApp {
                     });
             }
         }
+    }
+
+    /// Single-cycle oscilloscope-style view of the input-port
+    /// current at steady state. Pulls the operating point (duty,
+    /// i_min, i_max) from the last simulated cycle, then synthesizes
+    /// the sub-cycle waveform using exactly the same code path that
+    /// `spectrum_export::PwmReconstructed` uses to FFT — guaranteed
+    /// consistency between what the user sees here and what the
+    /// exported spectrum was built from.
+    fn show_scope(&mut self, ui: &mut egui::Ui) {
+        use crate::spectrum_export::{synthesize_steady_state_cycle, RingingParams};
+
+        let last = match self.sim_data.as_ref() {
+            Ok(d) => d.last(),
+            Err(reason) => {
+                ui.centered_and_justified(|ui| {
+                    ui.colored_label(Color32::from_rgb(255, 100, 100), reason);
+                });
+                return;
+            }
+        };
+        let Some(c) = last else {
+            ui.centered_and_justified(|ui| {
+                ui.label("No simulation data yet — adjust parameters to trigger a run.");
+            });
+            return;
+        };
+
+        // Controls row.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Samples per cycle:");
+            ui.add(
+                egui::DragValue::new(&mut self.scope_samples_per_cycle)
+                    .range(64..=8192)
+                    .speed(16.0),
+            );
+            ui.separator();
+            ui.label(format!(
+                "Operating point (last cycle): duty = {:.1}%, I_L = {:.2}–{:.2} A",
+                c.duty_pct_avg(),
+                c.i_total_min,
+                c.i_total_max,
+            ));
+        });
+        ui.separator();
+
+        let n_phases = c.phases.len().max(1) as f64;
+        let duty = c.duty_pct_avg() as f64 / 100.0;
+        let i_min = c.i_total_min as f64;
+        let i_max = c.i_total_max as f64;
+        let ringing = self.loaded_loop.as_ref().map(|l| RingingParams {
+            l_loop_h: l.l_self_henry,
+            r_loop_ohm: l.r_dc_ohm,
+            c_oss_total_f: 0.5
+                * (self.last_params.hs_fet.coss_pf + self.last_params.ls_fet.coss_pf)
+                * 1e-12,
+            v_step_v: self.last_params.v_in,
+        });
+        let snap = match synthesize_steady_state_cycle(
+            &self.last_params,
+            duty,
+            i_min,
+            i_max,
+            n_phases,
+            self.scope_samples_per_cycle,
+            true, // trapezoidal always on for scope view
+            ringing,
+            self.last_params.ls_fet.qrr_nc,
+            self.last_params.ls_fet.trr_ns,
+        ) {
+            Some(s) => s,
+            None => {
+                ui.colored_label(
+                    Color32::from_rgb(255, 100, 100),
+                    "synthesize_steady_state_cycle returned None (check samples_per_cycle >= 4).",
+                );
+                return;
+            }
+        };
+        let t_sw_us = snap.t_sw_s * 1e6;
+
+        // Physics annotations strip.
+        let model_line = format!(
+            "T_sw = {:.3} µs   t_rise = {:.2} ns   t_fall = {:.2} ns   \
+             Miller = {:.2} ns   Q_rr = {:.1} nC / t_rr = {:.1} ns",
+            t_sw_us,
+            snap.params.t_rise_s * 1e9,
+            snap.params.t_fall_s * 1e9,
+            snap.params.t_miller_s * 1e9,
+            self.last_params.ls_fet.qrr_nc,
+            snap.params.t_rr_s * 1e9,
+        );
+        ui.colored_label(Color32::from_rgb(200, 200, 200), model_line);
+        if let Some(r) = snap.params.ringing.as_ref() {
+            let f_ring = r.f_ring_hz() / 1e6;
+            ui.colored_label(
+                Color32::from_rgb(255, 180, 120),
+                format!(
+                    "Ringing: f_ring = {:.2} MHz, Q = {:.0}, V_step = {:.1} V \
+                     (loaded from LoopExtraction)",
+                    f_ring, r.q_factor(), r.v_step_v,
+                ),
+            );
+        } else {
+            ui.colored_label(
+                Color32::from_rgb(150, 150, 150),
+                "Ringing: disabled (load a LoopExtraction to enable commutation-loop \
+                 ringing in the scope waveform)",
+            );
+        }
+        ui.separator();
+
+        // Build plot points: time in µs vs current in A.
+        let m = snap.samples.len();
+        let pts: PlotPoints = (0..m)
+            .map(|k| {
+                let tau_us = (k as f64) / (m as f64) * t_sw_us;
+                [tau_us, snap.samples[k]]
+            })
+            .collect();
+        let waveform = Line::new("I_in [A]", pts).color(Color32::from_rgb(120, 200, 255));
+
+        // Region boundary markers, in µs.
+        let mk = &snap.markers;
+        let v_rise = VLine::new("", mk.t_flat_start * 1e6)
+            .color(Color32::from_rgb(200, 200, 0));
+        let v_mill_on = VLine::new("", mk.t_miller_on_end * 1e6)
+            .color(Color32::from_rgb(255, 100, 200));
+        let v_mill_off = VLine::new("", mk.t_miller_off_start * 1e6)
+            .color(Color32::from_rgb(255, 100, 200));
+        let v_fall = VLine::new("", mk.t_flat_end * 1e6)
+            .color(Color32::from_rgb(200, 200, 0));
+        let v_off = VLine::new("", mk.t_on_end * 1e6)
+            .color(Color32::from_rgb(120, 120, 120));
+
+        // Region-label text annotations near the top of the plot.
+        let i_label_y = i_max * 1.1 * n_phases.max(1.0);
+        let mid_rise = mk.t_flat_start * 0.5 * 1e6;
+        let mid_mill_on = (mk.t_flat_start + mk.t_miller_on_end) * 0.5 * 1e6;
+        let mid_ramp = (mk.t_miller_on_end + mk.t_miller_off_start) * 0.5 * 1e6;
+        let mid_mill_off = (mk.t_miller_off_start + mk.t_flat_end) * 0.5 * 1e6;
+        let mid_fall = (mk.t_flat_end + mk.t_on_end) * 0.5 * 1e6;
+        let mid_dead = (mk.t_on_end + t_sw_us) * 0.5;
+        let label = |t: f64, txt: &str| {
+            Text::new(
+                "label",
+                [t, i_label_y].into(),
+                egui::RichText::new(txt).color(Color32::from_rgb(220, 220, 220)).small(),
+            )
+        };
+
+        Plot::new("scope")
+            .height((ui.available_height() - 40.0).max(200.0))
+            .x_axis_label("t [µs]")
+            .y_axis_label("I_in (interleaved) [A]")
+            .show(ui, |plot_ui| {
+                plot_ui.line(waveform);
+                plot_ui.vline(v_rise);
+                plot_ui.vline(v_mill_on);
+                plot_ui.vline(v_mill_off);
+                plot_ui.vline(v_fall);
+                plot_ui.vline(v_off);
+                plot_ui.hline(HLine::new("0", 0.0).color(Color32::from_rgb(80, 80, 80)));
+                if mk.t_flat_start > 0.0 {
+                    plot_ui.text(label(mid_rise, "rise"));
+                }
+                if mk.t_miller_on_end > mk.t_flat_start {
+                    plot_ui.text(label(mid_mill_on, "Miller-on"));
+                }
+                if mk.t_miller_off_start > mk.t_miller_on_end {
+                    plot_ui.text(label(mid_ramp, "i_L ramp"));
+                }
+                if mk.t_flat_end > mk.t_miller_off_start {
+                    plot_ui.text(label(mid_mill_off, "Miller-off"));
+                }
+                if mk.t_on_end > mk.t_flat_end {
+                    plot_ui.text(label(mid_fall, "fall"));
+                }
+                if t_sw_us > mk.t_on_end * 1e6 {
+                    plot_ui.text(label(mid_dead, "HS off (dead time + freewheel)"));
+                }
+            });
     }
 }

@@ -135,6 +135,281 @@ impl RingingParams {
     }
 }
 
+/// Precomputed parameters for one PWM-reconstruction pass.
+/// Cheap to build; reused across cycles by `export_input_current_spectrum`
+/// and by `synthesize_steady_state_cycle` (the scope view), so the
+/// two consumers always draw from identical math.
+#[derive(Debug, Clone, Copy)]
+pub struct PwmReconParams {
+    pub t_sw_s: f64,
+    pub samples_per_cycle: usize,
+    pub n_phases: f64,
+    pub t_rise_s: f64,
+    pub t_fall_s: f64,
+    pub t_miller_s: f64,
+    pub qrr_c: f64,
+    pub t_rr_s: f64,
+    pub ringing: Option<RingingParams>,
+    pub ring_decay_window_s: f64,
+}
+
+impl PwmReconParams {
+    pub fn build(
+        p: &SimParams,
+        samples_per_cycle: usize,
+        trapezoidal: bool,
+        ringing: Option<RingingParams>,
+        qrr_nc: f64,
+        trr_ns: f64,
+        n_phases: f64,
+    ) -> Self {
+        let fsw = p.f_sw_khz * 1e3;
+        let t_sw_s = if fsw > 0.0 { 1.0 / fsw } else { 1.0 };
+        let (t_rise_s, t_fall_s) = if trapezoidal {
+            let r = (p.hs_fet.t_rise_ns * 1e-9).max(0.0);
+            let f = (p.hs_fet.t_fall_ns * 1e-9).max(0.0);
+            (r.min(0.25 * t_sw_s), f.min(0.25 * t_sw_s))
+        } else {
+            (0.0, 0.0)
+        };
+        let t_miller_s = {
+            let qgd = p.hs_fet.qgd_nc * 1e-9;
+            let rg = p.hs_fet.rg_ohm;
+            let v_miller_eff = if p.hs_fet.v_miller_v > 0.0 {
+                p.hs_fet.v_miller_v
+            } else {
+                0.5 * p.hs_fet.vgs_v
+            };
+            let v_overdrive = p.hs_fet.vgs_v - v_miller_eff;
+            if trapezoidal && qgd > 0.0 && rg > 0.0 && v_overdrive > 0.0 {
+                (qgd * rg / v_overdrive).min(0.15 * t_sw_s)
+            } else {
+                0.0
+            }
+        };
+        let qrr_c = (qrr_nc * 1e-9).max(0.0);
+        let t_rr_s = if trr_ns > 0.0 {
+            (trr_ns * 1e-9).min(0.5 * t_sw_s)
+        } else if qrr_c > 0.0 {
+            20e-9
+        } else {
+            0.0
+        };
+        let ring_decay_window_s = ringing
+            .and_then(|r| {
+                let a = r.alpha();
+                if a > 0.0 {
+                    Some(8.0 / a)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::INFINITY);
+        Self {
+            t_sw_s,
+            samples_per_cycle,
+            n_phases,
+            t_rise_s,
+            t_fall_s,
+            t_miller_s,
+            qrr_c,
+            t_rr_s,
+            ringing,
+            ring_decay_window_s,
+        }
+    }
+}
+
+/// Boundary points of one switching cycle, relative to cycle start
+/// in seconds. Used by the scope view to annotate the regions of
+/// the waveform.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CycleMarkers {
+    pub t_flat_start: f64,        // end of current-rise / start of turn-on Miller
+    pub t_miller_on_end: f64,     // end of turn-on Miller / start of inductor ramp
+    pub t_miller_off_start: f64,  // end of inductor ramp / start of turn-off Miller
+    pub t_flat_end: f64,          // end of turn-off Miller / start of current-fall
+    pub t_on_end: f64,            // end of HS on / start of HS off (dead-time absorbed in t_fall)
+}
+
+/// Synthesize one switching cycle of input-port current. Appends
+/// `samples_per_cycle` samples to `samples_out` (in amperes,
+/// already multiplied by `n_phases` so the result is the
+/// interleaved sum the input cap sees). `transitions` is mutated to
+/// record HS-on / HS-off events for the ringing model — the caller
+/// should pass the same Vec across cycles so ringing decays
+/// correctly across cycle boundaries.
+pub fn synthesize_one_cycle(
+    params: &PwmReconParams,
+    cycle_idx: usize,
+    duty: f64,
+    i_min_per_phase: f64,
+    i_max_per_phase: f64,
+    transitions: &mut Vec<(f64, f64)>,
+    samples_out: &mut Vec<f64>,
+) -> CycleMarkers {
+    let m = params.samples_per_cycle;
+    let t_sw_s = params.t_sw_s;
+    let cycle_start_s = (cycle_idx as f64) * t_sw_s;
+    let duty = duty.clamp(0.0, 1.0);
+    let i_min = i_min_per_phase;
+    let i_max = i_max_per_phase;
+    let t_on_s = duty * t_sw_s;
+    let t_flat_start = params.t_rise_s.min(t_on_s);
+    let t_flat_end = (t_on_s - params.t_fall_s).max(t_flat_start);
+    let total_miller = 2.0 * params.t_miller_s;
+    let ramp_budget = (t_flat_end - t_flat_start).max(0.0);
+    let t_miller_eff = if ramp_budget > total_miller {
+        params.t_miller_s
+    } else {
+        0.0
+    };
+    let t_miller_on_end = t_flat_start + t_miller_eff;
+    let t_miller_off_start = t_flat_end - t_miller_eff;
+
+    if duty > 0.0 && params.ringing.is_some() {
+        transitions.push((cycle_start_s + t_flat_start * 0.5, 1.0));
+        let toff_mid = t_flat_end + (t_on_s - t_flat_end) * 0.5;
+        transitions.push((cycle_start_s + toff_mid, -1.0));
+    }
+
+    for k in 0..m {
+        let tau_s = (k as f64) / (m as f64) * t_sw_s;
+        let abs_t = cycle_start_s + tau_s;
+
+        // 1. Trapezoidal base + Miller plateaus.
+        let mut v = if duty <= 0.0 {
+            0.0
+        } else if tau_s < t_flat_start {
+            let frac = if t_flat_start > 0.0 {
+                tau_s / t_flat_start
+            } else {
+                1.0
+            };
+            frac * i_min
+        } else if tau_s < t_miller_on_end {
+            i_min
+        } else if tau_s < t_miller_off_start {
+            let denom = (t_miller_off_start - t_miller_on_end).max(1e-18);
+            let frac = ((tau_s - t_miller_on_end) / denom).clamp(0.0, 1.0);
+            i_min + frac * (i_max - i_min)
+        } else if tau_s < t_flat_end {
+            i_max
+        } else if tau_s < t_on_s {
+            let denom = (t_on_s - t_flat_end).max(1e-18);
+            let frac = ((tau_s - t_flat_end) / denom).clamp(0.0, 1.0);
+            i_max * (1.0 - frac)
+        } else {
+            0.0
+        };
+
+        // 2. Body-diode reverse-recovery (LS Qrr).
+        if duty > 0.0 && params.qrr_c > 0.0 && params.t_rr_s > 0.0 {
+            let center = params.t_rise_s.max(params.t_rr_s) * 0.5;
+            let half_w = params.t_rr_s * 0.5;
+            if (tau_s - center).abs() < half_w {
+                let peak = 2.0 * params.qrr_c / params.t_rr_s;
+                let dist = (tau_s - center).abs();
+                v += peak * (1.0 - dist / half_w);
+            }
+        }
+
+        // 3. Commutation-loop ringing.
+        if let Some(r) = params.ringing.as_ref() {
+            for &(t_event, sign) in transitions.iter() {
+                let dt = abs_t - t_event;
+                if dt < 0.0 || dt > params.ring_decay_window_s {
+                    continue;
+                }
+                v += r.waveform(dt, sign);
+            }
+        }
+
+        samples_out.push(params.n_phases * v);
+    }
+
+    CycleMarkers {
+        t_flat_start,
+        t_miller_on_end,
+        t_miller_off_start,
+        t_flat_end,
+        t_on_end: t_on_s,
+    }
+}
+
+/// Snapshot of one steady-state switching cycle, suitable for an
+/// oscilloscope-style scope panel. Generated with several warmup
+/// cycles of ringing history so the returned samples reflect
+/// periodic steady-state (no startup transient).
+#[derive(Debug, Clone)]
+pub struct SteadyStateCycle {
+    /// Input-port current samples for one full T_sw, amperes
+    /// (interleaved sum). Length = `samples_per_cycle`.
+    pub samples: Vec<f64>,
+    /// Switching period in seconds.
+    pub t_sw_s: f64,
+    /// Region boundaries within the cycle.
+    pub markers: CycleMarkers,
+    /// Precomputed params used for the synthesis (lets the UI
+    /// display the same physics readouts the spectrum export does).
+    pub params: PwmReconParams,
+}
+
+/// Generate one steady-state cycle of input-port current for the
+/// scope view. Picks the operating point from `(duty, i_min, i_max)`
+/// (typically pulled from the last SimPoint in `sim_data` for
+/// steady-state operation) and runs the same PWM-reconstruction
+/// synthesis the spectrum exporter uses — with a few warmup cycles
+/// first so the ringing model has reached periodic steady state.
+pub fn synthesize_steady_state_cycle(
+    p: &SimParams,
+    duty: f64,
+    i_total_min: f64,
+    i_total_max: f64,
+    n_phases: f64,
+    samples_per_cycle: u32,
+    trapezoidal: bool,
+    ringing: Option<RingingParams>,
+    qrr_nc: f64,
+    trr_ns: f64,
+) -> Option<SteadyStateCycle> {
+    if samples_per_cycle < 4 {
+        return None;
+    }
+    let m = samples_per_cycle as usize;
+    let n_phases = n_phases.max(1.0);
+    let params = PwmReconParams::build(p, m, trapezoidal, ringing, qrr_nc, trr_ns, n_phases);
+    let i_min = i_total_min / n_phases;
+    let i_max = i_total_max / n_phases;
+
+    // Warmup so ringing reaches periodic steady-state. 4 cycles is
+    // enough at typical Q values; high-Q rings (Q >> 1000) may need
+    // more — capped at 8 cycles so the scope view stays snappy.
+    let n_warmup = 4;
+    let mut transitions: Vec<(f64, f64)> = Vec::new();
+    let mut all_samples: Vec<f64> = Vec::with_capacity(m * (n_warmup + 1));
+    let mut last_markers = CycleMarkers::default();
+    for cyc in 0..=n_warmup {
+        last_markers = synthesize_one_cycle(
+            &params,
+            cyc,
+            duty,
+            i_min,
+            i_max,
+            &mut transitions,
+            &mut all_samples,
+        );
+    }
+    let last_start = m * n_warmup;
+    let samples = all_samples[last_start..].to_vec();
+    Some(SteadyStateCycle {
+        samples,
+        t_sw_s: params.t_sw_s,
+        markers: last_markers,
+        params,
+    })
+}
+
 /// Reconstruction strategy. See module docs.
 #[derive(Debug, Clone, Copy)]
 pub enum ExportMode {
@@ -223,170 +498,28 @@ pub fn export_input_current_spectrum(
                 return Err("samples_per_cycle must be >= 4".into());
             }
             let m = samples_per_cycle as usize;
-            let t_sw_s = 1.0 / fsw;
-            let (t_rise_s, t_fall_s) = if trapezoidal {
-                let r = (p.hs_fet.t_rise_ns * 1e-9).max(0.0);
-                let f = (p.hs_fet.t_fall_ns * 1e-9).max(0.0);
-                (r.min(0.25 * t_sw_s), f.min(0.25 * t_sw_s))
-            } else {
-                (0.0, 0.0)
-            };
-            // Miller plateau width from the HS-FET's Q_gd / R_g /
-            // (V_drive - V_miller). Skip if any required field is
-            // unset. Defaults `v_miller` to `vgs_v / 2` per the
-            // typical "symmetric drive" rule when v_miller_v == 0.
-            let t_miller_s = {
-                let qgd = p.hs_fet.qgd_nc * 1e-9;
-                let rg = p.hs_fet.rg_ohm;
-                let v_miller_eff = if p.hs_fet.v_miller_v > 0.0 {
-                    p.hs_fet.v_miller_v
-                } else {
-                    0.5 * p.hs_fet.vgs_v
-                };
-                let v_overdrive = p.hs_fet.vgs_v - v_miller_eff;
-                if trapezoidal && qgd > 0.0 && rg > 0.0 && v_overdrive > 0.0 {
-                    (qgd * rg / v_overdrive).min(0.15 * t_sw_s)
-                } else {
-                    0.0
-                }
-            };
-            let qrr_c = (qrr_nc * 1e-9).max(0.0);
-            // Recovery time t_rr from datasheet. If unset (0) but
-            // Q_rr is > 0, fall back to 20 ns — typical for slower
-            // Si MOSFETs — so the pulse remains sampleable.
-            let t_rr_s = if trr_ns > 0.0 {
-                (trr_ns * 1e-9).min(0.5 * t_sw_s)
-            } else if qrr_c > 0.0 {
-                20e-9
-            } else {
-                0.0
-            };
-
-            // Collect every HS transition's absolute time + step
-            // sign within the capture window. HS turn-on midpoint
-            // gets +V_step; HS turn-off midpoint gets -V_step.
-            // Used by the ringing model to drop a damped sinusoid
-            // at each one.
+            // n_phases varies cycle-by-cycle in theory, but in
+            // practice phase count is fixed at config time. Take it
+            // from the first cycle of the window.
+            let n_phases = cycles[0].phases.len().max(1) as f64;
+            let params = PwmReconParams::build(
+                p, m, trapezoidal, ringing, qrr_nc, trr_ns, n_phases,
+            );
             let mut transitions: Vec<(f64, f64)> = Vec::new();
-            // Cap how far back we look for active rings — after
-            // 8/α the amplitude is below 0.03 %, contribution
-            // negligible; for over-damped (α=0) skip the cap.
-            let ring_decay_window_s = ringing
-                .and_then(|r| {
-                    let a = r.alpha();
-                    if a > 0.0 { Some(8.0 / a) } else { None }
-                })
-                .unwrap_or(f64::INFINITY);
-
             let mut s: Vec<f64> = Vec::with_capacity(m * cycles.len());
             for (cyc_idx, c) in cycles.iter().enumerate() {
-                let cycle_start_s = (cyc_idx as f64) * t_sw_s;
                 let duty = (c.duty_pct_avg() as f64 / 100.0).clamp(0.0, 1.0);
-                let n_phases = c.phases.len().max(1) as f64;
-                let i_min = c.i_total_min as f64 / n_phases;
-                let i_max = c.i_total_max as f64 / n_phases;
-                let t_on_s = duty * t_sw_s;
-                let t_flat_start = t_rise_s.min(t_on_s);
-                let t_flat_end = (t_on_s - t_fall_s).max(t_flat_start);
-                // Miller plateaus eat into the inductor-ramp section.
-                // Skip them entirely if the on-time can't fit both
-                // shoulders + the ramp.
-                let total_miller = 2.0 * t_miller_s;
-                let ramp_budget = (t_flat_end - t_flat_start).max(0.0);
-                let t_miller_eff = if ramp_budget > total_miller {
-                    t_miller_s
-                } else {
-                    0.0
-                };
-                let t_miller_on_end = t_flat_start + t_miller_eff;
-                let t_miller_off_start = t_flat_end - t_miller_eff;
-
-                if duty > 0.0 && ringing.is_some() {
-                    // HS turn-on midpoint (start of "switch node is
-                    // up" → +V_step on the loop).
-                    transitions.push((cycle_start_s + t_flat_start * 0.5, 1.0));
-                    // HS turn-off midpoint.
-                    let toff_mid = t_flat_end + (t_on_s - t_flat_end) * 0.5;
-                    transitions.push((cycle_start_s + toff_mid, -1.0));
-                }
-
-                for k in 0..m {
-                    let tau_s = (k as f64) / (m as f64) * t_sw_s;
-                    let abs_t = cycle_start_s + tau_s;
-
-                    // 1. Trapezoidal base + Miller plateaus.
-                    // Sequence within HS-on: ramp → Miller @ i_min →
-                    // inductor ramp → Miller @ i_max → fall.
-                    let mut v = if duty <= 0.0 {
-                        0.0
-                    } else if tau_s < t_flat_start {
-                        // Current rise.
-                        let frac = if t_flat_start > 0.0 {
-                            tau_s / t_flat_start
-                        } else {
-                            1.0
-                        };
-                        frac * i_min
-                    } else if tau_s < t_miller_on_end {
-                        // Turn-on Miller plateau: drain current is
-                        // held at i_min while V_DS swings high → low.
-                        i_min
-                    } else if tau_s < t_miller_off_start {
-                        // Inductor ramp.
-                        let denom = (t_miller_off_start - t_miller_on_end).max(1e-18);
-                        let frac = ((tau_s - t_miller_on_end) / denom).clamp(0.0, 1.0);
-                        i_min + frac * (i_max - i_min)
-                    } else if tau_s < t_flat_end {
-                        // Turn-off Miller plateau: held at i_max
-                        // while V_DS swings low → high.
-                        i_max
-                    } else if tau_s < t_on_s {
-                        // Current fall.
-                        let denom = (t_on_s - t_flat_end).max(1e-18);
-                        let frac = ((tau_s - t_flat_end) / denom).clamp(0.0, 1.0);
-                        i_max * (1.0 - frac)
-                    } else {
-                        0.0
-                    };
-
-                    // 2. Body-diode reverse-recovery (LS Qrr). Adds
-                    // a centered-triangle current pulse of area q_rr_c
-                    // and base width t_rr across the HS-on transition.
-                    // Triangle is centered on the rising-edge midpoint
-                    // (t_rise/2) — physically the recovery peaks as
-                    // the switch node hits its midpoint dV/dt.
-                    if duty > 0.0 && qrr_c > 0.0 && t_rr_s > 0.0 {
-                        let center = t_rise_s.max(t_rr_s) * 0.5;
-                        let half_w = t_rr_s * 0.5;
-                        if (tau_s - center).abs() < half_w {
-                            let peak = 2.0 * qrr_c / t_rr_s;
-                            let dist = (tau_s - center).abs();
-                            v += peak * (1.0 - dist / half_w);
-                        }
-                    }
-
-                    // 3. Commutation-loop ringing. Sum step-response
-                    // contributions from every transition within the
-                    // decay window.
-                    if let Some(r) = ringing.as_ref() {
-                        for &(t_event, sign) in &transitions {
-                            let dt = abs_t - t_event;
-                            if dt < 0.0 || dt > ring_decay_window_s {
-                                continue;
-                            }
-                            v += r.waveform(dt, sign);
-                        }
-                    }
-
-                    // Multiply by num_phases to recover the
-                    // interleaved-sum input current seen by the
-                    // shared input cap.
-                    s.push(n_phases * v);
-                }
+                let cyc_n_phases = c.phases.len().max(1) as f64;
+                let i_min = c.i_total_min as f64 / cyc_n_phases;
+                let i_max = c.i_total_max as f64 / cyc_n_phases;
+                synthesize_one_cycle(
+                    &params, cyc_idx, duty, i_min, i_max,
+                    &mut transitions, &mut s,
+                );
             }
             let edge_tag = if trapezoidal {
-                let miller_tag = if t_miller_s > 0.0 {
-                    format!(",miller={:.2}ns", t_miller_s * 1e9)
+                let miller_tag = if params.t_miller_s > 0.0 {
+                    format!(",miller={:.2}ns", params.t_miller_s * 1e9)
                 } else {
                     String::new()
                 };
@@ -406,8 +539,8 @@ pub fn export_input_current_spectrum(
             } else {
                 ",ringing=off".to_string()
             };
-            let qrr_tag = if qrr_c > 0.0 {
-                format!(",qrr={:.2}nC_trr={:.1}ns", qrr_nc, t_rr_s * 1e9)
+            let qrr_tag = if params.qrr_c > 0.0 {
+                format!(",qrr={:.2}nC_trr={:.1}ns", qrr_nc, params.t_rr_s * 1e9)
             } else {
                 ",qrr=off".to_string()
             };
