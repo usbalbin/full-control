@@ -103,6 +103,16 @@ pub struct BuckSimApp {
     pdn_json_path: String,
     pdn_load_status: Option<Result<String, String>>,
 
+    // ── PEEC loop extraction (commutation L_self + R_DC) ─────────────────
+    // Produced by `field_solver_cli loop-l --loop-export`; the
+    // L_self_henry surfaces in any future ringing-energy / ZVS panel
+    // (½·L·I_pk² hot-loop ring-down). Today the value is loaded and
+    // displayed; consumers (compute_losses, zvs_report) wire it in
+    // follow-on commits.
+    loaded_loop: Option<pdn_schema::LoopExtraction>,
+    loop_json_path: String,
+    loop_load_status: Option<Result<String, String>>,
+
     // ── UI state ─────────────────────────────────────────────────────────────
     converter_mode: ConverterMode,
     tab: Tab,
@@ -465,6 +475,9 @@ impl BuckSimApp {
             loaded_pdn: None,
             pdn_json_path: String::new(),
             pdn_load_status: None,
+            loaded_loop: None,
+            loop_json_path: String::new(),
+            loop_load_status: None,
             converter_mode: ConverterMode::BuckPcmc,
             tab: Tab::Simulation,
             plot_option: PlotOption::Average,
@@ -1452,6 +1465,8 @@ impl BuckSimApp {
             Tab::Simulation => self.show_simulation(ui),
             Tab::Bode => {
                 self.show_pdn_loader(ui);
+                self.show_loop_loader(ui);
+                self.show_board_hash_guard(ui);
                 match &self.bode_data {
                     Some(data) => show_bode(ui, data),
                     None => {
@@ -1562,6 +1577,132 @@ impl BuckSimApp {
         let n = sweep.freqs_hz.len();
         self.loaded_pdn = Some(sweep);
         Ok(format!("Loaded {} frequency points.", n))
+    }
+
+    /// Loader strip for the PEEC commutation-loop extraction
+    /// (`pdn_schema::LoopExtraction`). Produced by
+    /// `field_solver_cli loop-l --loop-export`. Surfaces L_self / R_DC
+    /// with provenance; future ZVS / ringing-energy code will read
+    /// `self.loaded_loop` to replace today's hard-coded fixtures.
+    fn show_loop_loader(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            match self.loaded_loop.as_ref() {
+                Some(l) => {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 180, 120),
+                        format!(
+                            "Loop: PEEC-extracted  (L = {:.3} nH, R_DC = {:.3} mΩ)",
+                            l.l_self_henry * 1e9,
+                            l.r_dc_ohm * 1e3,
+                        ),
+                    )
+                    .on_hover_text(format!(
+                        "{}\nfwd: {}\nret: {}",
+                        l.source, l.fwd_label, l.ret_label,
+                    ));
+                    if ui.button("Clear").clicked() {
+                        self.loaded_loop = None;
+                        self.loop_load_status = None;
+                    }
+                }
+                None => {
+                    ui.label("Loop: (no PEEC extraction loaded)");
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Loop JSON:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.loop_json_path)
+                    .desired_width(360.0)
+                    .hint_text("/path/to/loop_extraction.json"),
+            );
+            let load_clicked = ui.button("Load").clicked();
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = load_clicked;
+                ui.colored_label(
+                    Color32::GRAY,
+                    "(loading from disk is unavailable on the web build)",
+                );
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if load_clicked {
+                self.loop_load_status = Some(self.try_load_loop());
+            }
+        });
+
+        if let Some(status) = self.loop_load_status.as_ref() {
+            match status {
+                Ok(msg) => {
+                    ui.colored_label(Color32::from_rgb(120, 200, 120), msg);
+                }
+                Err(msg) => {
+                    ui.colored_label(Color32::from_rgb(255, 120, 120), msg);
+                }
+            }
+        }
+        ui.separator();
+    }
+
+    /// Native-only: read the JSON file at `self.loop_json_path`, parse
+    /// it as a `LoopExtraction`, and store it on the app.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn try_load_loop(&mut self) -> Result<String, String> {
+        let path = self.loop_json_path.trim();
+        if path.is_empty() {
+            return Err("Enter a path first.".into());
+        }
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {}", path, e))?;
+        let extraction = pdn_schema::LoopExtraction::from_json(&text)
+            .map_err(|e| format!("parse {}: {}", path, e))?;
+        if !(extraction.l_self_henry.is_finite() && extraction.l_self_henry >= 0.0) {
+            return Err(format!(
+                "Bad L_self_henry: {} (expected finite, non-negative)",
+                extraction.l_self_henry,
+            ));
+        }
+        let msg = format!(
+            "Loaded L = {:.3} nH, R_DC = {:.3} mΩ.",
+            extraction.l_self_henry * 1e9,
+            extraction.r_dc_ohm * 1e3,
+        );
+        self.loaded_loop = Some(extraction);
+        Ok(msg)
+    }
+
+    /// Provenance guard: warn if the loaded PDN sweep and loop
+    /// extraction were produced from different board exports (their
+    /// `board_hash` fields disagree). Easy to hit when iterating on a
+    /// board — re-run `pdn-export` but forget to re-run
+    /// `--loop-export`, mix sweeps from rev A with loop-L from rev B,
+    /// get plausible-looking garbage. Silent when only one (or
+    /// neither) source is loaded.
+    fn show_board_hash_guard(&mut self, ui: &mut egui::Ui) {
+        let pdn_h = self
+            .loaded_pdn
+            .as_ref()
+            .and_then(|s| s.board_hash.as_deref());
+        let loop_h = self
+            .loaded_loop
+            .as_ref()
+            .and_then(|l| l.board_hash.as_deref());
+        if let (Some(a), Some(b)) = (pdn_h, loop_h) {
+            if a != b {
+                ui.colored_label(
+                    Color32::from_rgb(255, 200, 80),
+                    format!(
+                        "⚠ board_hash mismatch: PDN={}  loop={}.  These came from \
+                         different board exports — re-run kicad_field_solver against \
+                         a single board snapshot.",
+                        a, b,
+                    ),
+                );
+                ui.separator();
+            }
+        }
     }
 
     fn show_pfc_params(&mut self, ui: &mut egui::Ui) {
