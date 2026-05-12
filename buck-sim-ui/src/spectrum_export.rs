@@ -19,20 +19,32 @@
 //!   up fsw and its harmonics — the dominant conducted-EM content
 //!   for a synchronous buck.
 //!
-//!   Two sub-modes: with `trapezoidal: false` the input current
-//!   has instantaneous transitions (perfect rectangular pulse). With
-//!   `trapezoidal: true` the HS turn-on ramps the input current 0 →
-//!   `i_L_min` over `SimParams.hs_fet.t_rise_ns` and the HS turn-off
-//!   ramps `i_L_max` → 0 over `t_fall_ns`. Trapezoidal mode
-//!   bandlimits the harmonic content above ~`1/(π·t_rise)`, the
-//!   dominant first-order effect distinguishing a real switching
-//!   spectrum from a perfect square wave. Note that the trapezoidal
-//!   model *reduces* the cycle-average input current — physically
-//!   correct, since at HS turn-on the input current rises from 0
-//!   rather than instantaneously jumping to `i_L_min` — so DC bin
-//!   readings move a few percent lower than the sharp-edge mode.
-//!   Models *do not* include commutation-loop ringing from
-//!   `LoopExtraction::l_self_henry`; that's a future enhancement.
+//!   Sub-modes:
+//!     - `trapezoidal: false` — instantaneous transitions (perfect
+//!       rectangular pulse).
+//!     - `trapezoidal: true` — finite-slope edges from
+//!       `SimParams.hs_fet.t_rise_ns / t_fall_ns`. Bandlimits the
+//!       harmonics above ~`1/(π·t_rise)`. (Cycle-average drops a
+//!       few percent vs sharp-edge mode — physically correct,
+//!       since at HS turn-on the input current rises from 0
+//!       rather than instantaneously jumping to `i_L_min`.)
+//!     - `ringing: Some(RingingParams)` — physics-based damped
+//!       sinusoid at the commutation-loop resonance after each HS
+//!       transition. Amplitude `V_step/(L·ω_d)` from the
+//!       step-response of a series RLC; decay `α = R/(2L)`. Picks
+//!       up the f_ring peak that the trapezoidal-only model
+//!       silently drops.
+//!     - `qrr_nc + trr_ns > 0` — LS body-diode reverse-recovery
+//!       triangle pulse of area Q_rr and base t_rr at HS turn-on.
+//!       Adds the broadband sinc content that real Si MOSFETs
+//!       inject on the input rail.
+//!
+//!   **Not modeled** (negligible relative to the above): Miller
+//!   plateau in the gate drive — it adds a brief constant-current
+//!   "shoulder" at i_L_min and i_L_max around each transition,
+//!   typically ~1 ns wide for modern Si/GaN FETs vs ~1 µs cycle
+//!   period (0.1% of the cycle). Spectral impact is well below the
+//!   ringing / Q_rr / input-cap effects.
 //!
 //! Both modes apply a Hann window over the steady-state half of the
 //! captured cycles, divide by the window's coherent gain so a pure
