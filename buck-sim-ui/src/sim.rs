@@ -1223,6 +1223,15 @@ pub struct LossBreakdown {
     pub ls_switching_w: f64,
     pub hs_eoss_w: f64,
     pub gate_drive_w: f64,
+    /// Commutation-loop ringing energy dissipated per second:
+    ///   P_ring = N · L · I_pk_per_phase² · f_sw
+    /// where L is the PEEC-extracted commutation-loop self-inductance
+    /// (from a `pdn_schema::LoopExtraction`) and I_pk_per_phase is the
+    /// per-phase peak inductor current. Each switching transition
+    /// stores ½·L·I² in the loop's stray L which then rings down into
+    /// loop R; both HS turn-on and HS turn-off contribute, so a full
+    /// L·I² per cycle. Zero when no LoopExtraction is loaded.
+    pub commutation_ringing_w: f64,
     pub total_loss_w: f64,
     pub p_out_w: f64,
     pub efficiency_pct: f64,
@@ -1232,7 +1241,15 @@ pub struct LossBreakdown {
 ///
 /// For Steps mode, uses cycles 1500–3000 (steady-state at nominal load before
 /// any load steps).  For Battery mode, uses the last 200 cycles.
-pub fn compute_losses(p: &SimParams, data: &[SimPoint]) -> Option<LossBreakdown> {
+///
+/// `l_commutation_loop_h` is the PEEC-extracted per-phase commutation-
+/// loop inductance (from a `pdn_schema::LoopExtraction`). Pass `None`
+/// to set the ringing-energy term to zero.
+pub fn compute_losses(
+    p: &SimParams,
+    data: &[SimPoint],
+    l_commutation_loop_h: Option<f64>,
+) -> Option<LossBreakdown> {
     if data.is_empty() {
         return None;
     }
@@ -1319,8 +1336,17 @@ pub fn compute_losses(p: &SimParams, data: &[SimPoint]) -> Option<LossBreakdown>
     let vgs = p.hs_fet.vgs_v.max(p.ls_fet.vgs_v);
     let gate_drive = qg_total * vgs * f_sw * n_phases;
 
+    // Commutation-loop ringing. Each switching transition stores
+    // ½·L·I_pk_per_phase² in the loop's stray L, dissipated in loop
+    // R during the ring-down. Two transitions per cycle → L·I²·f_sw
+    // per loop; one loop per phase → multiply by n_phases.
+    let commutation_ringing = match l_commutation_loop_h {
+        Some(l) if l > 0.0 => l * avg_i_max * avg_i_max * f_sw * n_phases,
+        _ => 0.0,
+    };
+
     let total_loss = hs_conduction + ls_conduction + inductor_dcr
-        + hs_switching + ls_switching + hs_eoss + gate_drive;
+        + hs_switching + ls_switching + hs_eoss + gate_drive + commutation_ringing;
     let p_out = avg_v_out * avg_i_total;
     let efficiency = if p_out + total_loss > 0.0 {
         p_out / (p_out + total_loss) * 100.0
@@ -1336,6 +1362,7 @@ pub fn compute_losses(p: &SimParams, data: &[SimPoint]) -> Option<LossBreakdown>
         ls_switching_w: ls_switching,
         hs_eoss_w: hs_eoss,
         gate_drive_w: gate_drive,
+        commutation_ringing_w: commutation_ringing,
         total_loss_w: total_loss,
         p_out_w: p_out,
         efficiency_pct: efficiency,
@@ -1849,7 +1876,7 @@ mod tests {
         p.ls_fet = FetProfile::epc2306();
         p.dcr_mohm = 4.1;
         let data = run_simulation(&p).expect("sim should succeed");
-        let lb = compute_losses(&p, &data).expect("losses should compute");
+        let lb = compute_losses(&p, &data, None).expect("losses should compute");
         assert!(lb.total_loss_w > 0.0, "total loss should be positive");
         assert!(lb.p_out_w > 0.0, "output power should be positive");
         assert!(lb.efficiency_pct > 0.0 && lb.efficiency_pct < 100.0,
@@ -1865,7 +1892,7 @@ mod tests {
     fn compute_losses_ideal_fets_zero_switching() {
         let p = test_params(); // Ideal FETs
         let data = run_simulation(&p).expect("sim should succeed");
-        let lb = compute_losses(&p, &data).expect("losses should compute");
+        let lb = compute_losses(&p, &data, None).expect("losses should compute");
         // Ideal FETs: no switching losses, no gate drive, no Rds(on) conduction
         assert!(lb.hs_conduction_w.abs() < 1e-12, "Ideal HS should have zero conduction loss");
         assert!(lb.ls_conduction_w.abs() < 1e-12, "Ideal LS should have zero conduction loss");

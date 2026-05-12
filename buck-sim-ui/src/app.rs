@@ -438,7 +438,10 @@ fn clear_storage() {}
 impl BuckSimApp {
     fn from_params(p: SimParams, presets: SavedPresets) -> Self {
         let sim_data = run_simulation(&p);
-        let loss_breakdown = sim_data.as_ref().ok().and_then(|d| compute_losses(&p, d));
+        // At construction we don't yet have `loaded_loop`, so ringing
+        // is zero on the first paint; it picks up the PEEC value on
+        // the next `update` call once the user has loaded the JSON.
+        let loss_breakdown = sim_data.as_ref().ok().and_then(|d| compute_losses(&p, d, None));
         let bode_data = build_bode(&p, None);
         Self {
             v_in: p.v_in,
@@ -1325,6 +1328,18 @@ impl BuckSimApp {
                             ui.label(egui::RichText::new(format!("  LS overlap: {}", fmt_mw(lb.ls_switching_w))).small().monospace());
                             ui.label(egui::RichText::new(format!("  Eoss:       {}", fmt_mw(lb.hs_eoss_w))).small().monospace());
                             ui.label(egui::RichText::new(format!("  Gate drive: {}", fmt_mw(lb.gate_drive_w))).small().monospace());
+                            // Commutation-loop ringing — only meaningful when a
+                            // PEEC LoopExtraction is loaded; reads as 0 W otherwise.
+                            let ring_label = format!(
+                                "  Ringing:    {}{}",
+                                fmt_mw(lb.commutation_ringing_w),
+                                if self.loaded_loop.is_some() {
+                                    ""
+                                } else {
+                                    " (load a LoopExtraction)"
+                                },
+                            );
+                            ui.label(egui::RichText::new(ring_label).small().monospace());
                             ui.separator();
                             ui.label(egui::RichText::new(format!("Total loss:   {}", fmt_mw(lb.total_loss_w))).monospace());
                             ui.label(egui::RichText::new(format!("P_out:        {:.2} W", lb.p_out_w)).monospace());
@@ -1462,7 +1477,12 @@ impl BuckSimApp {
         let params = self.current_params();
         if params != self.last_params {
             self.sim_data = run_simulation(&params);
-            self.loss_breakdown = self.sim_data.as_ref().ok().and_then(|d| compute_losses(&params, d));
+            let l_loop_h = self.loaded_loop.as_ref().map(|l| l.l_self_henry);
+            self.loss_breakdown = self
+                .sim_data
+                .as_ref()
+                .ok()
+                .and_then(|d| compute_losses(&params, d, l_loop_h));
             self.bode_data = build_bode(&params, self.loaded_pdn.as_ref());
             self.last_params = params;
             save_to_storage(&self.to_settings());
