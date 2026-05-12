@@ -166,24 +166,47 @@ impl FetProfile {
     }
 
     pub fn epc23102() -> Self {
-        // EPC23102 — 100 V eGaN half-bridge with integrated gate
-        // drivers in a single QFN. Datasheet not currently in the
-        // repo; values below are representative for the EPC2310x
-        // family with integrated driver. Update once a local copy
-        // of the datasheet is checked in.
+        // EPC23102 — 100 V ePower Stage IC (integrated half-bridge
+        // eGaN driver + HS/LS FETs in one MSL1 QFN).
+        // Source: EPC23102 datasheet, revised 2026-02-11.
+        // Electrical Characteristics @ V_IN = 48 V, V_DRV = V_DD = 5 V.
+        //
+        // HS C_OSS = 342 pF typ, LS C_OSS = 404 pF typ at V_IN = 48 V
+        // (the datasheet specifies them separately because the
+        // package has different routing per side). The single
+        // `coss_pf` field here is the average — close enough for
+        // ringing-model purposes; the app's
+        // `0.5 · (hs_fet.coss_pf + ls_fet.coss_pf)` reduction
+        // already averages them again identically.
+        //
+        // qg_nc: gate-drive supply current at 1 MHz, 50 % duty
+        // (incl. bootstrap charging) is 34 mA → Q_total_per_cycle =
+        // 34 nC → 17 nC per FET (the loss calc sums HS + LS).
+        //
+        // t_rise / t_fall: SW node 0→48 V transition with
+        // R_BOOT = 4.7 Ω in hard-switching buck mode (datasheet
+        // line t_rise_SW_HS4.7). The 1 ns "fastest" figure with
+        // R_BOOT = 0 Ω is also published — pick the slower entry
+        // as the realistic case since most users add a small bootstrap
+        // resistor for ringing control.
+        //
+        // qgd_nc / rg_ohm / v_miller_v: set to 0 because the IC's
+        // t_rise/t_fall already *include* the Miller plateau —
+        // there's no external gate access to overlay a separate
+        // plateau model without double-counting.
         Self {
             name: "EPC23102".into(),
-            rds_on_mohm: 5.2,
-            coss_pf: 370.0,
-            qg_nc: 12.0,         // family-typical total gate charge
-            vgs_v: 5.0,
-            t_rise_ns: 2.0,
-            t_fall_ns: 2.0,
+            rds_on_mohm: 5.2,    // HS / LS both 5.2 mΩ typ
+            coss_pf: 373.0,      // (342 + 404) / 2
+            qg_nc: 17.0,         // 34 nC IC total / 2 FETs
+            vgs_v: 5.0,          // V_DRV recommended
+            t_rise_ns: 3.0,      // t_rise_SW_HS4.7 (buck, hard switching)
+            t_fall_ns: 3.0,
             qrr_nc: 0.0,         // eGaN: no body diode
             trr_ns: 0.0,
-            qgd_nc: 3.0,         // family-typical Q_GD (larger die than EPC2306)
-            rg_ohm: 1.0,         // integrated driver — total gate-loop impedance
-            v_miller_v: 2.2,     // typical for eGaN at I_D ~ 25 A
+            qgd_nc: 0.0,         // Miller already in t_rise/t_fall
+            rg_ohm: 0.0,         // no external R_g access on the IC
+            v_miller_v: 0.0,
         }
     }
 

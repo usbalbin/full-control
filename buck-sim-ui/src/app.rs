@@ -1833,12 +1833,18 @@ impl BuckSimApp {
         let ringing = self.loaded_loop.as_ref().map(|l| RingingParams {
             l_loop_h: l.l_self_henry,
             r_loop_ohm: l.r_dc_ohm,
-            // FET output cap in parallel during the commutation
-            // transition (the loop sees HS Coss in series with LS
-            // Coss at the moment of switching — for similar FETs
-            // that's ≈ Coss/2; for asymmetric pairs use the average).
-            c_oss_total_f: 0.5 * (self.last_params.hs_fet.coss_pf
-                + self.last_params.ls_fet.coss_pf)
+            // After HS turn-on, the loop closes through the
+            // conducting HS (low Z) and LS_Coss; after HS turn-off,
+            // through HS_Coss and conducting LS. The ringing
+            // alternates between these two C values per cycle, so
+            // the AVERAGE of HS and LS C_oss is the right
+            // single-number value for the RLC resonance — *not*
+            // their sum (those Coss are never both in the loop at
+            // the same time) nor their series combination (that
+            // would only apply during the brief deadtime when both
+            // FETs are off).
+            c_oss_total_f: 0.5
+                * (self.last_params.hs_fet.coss_pf + self.last_params.ls_fet.coss_pf)
                 * 1e-12,
             v_step_v: self.last_params.v_in,
         });
