@@ -46,6 +46,76 @@ use std::f64::consts::PI;
 
 use crate::sim::{SimParams, SimPoint};
 
+/// Physics-based commutation-loop ringing model. At each HS
+/// transition the loop sees a voltage step of magnitude `V_step`
+/// (≈ V_in for a buck — the switch-node voltage moves between 0 and
+/// V_in, and the integral of that delta across the loop's stray L
+/// is what drives the ring). The loop's L, R, and the FETs' Coss
+/// form a series RLC; its step response is
+///
+///     i_ring(t) = (V_step / (L · ω_d)) · exp(-α·t) · sin(ω_d·t)
+///
+/// with `ω_n² = 1/(LC)`, `α = R/(2L)`, `ω_d² = ω_n² - α²`. The
+/// peak amplitude `V_step/(L·ω_d)` is derived from physics; no
+/// fudge factor.
+///
+/// For HS turn-on the transient is added to the input current
+/// (rising edge); for HS turn-off the same shape is added with the
+/// opposite sign on the falling edge.
+///
+/// Over-damped systems (`α² ≥ ω_n²` → `R ≥ 2·√(L/C)`) → waveform
+/// returns 0. Typical hard-switched buck has R_loop ≪ 2√(L/C) so
+/// the system is deeply under-damped and Q ≈ √(L/C)/R is hundreds.
+#[derive(Debug, Clone, Copy)]
+pub struct RingingParams {
+    pub l_loop_h: f64,
+    pub r_loop_ohm: f64,
+    pub c_oss_total_f: f64,
+    /// Voltage step at each transition (typically V_in).
+    pub v_step_v: f64,
+}
+
+impl RingingParams {
+    fn omega_n_sq(&self) -> f64 {
+        1.0 / (self.l_loop_h * self.c_oss_total_f)
+    }
+    fn alpha(&self) -> f64 {
+        self.r_loop_ohm / (2.0 * self.l_loop_h)
+    }
+    fn omega_d_sq(&self) -> f64 {
+        self.omega_n_sq() - self.alpha().powi(2)
+    }
+    /// Damped resonance frequency. 0 → over-damped (no ring).
+    pub fn f_ring_hz(&self) -> f64 {
+        let wd2 = self.omega_d_sq();
+        if wd2 > 0.0 {
+            wd2.sqrt() / (2.0 * std::f64::consts::PI)
+        } else {
+            0.0
+        }
+    }
+    /// Q factor of the resonator. `Q = (1/R)·√(L/C)` for series RLC.
+    pub fn q_factor(&self) -> f64 {
+        if self.r_loop_ohm > 0.0 {
+            (self.l_loop_h / self.c_oss_total_f).sqrt() / self.r_loop_ohm
+        } else {
+            f64::INFINITY
+        }
+    }
+    /// Step-response current at `t_s` seconds after a `+V_step`
+    /// voltage step. Amplitude is `V_step / (L·ω_d)`; multiply by
+    /// the caller's sign to handle HS turn-off.
+    fn waveform(&self, t_s: f64, sign: f64) -> f64 {
+        let wd2 = self.omega_d_sq();
+        if wd2 <= 0.0 || t_s < 0.0 {
+            return 0.0;
+        }
+        let wd = wd2.sqrt();
+        let amp = self.v_step_v / (self.l_loop_h * wd);
+        sign * amp * (-self.alpha() * t_s).exp() * (wd * t_s).sin()
+    }
+}
+
 /// Reconstruction strategy. See module docs.
 #[derive(Debug, Clone, Copy)]
 pub enum ExportMode {
@@ -57,9 +127,25 @@ pub enum ExportMode {
     /// and bandlimit the harmonics above ~`1/(π·t_rise)`, which is
     /// the dominant first-order effect that distinguishes a real
     /// switching spectrum from a perfect square wave.
+    ///
+    /// `ringing` superimposes a damped sinusoid at the commutation-
+    /// loop resonance `1/(2π√(L_loop·C_oss))` after each HS
+    /// transition. Adds a spectral peak at `f_ring` that the
+    /// trapezoidal-only model misses. Requires a `LoopExtraction` to
+    /// be loaded (for `L_loop`, `R_loop`).
+    ///
+    /// `qrr_nc > 0` adds a body-diode reverse-recovery di/dt spike
+    /// at HS turn-on — a triangular current pulse of area `Q_rr`
+    /// and base `t_rr` centered on the rising edge, peak
+    /// `2·Q_rr/t_rr`. Adds positive current at the HS drain (the
+    /// stored body-diode charge is pulled *through* HS as the
+    /// switch node moves up). Set both to 0 for GaN HEMTs.
     PwmReconstructed {
         samples_per_cycle: u32,
         trapezoidal: bool,
+        ringing: Option<RingingParams>,
+        qrr_nc: f64,
+        trr_ns: f64,
     },
 }
 
@@ -110,16 +196,15 @@ pub fn export_input_current_spectrum(
         ExportMode::PwmReconstructed {
             samples_per_cycle,
             trapezoidal,
+            ringing,
+            qrr_nc,
+            trr_ns,
         } => {
             if samples_per_cycle < 4 {
                 return Err("samples_per_cycle must be >= 4".into());
             }
             let m = samples_per_cycle as usize;
             let t_sw_s = 1.0 / fsw;
-            // Trapezoidal edges from SimParams.hs_fet rise/fall.
-            // Clamp to ≤ 25 % of the cycle each so an absurd
-            // rise+fall doesn't exceed the on-time and produce
-            // ill-defined geometry.
             let (t_rise_s, t_fall_s) = if trapezoidal {
                 let r = (p.hs_fet.t_rise_ns * 1e-9).max(0.0);
                 let f = (p.hs_fet.t_fall_ns * 1e-9).max(0.0);
@@ -127,8 +212,37 @@ pub fn export_input_current_spectrum(
             } else {
                 (0.0, 0.0)
             };
+            let qrr_c = (qrr_nc * 1e-9).max(0.0);
+            // Recovery time t_rr from datasheet. If unset (0) but
+            // Q_rr is > 0, fall back to 20 ns — typical for slower
+            // Si MOSFETs — so the pulse remains sampleable.
+            let t_rr_s = if trr_ns > 0.0 {
+                (trr_ns * 1e-9).min(0.5 * t_sw_s)
+            } else if qrr_c > 0.0 {
+                20e-9
+            } else {
+                0.0
+            };
+
+            // Collect every HS transition's absolute time + step
+            // sign within the capture window. HS turn-on midpoint
+            // gets +V_step; HS turn-off midpoint gets -V_step.
+            // Used by the ringing model to drop a damped sinusoid
+            // at each one.
+            let mut transitions: Vec<(f64, f64)> = Vec::new();
+            // Cap how far back we look for active rings — after
+            // 8/α the amplitude is below 0.03 %, contribution
+            // negligible; for over-damped (α=0) skip the cap.
+            let ring_decay_window_s = ringing
+                .and_then(|r| {
+                    let a = r.alpha();
+                    if a > 0.0 { Some(8.0 / a) } else { None }
+                })
+                .unwrap_or(f64::INFINITY);
+
             let mut s: Vec<f64> = Vec::with_capacity(m * cycles.len());
-            for c in cycles {
+            for (cyc_idx, c) in cycles.iter().enumerate() {
+                let cycle_start_s = (cyc_idx as f64) * t_sw_s;
                 let duty = (c.duty_pct_avg() as f64 / 100.0).clamp(0.0, 1.0);
                 let n_phases = c.phases.len().max(1) as f64;
                 let i_min = c.i_total_min as f64 / n_phases;
@@ -136,12 +250,24 @@ pub fn export_input_current_spectrum(
                 let t_on_s = duty * t_sw_s;
                 let t_flat_start = t_rise_s.min(t_on_s);
                 let t_flat_end = (t_on_s - t_fall_s).max(t_flat_start);
+
+                if duty > 0.0 && ringing.is_some() {
+                    // HS turn-on midpoint (start of "switch node is
+                    // up" → +V_step on the loop).
+                    transitions.push((cycle_start_s + t_flat_start * 0.5, 1.0));
+                    // HS turn-off midpoint.
+                    let toff_mid = t_flat_end + (t_on_s - t_flat_end) * 0.5;
+                    transitions.push((cycle_start_s + toff_mid, -1.0));
+                }
+
                 for k in 0..m {
                     let tau_s = (k as f64) / (m as f64) * t_sw_s;
-                    let v = if duty <= 0.0 {
+                    let abs_t = cycle_start_s + tau_s;
+
+                    // 1. Trapezoidal base.
+                    let mut v = if duty <= 0.0 {
                         0.0
                     } else if tau_s < t_flat_start {
-                        // Rising edge: linear ramp 0 → i_min.
                         let frac = if t_flat_start > 0.0 {
                             tau_s / t_flat_start
                         } else {
@@ -149,19 +275,46 @@ pub fn export_input_current_spectrum(
                         };
                         frac * i_min
                     } else if tau_s < t_flat_end {
-                        // HS conducting; inductor ramps i_min → i_max.
                         let denom = (t_flat_end - t_flat_start).max(1e-18);
                         let frac = ((tau_s - t_flat_start) / denom).clamp(0.0, 1.0);
                         i_min + frac * (i_max - i_min)
                     } else if tau_s < t_on_s {
-                        // Falling edge: linear ramp i_max → 0.
                         let denom = (t_on_s - t_flat_end).max(1e-18);
                         let frac = ((tau_s - t_flat_end) / denom).clamp(0.0, 1.0);
                         i_max * (1.0 - frac)
                     } else {
-                        // HS off.
                         0.0
                     };
+
+                    // 2. Body-diode reverse-recovery (LS Qrr). Adds
+                    // a centered-triangle current pulse of area q_rr_c
+                    // and base width t_rr across the HS-on transition.
+                    // Triangle is centered on the rising-edge midpoint
+                    // (t_rise/2) — physically the recovery peaks as
+                    // the switch node hits its midpoint dV/dt.
+                    if duty > 0.0 && qrr_c > 0.0 && t_rr_s > 0.0 {
+                        let center = t_rise_s.max(t_rr_s) * 0.5;
+                        let half_w = t_rr_s * 0.5;
+                        if (tau_s - center).abs() < half_w {
+                            let peak = 2.0 * qrr_c / t_rr_s;
+                            let dist = (tau_s - center).abs();
+                            v += peak * (1.0 - dist / half_w);
+                        }
+                    }
+
+                    // 3. Commutation-loop ringing. Sum step-response
+                    // contributions from every transition within the
+                    // decay window.
+                    if let Some(r) = ringing.as_ref() {
+                        for &(t_event, sign) in &transitions {
+                            let dt = abs_t - t_event;
+                            if dt < 0.0 || dt > ring_decay_window_s {
+                                continue;
+                            }
+                            v += r.waveform(dt, sign);
+                        }
+                    }
+
                     // Multiply by num_phases to recover the
                     // interleaved-sum input current seen by the
                     // shared input cap.
@@ -176,12 +329,26 @@ pub fn export_input_current_spectrum(
             } else {
                 ",trapezoidal=off".to_string()
             };
+            let ringing_tag = if let Some(r) = ringing.as_ref() {
+                format!(
+                    ",ringing=f_ring={:.2}MHz_Q={:.1}",
+                    r.f_ring_hz() / 1e6,
+                    r.q_factor(),
+                )
+            } else {
+                ",ringing=off".to_string()
+            };
+            let qrr_tag = if qrr_c > 0.0 {
+                format!(",qrr={:.2}nC_trr={:.1}ns", qrr_nc, t_rr_s * 1e9)
+            } else {
+                ",qrr=off".to_string()
+            };
             (
                 s,
                 fsw * m as f64,
                 format!(
-                    "mode=pwm-reconstructed,samples_per_cycle={}{}",
-                    m, edge_tag,
+                    "mode=pwm-reconstructed,samples_per_cycle={}{}{}{}",
+                    m, edge_tag, ringing_tag, qrr_tag,
                 ),
             )
         }
@@ -310,6 +477,142 @@ mod tests {
     }
 
     #[test]
+    fn ringing_params_physics_sanity() {
+        // L=5 nH, R=1 mΩ, C=600 pF → f_ring ≈ 92 MHz,
+        // Q = √(L/C)/R = √(5e-9/600e-12) / 1e-3 ≈ 2887.
+        let r = RingingParams {
+            l_loop_h: 5e-9,
+            r_loop_ohm: 1e-3,
+            c_oss_total_f: 600e-12,
+            v_step_v: 12.0,
+        };
+        let f = r.f_ring_hz();
+        assert!(
+            (f - 92e6).abs() / 92e6 < 0.05,
+            "f_ring should be ~92 MHz, got {} Hz",
+            f
+        );
+        assert!(r.q_factor() > 1000.0, "Q={}; should be >>1", r.q_factor());
+        // At t=0 the waveform is sin(0)=0; sample at quarter period
+        // to hit the peak overshoot.
+        let t_quarter = 1.0 / (4.0 * f);
+        let peak_expected = r.v_step_v / (r.l_loop_h * 2.0 * std::f64::consts::PI * f);
+        let measured = r.waveform(t_quarter, 1.0);
+        // Light damping → measured peak should be within a few %
+        // of the undamped V/(Lω) amplitude.
+        assert!(
+            (measured - peak_expected).abs() / peak_expected < 0.05,
+            "ring peak {} should be ~{} A (V/Lω at quarter period)",
+            measured,
+            peak_expected,
+        );
+    }
+
+    #[test]
+    fn pwm_ringing_adds_peak_at_f_ring() {
+        // 64 cycles × 256 samples/cycle = 16384 samples at 128 MHz
+        // (m × fsw = 256 × 500 kHz). Nyquist 64 MHz, so the test
+        // f_ring at ~30 MHz is comfortably in band.
+        let stream = const_stream(64, 0.5, 10.0);
+        // Pick L/C for f_ring = 30 MHz: ω² = 1/LC = (2π·30e6)² →
+        // LC = 2.81e-17; pick L=10 nH → C = 2.81e-9 F. C is much
+        // bigger than realistic Coss, but gives an isolated test
+        // bin we can target unambiguously.
+        let ring = RingingParams {
+            l_loop_h: 10e-9,
+            r_loop_ohm: 1e-3,
+            c_oss_total_f: 2.81e-9,
+            v_step_v: 12.0,
+        };
+        let spec_no_ring = export_input_current_spectrum(
+            &stream,
+            &default_params(),
+            ExportMode::PwmReconstructed {
+                samples_per_cycle: 256,
+                trapezoidal: true,
+                ringing: None,
+                qrr_nc: 0.0,
+                trr_ns: 0.0,
+            },
+        )
+        .unwrap();
+        let spec_ring = export_input_current_spectrum(
+            &stream,
+            &default_params(),
+            ExportMode::PwmReconstructed {
+                samples_per_cycle: 256,
+                trapezoidal: true,
+                ringing: Some(ring),
+                qrr_nc: 0.0,
+                trr_ns: 0.0,
+            },
+        )
+        .unwrap();
+        let mag = |s: &PortCurrentSpectrum, k: usize| {
+            (s.i_re_amp[k].powi(2) + s.i_im_amp[k].powi(2)).sqrt()
+        };
+        let bin_step = spec_ring.freqs_hz[1] - spec_ring.freqs_hz[0];
+        let k_ring = (ring.f_ring_hz() / bin_step).round() as usize;
+        let mag_at_fring_no_ring = mag(&spec_no_ring, k_ring);
+        let mag_at_fring_ring = mag(&spec_ring, k_ring);
+        assert!(
+            mag_at_fring_ring > 3.0 * mag_at_fring_no_ring,
+            "ringing should boost f_ring bin: ring={} vs no_ring={}",
+            mag_at_fring_ring,
+            mag_at_fring_no_ring,
+        );
+    }
+
+    #[test]
+    fn qrr_spike_adds_high_harmonic_content() {
+        let stream = const_stream(64, 0.5, 10.0);
+        let spec_no_qrr = export_input_current_spectrum(
+            &stream,
+            &default_params(),
+            ExportMode::PwmReconstructed {
+                samples_per_cycle: 256,
+                trapezoidal: true,
+                ringing: None,
+                qrr_nc: 0.0,
+                trr_ns: 0.0,
+            },
+        )
+        .unwrap();
+        let spec_qrr = export_input_current_spectrum(
+            &stream,
+            &default_params(),
+            ExportMode::PwmReconstructed {
+                samples_per_cycle: 256,
+                trapezoidal: true,
+                ringing: None,
+                qrr_nc: 100.0, // 100 nC — typical Si MOSFET body diode
+                trr_ns: 30.0,  // 30 ns recovery — typical t_rr
+            },
+        )
+        .unwrap();
+        // Sum magnitude² across the 5–30 MHz band. A narrow Qrr
+        // triangle has broadband sinc content that lifts the
+        // mid-band energy.
+        let band_energy = |s: &PortCurrentSpectrum| -> f64 {
+            let mut e = 0.0;
+            for (i, &f) in s.freqs_hz.iter().enumerate() {
+                if (5e6..=30e6).contains(&f) {
+                    e += s.i_re_amp[i].powi(2) + s.i_im_amp[i].powi(2);
+                }
+            }
+            e
+        };
+        let e_no = band_energy(&spec_no_qrr);
+        let e_qrr = band_energy(&spec_qrr);
+        assert!(
+            e_qrr > 1.5 * e_no,
+            "Qrr should raise 5–30 MHz energy: with={}, without={}",
+            e_qrr,
+            e_no,
+        );
+    }
+
+    #[test]
     fn pwm_constant_stream_shows_fsw_harmonic_peak() {
         // 64 cycles, 32 samples/cycle → 2048 total samples; fsw at
         // bin index 64 of the one-sided 1025-bin spectrum.
@@ -320,6 +623,9 @@ mod tests {
             ExportMode::PwmReconstructed {
                 samples_per_cycle: 32,
                 trapezoidal: false,
+                ringing: None,
+                qrr_nc: 0.0,
+                trr_ns: 0.0,
             },
         )
         .unwrap();
@@ -372,6 +678,9 @@ mod tests {
             ExportMode::PwmReconstructed {
                 samples_per_cycle: m,
                 trapezoidal: false,
+                ringing: None,
+                qrr_nc: 0.0,
+                trr_ns: 0.0,
             },
         )
         .unwrap();
@@ -381,6 +690,9 @@ mod tests {
             ExportMode::PwmReconstructed {
                 samples_per_cycle: m,
                 trapezoidal: true,
+                ringing: None,
+                qrr_nc: 0.0,
+                trr_ns: 0.0,
             },
         )
         .unwrap();

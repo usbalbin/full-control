@@ -79,6 +79,21 @@ pub struct FetProfile {
     pub vgs_v: f64,        // Gate drive voltage [V]
     pub t_rise_ns: f64,    // Current rise time [ns] — for V×I overlap loss
     pub t_fall_ns: f64,    // Current fall time [ns] — for V×I overlap loss
+    /// Body-diode reverse-recovery charge [nC]. Datasheet Q_rr.
+    /// Drives the di/dt spike on the input current at HS turn-on
+    /// (the LS body diode discharges Q_rr through HS as the switch
+    /// node is pulled up — a transient current spike of area Q_rr
+    /// adds to the rising edge). Zero for GaN HEMTs (no body diode).
+    #[serde(default)]
+    pub qrr_nc: f64,
+    /// Body-diode reverse-recovery time [ns]. Datasheet t_rr. Sets
+    /// the width of the Q_rr triangular pulse on the input current
+    /// at HS turn-on. Together with `qrr_nc` they pin both the
+    /// triangle's area (Q_rr) and base (t_rr), so the peak is
+    /// `2·Q_rr / t_rr`. Datasheet values: Si MOSFETs ~10–100 ns;
+    /// GaN HEMTs have no body diode → set both to 0.
+    #[serde(default)]
+    pub trr_ns: f64,
 }
 
 impl FetProfile {
@@ -91,10 +106,15 @@ impl FetProfile {
             vgs_v: 5.0,
             t_rise_ns: 0.0,
             t_fall_ns: 0.0,
+            qrr_nc: 0.0,
+            trr_ns: 0.0,
         }
     }
 
     pub fn epc2306() -> Self {
+        // EPC2306 GaN: no body diode → Q_rr ≈ 0. (eGaN HEMTs have a
+        // ~0 reverse-conduction stored charge; the input-current spike
+        // comes only from i_L, not from a body-diode recovery.)
         Self {
             name: "EPC2306".into(),
             rds_on_mohm: 3.1,
@@ -103,6 +123,8 @@ impl FetProfile {
             vgs_v: 5.0,
             t_rise_ns: 1.5,
             t_fall_ns: 1.5,
+            qrr_nc: 0.0,
+            trr_ns: 0.0,
         }
     }
 
@@ -115,6 +137,8 @@ impl FetProfile {
             vgs_v: 5.0,
             t_rise_ns: 2.0,
             t_fall_ns: 2.0,
+            qrr_nc: 0.0,
+            trr_ns: 0.0,
         }
     }
 

@@ -6,7 +6,7 @@ use crate::bode::{BodeData, NonIdealParams, show_bode};
 use crate::pfc_bode::{PfcBodeData, show_pfc_bode};
 use crate::pfc_sim::{PfcSimParams, PfcSimPoint, PfcMetrics, PfcControlMode, PfcTopology, run_pfc_simulation, run_pfc_vin_sweep, SOFT_START_HALF_CYCLES};
 use crate::sim::{CapTypeUi, CurrentConduction, FetProfile, McuProfile, CsProfile, DacProfile, LossBreakdown, LoadKind, SimParams, SimPoint, build_ctrl_params_multi, compute_losses, computed_r_series_mohm, run_simulation, SOFT_START_CYCLES, STEADY_STATE_CYCLES, LOAD_STEP_CYCLES};
-use crate::spectrum_export::{export_input_current_spectrum, ExportMode};
+use crate::spectrum_export::{export_input_current_spectrum, ExportMode, RingingParams};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ConverterMode {
@@ -1764,6 +1764,39 @@ impl BuckSimApp {
                 self.spectrum_export_status = Some(self.try_export_spectrum());
             }
         });
+        // Physics-derived ringing readout when LoopExtraction is loaded.
+        // Shows the user f_ring and Q so they can sanity-check the
+        // commutation-loop model that's about to be folded into the
+        // exported spectrum.
+        if let Some(l) = self.loaded_loop.as_ref() {
+            let c_oss_total_f =
+                0.5 * (self.last_params.hs_fet.coss_pf + self.last_params.ls_fet.coss_pf) * 1e-12;
+            let r = RingingParams {
+                l_loop_h: l.l_self_henry,
+                r_loop_ohm: l.r_dc_ohm,
+                c_oss_total_f,
+                v_step_v: self.last_params.v_in,
+            };
+            let f_ring = r.f_ring_hz();
+            let q = r.q_factor();
+            let line = if f_ring > 0.0 {
+                format!(
+                    "Ringing model: f_ring = {:.2} MHz, Q = {:.0} (L = {:.2} nH, \
+                     C_oss/2 = {:.0} pF, V_step = {:.1} V).",
+                    f_ring / 1e6,
+                    q,
+                    l.l_self_henry * 1e9,
+                    c_oss_total_f * 1e12,
+                    self.last_params.v_in,
+                )
+            } else {
+                format!(
+                    "Ringing model: over-damped (no resonance peak; R={:.3} mΩ ≥ 2·√(L/C))",
+                    l.r_dc_ohm * 1e3,
+                )
+            };
+            ui.colored_label(Color32::from_rgb(255, 180, 120), line);
+        }
         if let Some(status) = self.spectrum_export_status.as_ref() {
             match status {
                 Ok(msg) => {
@@ -1787,10 +1820,27 @@ impl BuckSimApp {
             return Err("Enter an output path first.".into());
         }
         let data = self.sim_data.as_ref().map_err(|e| e.clone())?;
+        let ringing = self.loaded_loop.as_ref().map(|l| RingingParams {
+            l_loop_h: l.l_self_henry,
+            r_loop_ohm: l.r_dc_ohm,
+            // FET output cap in parallel during the commutation
+            // transition (the loop sees HS Coss in series with LS
+            // Coss at the moment of switching — for similar FETs
+            // that's ≈ Coss/2; for asymmetric pairs use the average).
+            c_oss_total_f: 0.5 * (self.last_params.hs_fet.coss_pf
+                + self.last_params.ls_fet.coss_pf)
+                * 1e-12,
+            v_step_v: self.last_params.v_in,
+        });
         let mode = if self.spectrum_use_pwm {
             ExportMode::PwmReconstructed {
                 samples_per_cycle: self.spectrum_pwm_samples_per_cycle,
                 trapezoidal: self.spectrum_pwm_trapezoidal,
+                ringing,
+                // LS body-diode Q_rr drives the input spike at HS
+                // turn-on.
+                qrr_nc: self.last_params.ls_fet.qrr_nc,
+                trr_ns: self.last_params.ls_fet.trr_ns,
             }
         } else {
             ExportMode::Envelope
