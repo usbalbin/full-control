@@ -5,6 +5,7 @@ pub mod pdn;
 pub mod pfc_bode;
 pub mod pfc_sim;
 pub mod sim;
+pub mod spectrum_export;
 pub mod zvs;
 
 #[cfg(target_arch = "wasm32")]

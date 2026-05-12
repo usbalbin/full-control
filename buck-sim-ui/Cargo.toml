@@ -17,7 +17,11 @@ text-log = []
 [dependencies]
 electronics-sim = { path = "../electronics-sim", default-features = false }
 full-control    = { path = "../full-control",    default-features = false, features = ["std"] }
-pdn-schema      = { path = "../../kicad_field_solver/pdn_schema" }
+# Temporarily points at the `closed-loop-emc` worktree until those
+# pdn_schema additions (PortCurrentSpectrum, CurrentDensityField,
+# ControllerFlavor) land on main in `../../kicad_field_solver`.
+# Revert to `../../kicad_field_solver/pdn_schema` after the merge.
+pdn-schema      = { path = "../../kicad_field_solver-closed-loop-emc/pdn_schema" }
 
 # egui + eframe + egui_plot must use the same major.minor version.
 eframe    = { version = "0.33", features = ["glow"] }
@@ -26,6 +30,10 @@ egui_plot = "0.34"
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Power-of-2 + mixed-radix FFTs for the switching-current spectrum
+# export. Pure-Rust, wasm-compatible, ~30 KB compiled. Used by
+# `spectrum_export::*` only.
+rustfft    = { version = "6", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen         = "0.2"

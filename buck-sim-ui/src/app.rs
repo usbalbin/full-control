@@ -6,6 +6,7 @@ use crate::bode::{BodeData, NonIdealParams, show_bode};
 use crate::pfc_bode::{PfcBodeData, show_pfc_bode};
 use crate::pfc_sim::{PfcSimParams, PfcSimPoint, PfcMetrics, PfcControlMode, PfcTopology, run_pfc_simulation, run_pfc_vin_sweep, SOFT_START_HALF_CYCLES};
 use crate::sim::{CapTypeUi, CurrentConduction, FetProfile, McuProfile, CsProfile, DacProfile, LossBreakdown, LoadKind, SimParams, SimPoint, build_ctrl_params_multi, compute_losses, computed_r_series_mohm, run_simulation, SOFT_START_CYCLES, STEADY_STATE_CYCLES, LOAD_STEP_CYCLES};
+use crate::spectrum_export::{export_input_current_spectrum, ExportMode};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ConverterMode {
@@ -112,6 +113,15 @@ pub struct BuckSimApp {
     loaded_loop: Option<pdn_schema::LoopExtraction>,
     loop_json_path: String,
     loop_load_status: Option<Result<String, String>>,
+
+    // ── Spectrum export (input-port current → PortCurrentSpectrum JSON) ──
+    // Hands the FFT of the steady-state input current off to
+    // kicad_field_solver's `current-injection` and `emc-radiated-injection`
+    // CLI modes. Envelope mode → DC–fsw/2; PWM mode → DC–N×fsw/2.
+    spectrum_export_path: String,
+    spectrum_pwm_samples_per_cycle: u32,
+    spectrum_use_pwm: bool,
+    spectrum_export_status: Option<Result<String, String>>,
 
     // ── UI state ─────────────────────────────────────────────────────────────
     converter_mode: ConverterMode,
@@ -478,6 +488,10 @@ impl BuckSimApp {
             loaded_loop: None,
             loop_json_path: String::new(),
             loop_load_status: None,
+            spectrum_export_path: String::new(),
+            spectrum_pwm_samples_per_cycle: 64,
+            spectrum_use_pwm: true,
+            spectrum_export_status: None,
             converter_mode: ConverterMode::BuckPcmc,
             tab: Tab::Simulation,
             plot_option: PlotOption::Average,
@@ -1673,6 +1687,93 @@ impl BuckSimApp {
         Ok(msg)
     }
 
+    /// Spectrum-export strip on the Simulation tab. Writes a
+    /// `pdn_schema::PortCurrentSpectrum` JSON consumable by
+    /// `field_solver_cli current-injection` /
+    /// `emc-radiated-injection`. Two modes:
+    ///   - **Envelope** — FFT cycle-rate input current (DC–fsw/2).
+    ///   - **PWM** — reconstruct idealized switching waveform and
+    ///     FFT (DC–N×fsw/2; captures fsw and harmonics).
+    fn show_spectrum_export(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Export input-current spectrum →");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.spectrum_export_path)
+                    .desired_width(280.0)
+                    .hint_text("/path/to/i_in_spectrum.json"),
+            );
+            ui.checkbox(&mut self.spectrum_use_pwm, "PWM reconstruction")
+                .on_hover_text(
+                    "On: reconstruct idealized switching waveform at N samples \
+                     per cycle, FFT. Captures fsw and its harmonics. \
+                     Off (envelope): FFT cycle-rate current only — DC..fsw/2.",
+                );
+            if self.spectrum_use_pwm {
+                ui.label("samples/cycle:");
+                ui.add(
+                    egui::DragValue::new(&mut self.spectrum_pwm_samples_per_cycle)
+                        .range(4..=512)
+                        .speed(1.0),
+                );
+            }
+            let export_clicked = ui.button("Export").clicked();
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = export_clicked;
+                ui.colored_label(
+                    Color32::GRAY,
+                    "(spectrum export is native-only)",
+                );
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if export_clicked {
+                self.spectrum_export_status = Some(self.try_export_spectrum());
+            }
+        });
+        if let Some(status) = self.spectrum_export_status.as_ref() {
+            match status {
+                Ok(msg) => {
+                    ui.colored_label(Color32::from_rgb(120, 200, 120), msg);
+                }
+                Err(msg) => {
+                    ui.colored_label(Color32::from_rgb(255, 120, 120), msg);
+                }
+            }
+        }
+    }
+
+    /// Native-only: compute the spectrum from the current `sim_data`
+    /// (using either envelope or PWM-reconstruction mode) and write
+    /// the resulting `PortCurrentSpectrum` JSON to
+    /// `self.spectrum_export_path`.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn try_export_spectrum(&self) -> Result<String, String> {
+        let path = self.spectrum_export_path.trim();
+        if path.is_empty() {
+            return Err("Enter an output path first.".into());
+        }
+        let data = self.sim_data.as_ref().map_err(|e| e.clone())?;
+        let mode = if self.spectrum_use_pwm {
+            ExportMode::PwmReconstructed {
+                samples_per_cycle: self.spectrum_pwm_samples_per_cycle,
+            }
+        } else {
+            ExportMode::Envelope
+        };
+        let spec = export_input_current_spectrum(data, &self.last_params, mode)?;
+        let json = spec
+            .to_json_pretty()
+            .map_err(|e| format!("serialize: {}", e))?;
+        std::fs::write(path, json).map_err(|e| format!("write {}: {}", path, e))?;
+        Ok(format!(
+            "Wrote {} freq bins ({} – {} Hz, I_peak_ref = {:.3} A).",
+            spec.freqs_hz.len(),
+            spec.freqs_hz.first().copied().unwrap_or(0.0) as i64,
+            spec.freqs_hz.last().copied().unwrap_or(0.0) as i64,
+            spec.i_peak_amp_ref,
+        ))
+    }
+
     /// Provenance guard: warn if the loaded PDN sweep and loop
     /// extraction were produced from different board exports (their
     /// `board_hash` fields disagree). Easy to hit when iterating on a
@@ -2336,7 +2437,11 @@ impl BuckSimApp {
             });
     }
 
-    fn show_simulation(&self, ui: &mut egui::Ui) {
+    fn show_simulation(&mut self, ui: &mut egui::Ui) {
+        // Spectrum-export strip lives at the top of the tab, above
+        // the plots — short row that doesn't push the plots much.
+        self.show_spectrum_export(ui);
+        ui.separator();
         match &self.sim_data {
             Err(reason) => {
                 ui.centered_and_justified(|ui| {
