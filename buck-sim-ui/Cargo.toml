@@ -17,6 +17,7 @@ text-log = []
 [dependencies]
 electronics-sim = { path = "../electronics-sim", default-features = false }
 full-control    = { path = "../full-control",    default-features = false, features = ["std"] }
+pdn-schema      = { path = "../../kicad_field_solver/pdn_schema" }
 
 # egui + eframe + egui_plot must use the same major.minor version.
 eframe    = { version = "0.33", features = ["glow"] }

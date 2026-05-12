@@ -98,6 +98,11 @@ pub struct BuckSimApp {
     loss_breakdown: Option<LossBreakdown>,
     last_params: SimParams,
 
+    // ── Tabulated PDN (loaded from kicad_field_solver) ───────────────────
+    loaded_pdn: Option<pdn_schema::PdnZSweep>,
+    pdn_json_path: String,
+    pdn_load_status: Option<Result<String, String>>,
+
     // ── UI state ─────────────────────────────────────────────────────────────
     converter_mode: ConverterMode,
     tab: Tab,
@@ -291,7 +296,7 @@ impl Default for BuckSimApp {
     }
 }
 
-fn build_bode(p: &SimParams) -> Option<BodeData> {
+fn build_bode(p: &SimParams, loaded_pdn: Option<&pdn_schema::PdnZSweep>) -> Option<BodeData> {
     use crate::bode::OutputImpedanceParams;
     use crate::sim::to_cap_types;
     // Use multi-phase-aware parameters so the Bode plot reflects
@@ -306,6 +311,17 @@ fn build_bode(p: &SimParams) -> Option<BodeData> {
         LoadKind::Steps => p.r_loads.first().copied().unwrap_or(10.0),
         LoadKind::Battery => p.bat_r_int_mohm * 1e-3,
     };
+
+    // A loaded PDN sweep takes precedence over the analytic cap bank:
+    // the user has explicitly opted into PCB-extracted impedance.
+    if let Some(sweep) = loaded_pdn {
+        let zi = OutputImpedanceParams {
+            r_load,
+            c_out: sweep.c_effective_farads.max(1e-12),
+            r_esr: 0.0,
+        };
+        return Some(BodeData::compute_with_pdn_sweep(&ds, &ni, sweep, &zi));
+    }
 
     if !p.output_caps.is_empty() {
         let si_caps = to_cap_types(&p.output_caps);
@@ -403,7 +419,7 @@ impl BuckSimApp {
     fn from_params(p: SimParams, presets: SavedPresets) -> Self {
         let sim_data = run_simulation(&p);
         let loss_breakdown = sim_data.as_ref().ok().and_then(|d| compute_losses(&p, d));
-        let bode_data = build_bode(&p);
+        let bode_data = build_bode(&p, None);
         Self {
             v_in: p.v_in,
             v_out_target: p.v_out_target,
@@ -446,6 +462,9 @@ impl BuckSimApp {
             bode_data,
             loss_breakdown,
             last_params: p,
+            loaded_pdn: None,
+            pdn_json_path: String::new(),
+            pdn_load_status: None,
             converter_mode: ConverterMode::BuckPcmc,
             tab: Tab::Simulation,
             plot_option: PlotOption::Average,
@@ -1417,7 +1436,7 @@ impl BuckSimApp {
         if params != self.last_params {
             self.sim_data = run_simulation(&params);
             self.loss_breakdown = self.sim_data.as_ref().ok().and_then(|d| compute_losses(&params, d));
-            self.bode_data = build_bode(&params);
+            self.bode_data = build_bode(&params, self.loaded_pdn.as_ref());
             self.last_params = params;
             save_to_storage(&self.to_settings());
         }
@@ -1432,6 +1451,7 @@ impl BuckSimApp {
         match self.tab {
             Tab::Simulation => self.show_simulation(ui),
             Tab::Bode => {
+                self.show_pdn_loader(ui);
                 match &self.bode_data {
                     Some(data) => show_bode(ui, data),
                     None => {
@@ -1445,6 +1465,103 @@ impl BuckSimApp {
                 }
             }
         }
+    }
+
+    /// Loader strip at the top of the Bode tab. Lets the user point at
+    /// a `pdn-schema` JSON file (produced by `kicad_field_solver`'s
+    /// `pdn-export`) and use the extracted Z(omega) as the plant
+    /// impedance instead of the analytic cap-bank model.
+    fn show_pdn_loader(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            match self.loaded_pdn.as_ref() {
+                Some(s) => {
+                    ui.colored_label(
+                        Color32::from_rgb(120, 200, 255),
+                        format!(
+                            "PDN: tabulated  ({} pts, {:.1} Hz – {:.1} MHz, C_eff = {:.1} µF)",
+                            s.freqs_hz.len(),
+                            s.freqs_hz.first().copied().unwrap_or(0.0),
+                            s.freqs_hz.last().copied().unwrap_or(0.0) / 1e6,
+                            s.c_effective_farads * 1e6,
+                        ),
+                    )
+                    .on_hover_text(format!(
+                        "{}\nfwd: {}\nret: {}",
+                        s.source, s.fwd_label, s.ret_label,
+                    ));
+                    if ui.button("Clear").clicked() {
+                        self.loaded_pdn = None;
+                        self.pdn_load_status = None;
+                        self.bode_data = build_bode(&self.last_params, None);
+                    }
+                }
+                None => {
+                    ui.label("PDN: analytic cap bank");
+                }
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("PDN JSON:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.pdn_json_path)
+                    .desired_width(360.0)
+                    .hint_text("/path/to/pdn_sweep.json"),
+            );
+            let load_clicked = ui.button("Load").clicked();
+            #[cfg(target_arch = "wasm32")]
+            {
+                let _ = load_clicked;
+                ui.colored_label(
+                    Color32::GRAY,
+                    "(loading from disk is unavailable on the web build)",
+                );
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            if load_clicked {
+                self.pdn_load_status = Some(self.try_load_pdn());
+                if matches!(self.pdn_load_status, Some(Ok(_))) {
+                    self.bode_data =
+                        build_bode(&self.last_params, self.loaded_pdn.as_ref());
+                }
+            }
+        });
+
+        if let Some(status) = self.pdn_load_status.as_ref() {
+            match status {
+                Ok(msg) => {
+                    ui.colored_label(Color32::from_rgb(120, 200, 120), msg);
+                }
+                Err(msg) => {
+                    ui.colored_label(Color32::from_rgb(255, 120, 120), msg);
+                }
+            }
+        }
+        ui.separator();
+    }
+
+    /// Native-only: read the JSON file at `self.pdn_json_path`, parse
+    /// it as a `PdnZSweep`, and store it on the app. Returns a short
+    /// human-readable success/error message for the UI.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn try_load_pdn(&mut self) -> Result<String, String> {
+        let path = self.pdn_json_path.trim();
+        if path.is_empty() {
+            return Err("Enter a path first.".into());
+        }
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {}", path, e))?;
+        let sweep = pdn_schema::PdnZSweep::from_json(&text)
+            .map_err(|e| format!("parse {}: {}", path, e))?;
+        if sweep.freqs_hz.is_empty()
+            || sweep.freqs_hz.len() != sweep.z_re_ohm.len()
+            || sweep.freqs_hz.len() != sweep.z_im_ohm.len()
+        {
+            return Err("Malformed sweep: array length mismatch.".into());
+        }
+        let n = sweep.freqs_hz.len();
+        self.loaded_pdn = Some(sweep);
+        Ok(format!("Loaded {} frequency points.", n))
     }
 
     fn show_pfc_params(&mut self, ui: &mut egui::Ui) {

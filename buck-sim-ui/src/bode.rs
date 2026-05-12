@@ -2,9 +2,11 @@ use std::f64::consts::PI;
 
 use egui::Color32;
 use egui_plot::{HLine, Line, PlotPoints, VLine};
-use electronics_sim::cap_bank::{CapBank, CapType};
+use electronics_sim::cap_bank::CapType;
 use full_control::control_2p2z::DesignSummary;
+use pdn_schema::PdnZSweep;
 
+use crate::pdn::PdnSource;
 use crate::sim::{SimParams, has_transport_delays};
 
 /// Number of frequency points in the sweep.
@@ -169,30 +171,24 @@ fn plant(omega: f64, ds: &DesignSummary) -> C {
     c_div(num, den)
 }
 
-/// Evaluate the plant transfer function using composite cap bank impedance.
+/// Evaluate the plant transfer function using a generalized PDN source.
 ///
-/// Instead of a single ESR zero `(1 + jω/ω_esr)`, we use the actual impedance
-/// of the parallel cap bank:
+/// Instead of a single ESR zero `(1 + jω/ω_esr)`, we use the actual
+/// impedance reported by `src` (an analytic cap bank, or a tabulated
+/// `PdnZSweep` extracted from a real PCB):
 ///
-///   Z_out_normalized(jω) = Z_out(jω) × jω × C_total
+///   Z_out_normalized(jω) = Z_out(jω) × jω × C_eff
 ///
-/// This equals 1 at DC (pure capacitive) and shows the real ESR/ESL behavior
-/// at higher frequencies, including resonances and anti-resonances from mixed
-/// cap types.
-fn plant_cap_bank(omega: f64, ds: &DesignSummary, caps: &[CapType], c_total: f64) -> C {
-    // Compute composite impedance of the cap bank at this frequency.
-    let (z_re, z_im) = CapBank::impedance_at(caps, omega);
+/// `C_eff` is the analytic cap-bank total in the analytic case, or
+/// the lowest-frequency-derived effective bulk capacitance for a
+/// tabulated sweep. The product is dimensionless and equals 1 at DC,
+/// preserving the plant's DC gain.
+fn plant_pdn(omega: f64, ds: &DesignSummary, src: &PdnSource<'_>) -> C {
+    let (z_re, z_im) = src.impedance_at(omega);
 
-    // Normalize: multiply by jω × C_total.
-    // This makes the impedance transfer function dimensionless and equal to 1 at DC.
-    //   Z_norm = Z_out × jω × C_total
-    //          = (z_re + j·z_im) × (0 + j·ω·C_total)
-    //          = (-z_im·ω·C_total) + j·(z_re·ω·C_total)
-    let wc = omega * c_total;
+    let wc = omega * src.c_effective();
     let z_norm: C = (-z_im * wc, z_re * wc);
 
-    // Rest of the plant: H_dc / [(1 + jω/ω_p1) × double_pole]
-    // The ESR zero is now replaced by z_norm above.
     let jw_over_p1: C = (1.0, omega / ds.omega_p1);
     let r = omega / ds.omega_n;
     let double_pole: C = (1.0 - r * r, r);
@@ -223,27 +219,37 @@ pub struct OutputImpedanceParams {
 }
 
 impl BodeData {
-    /// Compute Bode data. When `cap_bank_caps` is Some, the plant uses composite
-    /// impedance instead of a single ESR zero.
+    /// Compute Bode data with the scalar (single-cap) plant model. The
+    /// plant uses one ESR zero and the cap impedance is `R_ESR + 1/(jωC)`.
     pub fn compute(ds: &DesignSummary, ni: &NonIdealParams, zi: &OutputImpedanceParams) -> Self {
         Self::compute_inner(ds, ni, None, zi)
     }
 
-    /// Compute Bode data with composite cap bank impedance in the plant.
+    /// Compute Bode data with composite cap-bank impedance in the plant.
     pub fn compute_with_cap_bank(
         ds: &DesignSummary,
         ni: &NonIdealParams,
         caps: &[CapType],
         zi: &OutputImpedanceParams,
     ) -> Self {
-        let c_total = CapBank::total_capacitance(caps);
-        Self::compute_inner(ds, ni, Some((caps, c_total)), zi)
+        Self::compute_inner(ds, ni, Some(PdnSource::analytic(caps)), zi)
+    }
+
+    /// Compute Bode data using a tabulated PDN sweep (e.g. extracted
+    /// from a real PCB by the field solver) as the plant impedance.
+    pub fn compute_with_pdn_sweep(
+        ds: &DesignSummary,
+        ni: &NonIdealParams,
+        sweep: &PdnZSweep,
+        zi: &OutputImpedanceParams,
+    ) -> Self {
+        Self::compute_inner(ds, ni, Some(PdnSource::tabulated(sweep)), zi)
     }
 
     fn compute_inner(
         ds: &DesignSummary,
         ni: &NonIdealParams,
-        cap_bank: Option<(&[CapType], f64)>,
+        pdn: Option<PdnSource<'_>>,
         zi: &OutputImpedanceParams,
     ) -> Self {
         let f_min = 1.0_f64;
@@ -266,8 +272,8 @@ impl BodeData {
             let f = 10.0_f64.powf(log_min + t * (log_max - log_min));
             let omega = 2.0 * PI * f;
 
-            let hp = match cap_bank {
-                Some((caps, c_total)) => plant_cap_bank(omega, ds, caps, c_total),
+            let hp = match pdn.as_ref() {
+                Some(src) => plant_pdn(omega, ds, src),
                 None => plant(omega, ds),
             };
             let hc = compensator(omega, ds);
@@ -278,11 +284,8 @@ impl BodeData {
             // Z_cap: cap bank impedance (or scalar R_ESR + 1/jωC).
             // Z_out_open = Z_cap ∥ R_load  (PCMC inductor is a current source)
             // Z_out_closed = Z_out_open / (1 + T)
-            let z_cap: C = match cap_bank {
-                Some((caps, _)) => {
-                    let (re, im) = CapBank::impedance_at(caps, omega);
-                    (re, im)
-                }
+            let z_cap: C = match pdn.as_ref() {
+                Some(src) => src.impedance_at(omega),
                 None => {
                     // Z = R_ESR + 1/(jωC) = R_ESR - j/(ωC)
                     (zi.r_esr, -1.0 / (omega * zi.c_out))
