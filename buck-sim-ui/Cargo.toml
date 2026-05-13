@@ -17,11 +17,7 @@ text-log = []
 [dependencies]
 electronics-sim = { path = "../electronics-sim", default-features = false }
 full-control    = { path = "../full-control",    default-features = false, features = ["std"] }
-# Temporarily points at the `closed-loop-emc` worktree until those
-# pdn_schema additions (PortCurrentSpectrum, CurrentDensityField,
-# ControllerFlavor) land on main in `../../kicad_field_solver`.
-# Revert to `../../kicad_field_solver/pdn_schema` after the merge.
-pdn-schema      = { path = "../../kicad_field_solver-closed-loop-emc/pdn_schema" }
+pdn-schema      = { path = "../../kicad_field_solver/pdn_schema" }
 
 # egui + eframe + egui_plot must use the same major.minor version.
 eframe    = { version = "0.33", features = ["glow"] }
