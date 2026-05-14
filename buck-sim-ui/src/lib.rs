@@ -1,6 +1,7 @@
 pub mod app;
 pub mod bode;
 pub mod conducted_emc;
+pub mod inner_ctrl;
 pub mod monte_carlo;
 pub mod pdn;
 pub mod pfc_bode;
