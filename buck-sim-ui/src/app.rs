@@ -19,6 +19,7 @@ enum Tab {
     Simulation,
     Scope,
     Bode,
+    ConductedEmc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -134,6 +135,17 @@ pub struct BuckSimApp {
     // the FFT'd export are guaranteed bit-identical. Sample count
     // independent from the export's; defaults higher for crisp edges.
     scope_samples_per_cycle: u32,
+
+    // ── Conducted EMC view ───────────────────────────────────────────────
+    // In-process LISN evaluation of whatever spectrum the export
+    // would produce. No field_solver_cli shell-out — the Bode + Loss
+    // panels already share state; Conducted EMC reads the same
+    // simulator output, so PASS/FAIL updates live with parameter
+    // changes.
+    conducted_emc_input_cap_uf: f64,
+    conducted_emc_input_cap_esr_mohm: f64,
+    conducted_emc_input_cap_esl_nh: f64,
+    conducted_emc_class_a: bool,
 
     // ── UI state ─────────────────────────────────────────────────────────────
     converter_mode: ConverterMode,
@@ -509,6 +521,10 @@ impl BuckSimApp {
             spectrum_pwm_trapezoidal: true,
             spectrum_export_status: None,
             scope_samples_per_cycle: 2048,
+            conducted_emc_input_cap_uf: 100.0,
+            conducted_emc_input_cap_esr_mohm: 10.0,
+            conducted_emc_input_cap_esl_nh: 10.0,
+            conducted_emc_class_a: false,
             converter_mode: ConverterMode::BuckPcmc,
             tab: Tab::Simulation,
             plot_option: PlotOption::Average,
@@ -1507,12 +1523,14 @@ impl BuckSimApp {
             ui.selectable_value(&mut self.tab, Tab::Simulation, "Simulation");
             ui.selectable_value(&mut self.tab, Tab::Scope, "Scope");
             ui.selectable_value(&mut self.tab, Tab::Bode, "Bode");
+            ui.selectable_value(&mut self.tab, Tab::ConductedEmc, "Conducted EMC");
         });
         ui.separator();
 
         match self.tab {
             Tab::Simulation => self.show_simulation(ui),
             Tab::Scope => self.show_scope(ui),
+            Tab::ConductedEmc => self.show_conducted_emc(ui),
             Tab::Bode => {
                 self.show_pdn_loader(ui);
                 self.show_loop_loader(ui);
@@ -2698,6 +2716,151 @@ impl BuckSimApp {
                     });
             }
         }
+    }
+
+    /// In-process Conducted-EMC view: take the same in-memory
+    /// input-current spectrum the export button produces, run it
+    /// through the CISPR-22 LISN model + optional input-cap divider,
+    /// and plot `dB(µV)` vs frequency with the QP limit overlaid.
+    /// PASS/FAIL verdict updates live with parameter changes.
+    fn show_conducted_emc(&mut self, ui: &mut egui::Ui) {
+        use crate::conducted_emc::{lisn_dbuv, verdict, CisprClass, InputCap};
+        use crate::spectrum_export::{export_input_current_spectrum, ExportMode, RingingParams};
+
+        // Controls strip.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Input cap:");
+            ui.add(
+                egui::DragValue::new(&mut self.conducted_emc_input_cap_uf)
+                    .range(0.0..=10_000.0)
+                    .suffix(" µF")
+                    .speed(1.0),
+            );
+            ui.label("ESR:");
+            ui.add(
+                egui::DragValue::new(&mut self.conducted_emc_input_cap_esr_mohm)
+                    .range(0.0..=1_000.0)
+                    .suffix(" mΩ")
+                    .speed(0.1),
+            );
+            ui.label("ESL:");
+            ui.add(
+                egui::DragValue::new(&mut self.conducted_emc_input_cap_esl_nh)
+                    .range(0.0..=1_000.0)
+                    .suffix(" nH")
+                    .speed(0.1),
+            );
+            ui.separator();
+            ui.label("CISPR class:");
+            ui.selectable_value(&mut self.conducted_emc_class_a, false, "B (residential)");
+            ui.selectable_value(&mut self.conducted_emc_class_a, true, "A (industrial)");
+        });
+        ui.separator();
+
+        // Build the spectrum on the fly from the current sim_data
+        // (PWM mode with trapezoidal + Miller + Q_rr + ringing if
+        // available). Always 2048 samples/cycle — crisp enough for
+        // CISPR conducted band (up to 30 MHz, well below the
+        // Nyquist for any reasonable fsw).
+        let Ok(data) = self.sim_data.as_ref() else {
+            ui.colored_label(
+                Color32::from_rgb(255, 100, 100),
+                "No valid simulation — fix parameters first.",
+            );
+            return;
+        };
+        let ringing = self.loaded_loop.as_ref().map(|l| RingingParams {
+            l_loop_h: l.l_self_henry,
+            r_loop_ohm: l.r_dc_ohm,
+            c_oss_total_f: 0.5
+                * (self.last_params.hs_fet.coss_pf + self.last_params.ls_fet.coss_pf)
+                * 1e-12,
+            v_step_v: self.last_params.v_in,
+        });
+        let spec = match export_input_current_spectrum(
+            data,
+            &self.last_params,
+            ExportMode::PwmReconstructed {
+                samples_per_cycle: 2048,
+                trapezoidal: true,
+                ringing,
+                qrr_nc: self.last_params.ls_fet.qrr_nc,
+                trr_ns: self.last_params.ls_fet.trr_ns,
+            },
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                ui.colored_label(
+                    Color32::from_rgb(255, 100, 100),
+                    format!("Spectrum synthesis failed: {}", e),
+                );
+                return;
+            }
+        };
+
+        let input_cap = if self.conducted_emc_input_cap_uf > 0.0 {
+            Some(InputCap {
+                c_farads: self.conducted_emc_input_cap_uf * 1e-6,
+                esr_ohm: self.conducted_emc_input_cap_esr_mohm * 1e-3,
+                esl_henry: self.conducted_emc_input_cap_esl_nh * 1e-9,
+            })
+        } else {
+            None
+        };
+        let curve = lisn_dbuv(&spec, input_cap, 30e6);
+        let class = if self.conducted_emc_class_a {
+            CisprClass::A
+        } else {
+            CisprClass::B
+        };
+
+        // Verdict banner.
+        if let Some((worst_f, worst_db, worst_margin, pass)) = verdict(&curve, class) {
+            let (color, status) = if pass {
+                (Color32::from_rgb(120, 220, 120), "PASS")
+            } else {
+                (Color32::from_rgb(255, 120, 120), "FAIL")
+            };
+            ui.colored_label(
+                color,
+                format!(
+                    "CISPR-22 {} QP (150 kHz – 30 MHz): {} — worst margin {:+.2} dB \
+                     at {:.3} MHz ({:.2} dBµV vs limit {:.2})",
+                    class.label(),
+                    status,
+                    worst_margin,
+                    worst_f / 1e6,
+                    worst_db,
+                    class.qp_limit_db_uv(worst_f),
+                ),
+            );
+        } else {
+            ui.colored_label(
+                Color32::from_rgb(200, 200, 100),
+                "No in-band samples (need spectrum content between 150 kHz and 30 MHz).",
+            );
+        }
+
+        let pts: PlotPoints = curve.iter().map(|&(f, db)| [f, db]).collect();
+        let waveform = Line::new("dB(µV)", pts).color(Color32::from_rgb(120, 200, 255));
+        // CISPR limit curve.
+        let limit_pts: PlotPoints = curve
+            .iter()
+            .map(|&(f, _)| [f, class.qp_limit_db_uv(f)])
+            .collect();
+        let limit_line =
+            Line::new(format!("{} QP limit", class.label()), limit_pts)
+                .color(Color32::from_rgb(255, 100, 100))
+                .style(egui_plot::LineStyle::dashed_loose());
+
+        Plot::new("conducted_emc")
+            .height((ui.available_height() - 40.0).max(200.0))
+            .x_axis_label("f [Hz]  (log scale)")
+            .y_axis_label("dB(µV)")
+            .show(ui, |plot_ui| {
+                plot_ui.line(waveform);
+                plot_ui.line(limit_line);
+            });
     }
 
     /// Single-cycle oscilloscope-style view of the input-port
