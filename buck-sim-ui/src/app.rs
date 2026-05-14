@@ -921,6 +921,32 @@ impl BuckSimApp {
                         .step_by(1.0),
                 ).on_hover_text("PWM cycles between compensator updates; >1 reduces CPU load but lowers effective bandwidth");
                 self.cycles_per_tick = cpt as usize;
+                ui.horizontal(|ui| {
+                    ui.label("Q format:");
+                    use crate::inner_ctrl::InnerCtrlFlavor;
+                    ui.selectable_value(
+                        &mut self.controller_flavor,
+                        InnerCtrlFlavor::HostF32,
+                        "f32 (host)",
+                    )
+                    .on_hover_text(
+                        "Fast, deep host arithmetic. Default. Quantisation-induced \
+                         limit cycles silently absent — subharmonic / marginal-PM \
+                         pathologies still show up.",
+                    );
+                    ui.selectable_value(
+                        &mut self.controller_flavor,
+                        InnerCtrlFlavor::FmacQ15,
+                        "q1.15 (FMAC)",
+                    )
+                    .on_hover_text(
+                        "STM32G474 FMAC peripheral emulation. q1.15 coefficients + \
+                         samples, i64 accumulator. Reproduces the firmware's \
+                         coefficient-quantisation limit cycles in the spectrum — \
+                         needed for honest control-loop-oscillation → conducted-EM \
+                         predictions.",
+                    );
+                });
                 {
                     let cpu_time_us = self.mcu.t_adc_us + self.mcu.t_processing_us + self.dac.t_dac_us;
                     let cpu_pct = cpu_time_us / (t_sw_us * self.cycles_per_tick as f64) * 100.0;

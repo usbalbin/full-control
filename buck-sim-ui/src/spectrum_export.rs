@@ -605,9 +605,16 @@ pub fn export_input_current_spectrum(
         cycles.len(),
         fsw / 1e3,
     );
+    // ControllerFlavor provenance from SimParams.controller_flavor.
+    // For FmacQ15 we'd ideally stamp the actual R-exponent here,
+    // but spectrum_export doesn't construct an InnerCtrl; pass r=0
+    // and document the limitation (downstream consumers that care
+    // about R can construct an InnerCtrl from the same weights to
+    // get it). TODO: thread r through from sim.rs's `ctrl.r_exponent()`.
+    let controller_flavor = p.controller_flavor.to_provenance(0);
     Ok(PortCurrentSpectrum::new(
         source,
-        ControllerFlavor::HostF32,
+        controller_flavor,
         "VIN (input port, cycle-averaged HS-FET drain)",
         "GND",
         freqs_hz,
