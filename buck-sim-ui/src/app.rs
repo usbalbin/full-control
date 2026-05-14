@@ -95,6 +95,9 @@ pub struct BuckSimApp {
     // ── Multi-phase ──────────────────────────────────────────────────────────
     num_phases: usize,
 
+    // ── Inner-loop Q format ──────────────────────────────────────────────────
+    controller_flavor: crate::inner_ctrl::InnerCtrlFlavor,
+
     // ── Cached simulation output ────────────────────────────────────────────
     sim_data: Result<Vec<SimPoint>, String>,
     bode_data: Option<BodeData>,
@@ -505,6 +508,7 @@ impl BuckSimApp {
             use_cap_bank: !p.output_caps.is_empty(),
             output_caps: p.output_caps.clone(),
             num_phases: p.num_phases,
+            controller_flavor: p.controller_flavor,
             sim_data,
             bode_data,
             loss_breakdown,
@@ -580,6 +584,7 @@ impl BuckSimApp {
             dac: self.dac.clone(),
             output_caps: self.output_caps.clone(),
             num_phases: self.num_phases,
+            controller_flavor: self.controller_flavor,
         }
     }
 

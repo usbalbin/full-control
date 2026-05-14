@@ -320,6 +320,17 @@ pub struct SimParams {
 
     // ── Multi-phase ──────────────────────────────────────────────────────
     pub num_phases: usize,
+
+    // ── Inner-loop controller Q format ───────────────────────────────────
+    /// Which numeric flavor the inner current loop runs in on the
+    /// host sim. Default is `HostF32` (today's behaviour and a
+    /// faithful approximation for tuning Bode loop-gain margins).
+    /// Switch to `FmacQ15` to make the spectrum reflect the real
+    /// firmware's q1.15 quantisation behaviour — needed for an
+    /// honest "control-loop oscillations → conducted-EM" view that
+    /// includes coefficient-quantisation limit cycles.
+    #[serde(default)]
+    pub controller_flavor: crate::inner_ctrl::InnerCtrlFlavor,
 }
 
 /// UI-friendly capacitor type with user-facing units.
@@ -384,6 +395,7 @@ impl Default for SimParams {
             c_in_uf: 0.0,
             output_caps: Vec::new(),
             num_phases: 1,
+            controller_flavor: crate::inner_ctrl::InnerCtrlFlavor::HostF32,
         }
     }
 }
@@ -646,7 +658,8 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
         return Err("Controller coefficients out of range (b0 non-finite or > 1e6)".into());
     }
 
-    let mut ctrl = weights_code.to_controller(0.0_f32, 4096.0_f32);
+    let mut ctrl =
+        crate::inner_ctrl::InnerCtrl::build(weights_code, 0.0_f32, 4096.0_f32, p.controller_flavor);
 
     let sim_params = SimParameters {
         period: Time(t_period),
@@ -932,7 +945,7 @@ fn interleaved_envelope(phases: &[PhasePoint], period: f32) -> (f32, f32) {
 /// trip current, then ticks each phase with `load / N`.  Charge balance gives
 /// the combined delta_v which is applied to all phases.
 fn tick_multi(
-    ctrl: &mut full_control::control_2p2z::TwoPoleTwoZero<f32>,
+    ctrl: &mut crate::inner_ctrl::InnerCtrl,
     sims: &mut [CurrentModeConverter],
     v_in: Voltage,
     target_code: f32,
@@ -1045,7 +1058,7 @@ fn tick_multi(
 }
 
 fn tick_one(
-    ctrl: &mut full_control::control_2p2z::TwoPoleTwoZero<f32>,
+    ctrl: &mut crate::inner_ctrl::InnerCtrl,
     sim: &mut CurrentModeConverter,
     v_in: Voltage,
     target_code: f32,
@@ -1123,7 +1136,7 @@ fn tick_one(
 }
 
 fn tick_one_cap_bank(
-    ctrl: &mut full_control::control_2p2z::TwoPoleTwoZero<f32>,
+    ctrl: &mut crate::inner_ctrl::InnerCtrl,
     sim: &mut CurrentModeConverter,
     cap_bank: &mut CapBank,
     v_in: Voltage,
@@ -1201,7 +1214,7 @@ fn tick_one_cap_bank(
 }
 
 fn tick_multi_cap_bank(
-    ctrl: &mut full_control::control_2p2z::TwoPoleTwoZero<f32>,
+    ctrl: &mut crate::inner_ctrl::InnerCtrl,
     sims: &mut [CurrentModeConverter],
     cap_bank: &mut CapBank,
     v_in: Voltage,
@@ -1506,6 +1519,7 @@ mod tests {
             c_in_uf: 0.0,
             output_caps: Vec::new(),
             num_phases: 1,
+            controller_flavor: crate::inner_ctrl::InnerCtrlFlavor::HostF32,
         }
     }
 
@@ -1543,6 +1557,7 @@ mod tests {
             c_in_uf: 0.0,
             output_caps: Vec::new(),
             num_phases: 1,
+            controller_flavor: crate::inner_ctrl::InnerCtrlFlavor::HostF32,
         }
     }
 
