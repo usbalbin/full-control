@@ -142,12 +142,48 @@ pub struct FetModel {
     /// Drain-source on-resistance [Ω].
     pub r_dson: f64,
     /// Body-diode forward voltage [V] (V_F at rated forward current).
+    /// For GaN HEMTs (`is_gan = true`) this field is ignored — the
+    /// third-quadrant V_F is instead computed as `v_th + |V_GS_off|`
+    /// because GaN devices have no minority-carrier body diode.
     pub v_f_body: f64,
-    /// Body-diode reverse-recovery charge [C].
+    /// Body-diode reverse-recovery charge [C]. Set to 0 for GaN and
+    /// Schottky-clamped bodies (no minority-carrier storage).
     pub q_rr: f64,
     /// Internal gate-mesh resistance R_g_int (the chip's R_G [Ω]).
     pub r_g_int: f64,
+
+    // ── Extended physics fields (with serde defaults for back-compat).
+    /// V_DS at which the datasheet C_oss / C_rss / C_iss were
+    /// specified [V]. Used to scale the capacitances to the actual
+    /// operating V_DS via `C_eff(V_DS) ≈ C_test · √(V_test / V_DS)`
+    /// (depletion-region sqrt model). Typical: 20 V Si, 100 V GaN.
+    /// Default if missing: 20 V.
+    #[serde(default = "default_c_test_v")]
+    pub c_test_v: f64,
+    /// Body-diode reverse-recovery time at the datasheet-rated forward
+    /// current [s]. Together with `softness_factor` sets the
+    /// piecewise-linear t_a (fall) + t_b (recovery) split. Typical
+    /// values: 30-100 ns for Si MOSFETs, 0 for GaN/Schottky. Default
+    /// 50 ns if missing.
+    #[serde(default = "default_t_rr")]
+    pub t_rr: f64,
+    /// Body-diode softness factor S = t_b/t_a. Soft-recovery diodes
+    /// (S ≈ 1) ring less and have lower EMI; abrupt diodes (S → 0)
+    /// have a much larger snap-induced di/dt. Range typically
+    /// 0.3-1.0. Default 0.5 if missing.
+    #[serde(default = "default_softness")]
+    pub softness_factor: f64,
+    /// `true` for GaN HEMTs / depletion-mode devices that lack a
+    /// minority-carrier body diode. When set, the third-quadrant
+    /// V_F is computed as `v_th + |V_GS_off|` instead of using
+    /// `v_f_body`, and Q_rr is forced to zero. Default false (Si).
+    #[serde(default)]
+    pub is_gan: bool,
 }
+
+fn default_c_test_v() -> f64 { 20.0 }
+fn default_t_rr() -> f64 { 50e-9 }
+fn default_softness() -> f64 { 0.5 }
 
 impl FetModel {
     /// Silicon power FET preset based on the Infineon BSC0902NSI class
@@ -166,6 +202,10 @@ impl FetModel {
             v_f_body: 0.85,
             q_rr: 80e-9,
             r_g_int: 0.8,
+            c_test_v: 20.0,       // datasheet C @ V_DS = 20 V
+            t_rr: 50e-9,          // datasheet t_rr ≈ 50 ns
+            softness_factor: 0.5, // typical Si body diode
+            is_gan: false,
         }
     }
 
@@ -183,9 +223,15 @@ impl FetModel {
             v_th: 1.4,
             g_fs: 42.0,
             r_dson: 7e-3,
-            v_f_body: 1.8,
+            // V_F not used for GaN — third-quadrant V_F is
+            // computed from v_th + |driver.v_off|.
+            v_f_body: 0.0,
             q_rr: 0.0,
             r_g_int: 0.4,
+            c_test_v: 100.0,      // GaN datasheets typically at V_DS = 100 V
+            t_rr: 0.0,            // no minority-carrier RR
+            softness_factor: 1.0, // irrelevant when q_rr=0
+            is_gan: true,
         }
     }
 }
@@ -202,18 +248,55 @@ pub struct DriverModel {
     /// External series gate resistor R_g_ext [Ω] (separate from the
     /// FET's intrinsic R_g_int).
     pub r_g_ext: f64,
+
+    // ── Extended fields (serde defaults for back-compat).
+    /// Gate-off rail voltage [V]. 0 V is standard; some GaN drivers
+    /// (e.g. LMG1210, UCC27282) use a negative rail like −2 V to
+    /// raise the Cdv/dt parasitic-turn-on margin (the LS gate has to
+    /// climb V_th + |V_off| through C_rss·dV_SW/dt before the FET
+    /// conducts). For GaN with no body diode, this also DIRECTLY sets
+    /// the third-quadrant reverse-conduction V_F = v_th + |V_off|.
+    #[serde(default)]
+    pub v_off: f64,
+    /// Driver output-stage finite slew rate [V/s]. The actual gate-
+    /// drive voltage tracks the target at this rate, rather than
+    /// instantaneously. Default 1e11 V/s (≈ very fast, behaves like
+    /// the previous ideal-step model).
+    #[serde(default = "default_drv_slew")]
+    pub slew_rate_v_per_s: f64,
 }
+
+fn default_drv_slew() -> f64 { 1.0e11 }
 
 impl DriverModel {
     /// Generic 5 V GaN driver preset: 1 Ω source, 0.5 Ω sink, no
-    /// external R_g.
+    /// external R_g, V_off = 0 V, slew ≈ 50 V/ns (typical for fast
+    /// half-bridge drivers like LMG1210).
     pub fn generic_gan_5v() -> Self {
-        Self { v_drive: 5.0, r_source: 1.0, r_sink: 0.5, r_g_ext: 0.0 }
+        Self {
+            v_drive: 5.0, r_source: 1.0, r_sink: 0.5, r_g_ext: 0.0,
+            v_off: 0.0, slew_rate_v_per_s: 50e9,
+        }
     }
 
-    /// Generic 10 V Si driver preset.
+    /// Generic 5 V GaN driver with NEGATIVE off rail (−2 V) — common
+    /// in modern GaN half-bridges to defend against Cdv/dt parasitic
+    /// turn-on on the off side. Note the trade-off: −2 V V_off makes
+    /// the third-quadrant reverse-conduction V_F = v_th + 2 V, which
+    /// is a substantial dead-time loss penalty.
+    pub fn generic_gan_5v_neg_off() -> Self {
+        Self {
+            v_drive: 5.0, r_source: 1.0, r_sink: 0.5, r_g_ext: 0.0,
+            v_off: -2.0, slew_rate_v_per_s: 50e9,
+        }
+    }
+
+    /// Generic 10 V Si driver preset, V_off = 0 V, slew ≈ 20 V/ns.
     pub fn generic_si_10v() -> Self {
-        Self { v_drive: 10.0, r_source: 2.0, r_sink: 1.0, r_g_ext: 2.2 }
+        Self {
+            v_drive: 10.0, r_source: 2.0, r_sink: 1.0, r_g_ext: 2.2,
+            v_off: 0.0, slew_rate_v_per_s: 20e9,
+        }
     }
 }
 
@@ -238,6 +321,24 @@ pub struct OperatingPoint {
     /// the parasitic loop L. Used only as the "far side" boundary of
     /// I_L on the µs timescale (di/dt = (V_SW − V_out) / L_inductor).
     pub l_inductor: f64,
+
+    // ── Extended fields (serde defaults for back-compat).
+    /// Input-rail decoupling capacitance [F]. Sets the V_in ripple
+    /// amplitude `ΔV_in ≈ ∫i_d_hs · dt / C_in` over the switching
+    /// edge. Default 0 = "stiff V_in" (no ripple); a realistic buck
+    /// has C_in ≥ 10 µF and sees ΔV_in on the order of a few hundred
+    /// mV for typical loads.
+    #[serde(default)]
+    pub c_in_farad: f64,
+    /// Assembly-level Y-capacitance from the SW node to the chassis
+    /// ground via the FET heatsink tab + thermal pad + thermal
+    /// interface material [F]. Major common-mode EMI path; the PCB
+    /// extractor cannot see this — user must measure or estimate.
+    /// Typical: 10-500 pF depending on tab geometry and TIM. Default
+    /// 0 (no Y-path); when non-zero, it adds in parallel with the
+    /// SW-node parasitic C for the LC-ring dynamics.
+    #[serde(default)]
+    pub c_y_chassis_farad: f64,
 }
 
 /// Discrete LS body-diode state.
@@ -303,6 +404,9 @@ pub struct EdgeWaveforms {
     /// Peak `dI_D_HS/dt` magnitude [A/s] during the slew. Drives the
     /// radiated H-field via the power-loop antenna area.
     pub di_d_dt_peak: f64,
+    /// Peak V_in ripple [V] (max − min within the simulation window).
+    /// Only meaningful when `op.c_in_farad > 0`; otherwise 0.
+    pub v_in_ripple_peak: f64,
 }
 
 /// Configuration knobs for the simulator.
@@ -338,6 +442,71 @@ pub fn default_loop_r(_parasitics: &BuckParasiticSet) -> f64 {
     20e-3
 }
 
+/// Effective C_oss(V_DS) using the depletion-region √ scaling
+/// `C_oss(V_DS) ≈ C_test · √(V_test / max(V_DS, 0.5 V))`. Captures
+/// the dominant nonlinearity of MOSFET / GaN output capacitance with
+/// drain voltage; real C_oss curves drop 5-20× from V_DS ≈ 0 up to
+/// rated V_DS. The 0.5 V floor avoids the divergence at V_DS → 0.
+pub fn c_oss_eff(fet: &FetModel, v_ds: f64) -> f64 {
+    let v_use = v_ds.max(0.5);
+    fet.c_oss * (fet.c_test_v / v_use).sqrt()
+}
+
+/// Effective C_rss(V_DS) with the same √ scaling. The Miller plateau
+/// dV/dt is set by I_g / C_rss_eff, so this nonlinearity stretches
+/// the plateau when V_DS is small (start of the slew) and contracts
+/// it when V_DS is large (end of the slew).
+pub fn c_rss_eff(fet: &FetModel, v_ds: f64) -> f64 {
+    let v_use = v_ds.max(0.5);
+    fet.c_rss * (fet.c_test_v / v_use).sqrt()
+}
+
+/// Effective body-diode forward voltage for the LS-side reverse
+/// conduction clamp. For Si the value comes from `fet.v_f_body`;
+/// GaN HEMTs lack a minority-carrier body diode, and instead conduct
+/// in reverse through the same channel — the effective V_F is
+/// `v_th + |V_GS_off|`. With a 0 V off-rail this is just V_th
+/// (~1.4 V on EPC2034C); with a −2 V off-rail it rises to ~3.4 V,
+/// which is a real dead-time loss penalty users pay for the Cdv/dt
+/// parasitic-turn-on margin.
+pub fn body_diode_v_f(fet: &FetModel, driver: &DriverModel) -> f64 {
+    if fet.is_gan {
+        fet.v_th + driver.v_off.abs()
+    } else {
+        fet.v_f_body
+    }
+}
+
+/// Soft-recovery body-diode model. Returns the diode current at
+/// elapsed-time `t_in_rr` since RR entry, or `None` once RR is
+/// finished. Profile is piecewise-linear:
+///
+/// - t ∈ [0, t_a]:  current sweeps from 0 down to −I_RR_peak.
+/// - t ∈ [t_a, t_a + t_b]:  current recovers from −I_RR_peak back to 0.
+/// - t > t_a + t_b:  RR done; returns None.
+///
+/// where `I_RR_peak = 2 · Q_rr / t_rr` (triangular-charge equivalence)
+/// and `t_a + t_b = t_rr`, with `softness_factor = t_b / t_a`.
+pub fn soft_recovery_i_diode(fet: &FetModel, t_in_rr: f64) -> Option<f64> {
+    if fet.q_rr <= 0.0 || fet.t_rr <= 0.0 {
+        return None;
+    }
+    let s = fet.softness_factor.max(1e-3);
+    let t_a = fet.t_rr / (1.0 + s);
+    let t_b = s * t_a;
+    let i_rr_peak = 2.0 * fet.q_rr / fet.t_rr;
+    if t_in_rr <= 0.0 {
+        Some(0.0)
+    } else if t_in_rr <= t_a {
+        Some(-i_rr_peak * (t_in_rr / t_a))
+    } else if t_in_rr <= t_a + t_b {
+        let frac = (t_in_rr - t_a) / t_b;
+        Some(-i_rr_peak * (1.0 - frac))
+    } else {
+        None
+    }
+}
+
 /// Simulate one HS-FET turn-on event.
 pub fn simulate_hs_turn_on(
     parasitics: &BuckParasiticSet,
@@ -352,10 +521,16 @@ pub fn simulate_hs_turn_on(
     let l_power = parasitics.power_loop_l_henry.max(1e-12);
     let l_s_hs = parasitics.source_degen_l_henry_top.max(0.0);
     let l_s_ls = parasitics.source_degen_l_henry_bot.max(0.0);
-    let c_sw_total = parasitics.sw_node_c_farad + fet_hs.c_oss + fet_ls.c_oss;
+    // C_sw_total is recomputed per-step from the nonlinear C_oss(V_DS)
+    // helpers; this initial value is only used to size the time-step
+    // and seed the f_ring estimate.
+    let c_sw_total_initial =
+        parasitics.sw_node_c_farad + op.c_y_chassis_farad
+            + c_oss_eff(fet_hs, op.v_in) + c_oss_eff(fet_ls, 0.0);
+    let v_f_ls = body_diode_v_f(fet_ls, driver);
 
     let f_ring_est = 1.0 / (2.0 * std::f64::consts::PI
-        * (l_power * c_sw_total).sqrt());
+        * (l_power * c_sw_total_initial).sqrt());
 
     // Gate-loop series R for each side.
     let r_gate_hs = driver.r_source + driver.r_g_ext + fet_hs.r_g_int;
@@ -367,10 +542,15 @@ pub fn simulate_hs_turn_on(
     let mut v_gs_ls = 0.0_f64;       // LS driver pulling low
     let mut i_g_hs = 0.0_f64;
     let mut i_g_ls = 0.0_f64;
-    let mut v_sw = -fet_ls.v_f_body; // diode clamping initially
+    let mut v_sw = -v_f_ls; // diode clamping initially
     let mut i_l = op.i_l_init;
-    let mut q_rev = 0.0_f64;
+    let mut _q_rev_unused = 0.0_f64; // legacy charge-integral; replaced by soft_recovery_i_diode
     let mut diode = DiodeState::Forward;
+    // V_in is a state when c_in_farad > 0 (input cap discharges as
+    // FET draws current); otherwise treat as stiff and equal to v_in.
+    let mut v_in_actual = op.v_in;
+    let mut v_in_min = op.v_in;
+    let mut v_in_max = op.v_in;
 
     // Track previous-step values for derivative-feedback terms.
     let mut prev_dvsw_dt = 0.0_f64;
@@ -411,33 +591,32 @@ pub fn simulate_hs_turn_on(
 
     while step < n_steps {
         // ── 1. FET drain currents ──────────────────────────────────
-        let v_ds_hs = (op.v_in - v_sw).max(0.0);
+        let v_ds_hs = (v_in_actual - v_sw).max(0.0);
         let v_ds_ls = v_sw.max(0.0);    // V_DS_LS = V_SW − GND
         let i_d_hs = fet_i_d(fet_hs, v_gs_hs, v_ds_hs);
         let i_d_ls = fet_i_d(fet_ls, v_gs_ls, v_ds_ls);
 
         if i_d_ls > i_d_ls_peak { i_d_ls_peak = i_d_ls; }
 
+        // Per-step nonlinear capacitance (depletion-region √ scaling
+        // of the datasheet C @ c_test_v down to the actual V_DS).
+        let c_rss_hs = c_rss_eff(fet_hs, v_ds_hs);
+        let c_rss_ls = c_rss_eff(fet_ls, v_ds_ls);
+        let c_sw_total = parasitics.sw_node_c_farad + op.c_y_chassis_farad
+            + c_oss_eff(fet_hs, v_ds_hs) + c_oss_eff(fet_ls, v_ds_ls);
+
         // ── 2. Diode current (KCL at SW node) ──────────────────────
         let i_diode_ls = match diode {
             DiodeState::Forward => {
                 // V_SW pinned at −V_F. Diode swallows whatever current
-                // closes the freewheel balance (positive = SW→GND, the
-                // freewheel direction).
-                // KCL at SW: I_HS_in = I_L + I_LS_FET + I_diode_fwd
-                // → I_diode = I_HS_in − I_L − I_LS_FET, but I_HS_in flows
-                //   FROM V_in INTO SW (positive when FET on), and the
-                //   diode current is from SW TO GND positive, so:
-                //   I_diode = I_L + I_LS_FET − I_HS_in
+                // closes the freewheel balance.
                 (i_l + i_d_ls - i_d_hs).max(0.0)
             }
             DiodeState::ReverseRecovery => {
-                if fet_ls.q_rr > 0.0 {
-                    let frac_remaining = (1.0 - q_rev / fet_ls.q_rr).max(0.0);
-                    -op.i_l_init * frac_remaining
-                } else {
-                    0.0
-                }
+                // Soft-recovery piecewise model: t_a (fall) → t_b
+                // (recovery), parameterised by softness_factor.
+                let t_in_rr = t_rr_entered.map(|t0| t - t0).unwrap_or(0.0);
+                soft_recovery_i_diode(fet_ls, t_in_rr).unwrap_or(0.0)
             }
             DiodeState::Off => 0.0,
         };
@@ -466,17 +645,12 @@ pub fn simulate_hs_turn_on(
         // Miller current INTO C_iss from C_rss is C_rss · dV_DS/dt;
         // when V_DS is FALLING (turn-on), this *robs* gate charge for
         // the on-side and *injects* charge into the off-side gate.
-        let i_miller_hs = fet_hs.c_rss * (-prev_dvsw_dt);
-        let i_miller_ls = fet_ls.c_rss * (prev_dvsw_dt);
+        let i_miller_hs = c_rss_hs * (-prev_dvsw_dt);
+        let i_miller_ls = c_rss_ls * (prev_dvsw_dt);
         let dv_gs_hs_dt = (i_g_hs - i_miller_hs) / fet_hs.c_iss;
         let dv_gs_ls_dt = (i_g_ls + i_miller_ls) / fet_ls.c_iss;
 
         // SW node KCL → dV_SW/dt.
-        //   Forward (V_SW pinned at −V_F): dV_SW/dt = 0.
-        //   RR / Off: cap balances remaining current.
-        //     KCL: I_HS_in (= i_d_hs)  =  I_L + I_LS_FET + I_diode + I_cap
-        //     → I_cap = i_d_hs − i_l − i_d_ls − i_diode_ls
-        //     dV_SW/dt = I_cap / C_sw_total
         let dv_sw_dt = match diode {
             DiodeState::Forward => 0.0,
             DiodeState::ReverseRecovery | DiodeState::Off => {
@@ -485,6 +659,16 @@ pub fn simulate_hs_turn_on(
         };
 
         if dv_sw_dt.abs() > dv_sw_dt_peak { dv_sw_dt_peak = dv_sw_dt.abs(); }
+
+        // V_in node — discharges through the FET when c_in_farad > 0.
+        // dV_in/dt = -I_d_hs / C_in (positive current flowing out of
+        // the cap raises the deficit). When c_in_farad == 0, V_in is
+        // treated as stiff.
+        let dv_in_dt = if op.c_in_farad > 0.0 {
+            -i_d_hs / op.c_in_farad
+        } else {
+            0.0
+        };
 
         // Inductor di/dt = (V_SW − V_out) / L_inductor + loop R drop.
         let di_l_dt = (v_sw - op.v_out - i_l * op.loop_r) / op.l_inductor;
@@ -496,27 +680,29 @@ pub fn simulate_hs_turn_on(
         i_g_ls += di_g_ls_dt * cfg.dt;
         v_sw += dv_sw_dt * cfg.dt;
         i_l += di_l_dt * cfg.dt;
+        v_in_actual += dv_in_dt * cfg.dt;
+        if v_in_actual < v_in_min { v_in_min = v_in_actual; }
+        if v_in_actual > v_in_max { v_in_max = v_in_actual; }
 
         // V_GS_LS is held ≥ 0 by the driver pull-down: don't let it
-        // ring negative (the body diode of the driver clamps).
-        if v_gs_ls < 0.0 { v_gs_ls = 0.0; }
-
-        // Accumulate reverse charge (only when i_diode flows reverse).
-        if i_diode_ls < 0.0 {
-            q_rev += -i_diode_ls * cfg.dt;
-        }
+        // ring negative (the body diode of the driver clamps). For
+        // negative-rail drivers (`driver.v_off < 0`) the LS gate
+        // settles at v_off — clamp accordingly.
+        if v_gs_ls < driver.v_off.min(0.0) { v_gs_ls = driver.v_off.min(0.0); }
 
         // ── 5. Diode state transitions ─────────────────────────────
         match diode {
             DiodeState::Forward => {
                 // Once forward current crosses zero, enter RR.
-                if i_diode_ls <= 0.0 && q_rev == 0.0 && i_d_hs >= op.i_l_init * 0.95 {
+                if i_diode_ls <= 0.0 && i_d_hs >= op.i_l_init * 0.95 {
                     diode = DiodeState::ReverseRecovery;
                     t_rr_entered = Some(t);
                 }
             }
             DiodeState::ReverseRecovery => {
-                if fet_ls.q_rr <= 0.0 || q_rev >= 0.99 * fet_ls.q_rr {
+                // soft_recovery_i_diode returns None once t > t_a+t_b.
+                let t_in_rr = t_rr_entered.map(|t0| t - t0).unwrap_or(0.0);
+                if soft_recovery_i_diode(fet_ls, t_in_rr).is_none() {
                     diode = DiodeState::Off;
                     t_rr_done = Some(t);
                 }
@@ -524,12 +710,9 @@ pub fn simulate_hs_turn_on(
             DiodeState::Off => {
                 // LS body-diode re-conduction clamp on negative-going
                 // ring. If V_SW swings below −V_F the diode catches
-                // it and we re-enter the Forward state. q_rev is
-                // *not* reset — the carriers from the prior RR are
-                // back, but for MVP we don't simulate a *second* RR
-                // when V_SW eventually rises again.
-                if v_sw < -fet_ls.v_f_body {
-                    v_sw = -fet_ls.v_f_body;
+                // it (or for GaN, V_F_eff = v_th + |v_off|).
+                if v_sw < -v_f_ls {
+                    v_sw = -v_f_ls;
                     diode = DiodeState::Forward;
                 }
             }
@@ -586,6 +769,296 @@ pub fn simulate_hs_turn_on(
         i_d_ls_peak,
         dv_sw_dt_peak,
         di_d_dt_peak,
+        v_in_ripple_peak: (v_in_max - v_in_min).max(0.0),
+    }
+}
+
+/// Simulate one HS-FET turn-off event.
+///
+/// Mirror of [`simulate_hs_turn_on`]: at t=0 the HS driver flips from
+/// SOURCE mode (pulling the HS gate to V_drive) to SINK mode (pulling
+/// the HS gate to 0). The LS driver is unchanged (LS gate held at 0).
+///
+/// Phase A. V_GS_HS falls through C_iss·R_gate from V_drive toward the
+/// Miller plateau V_plat = V_th + I_L / g_fs. FET still in ohmic; V_SW
+/// ≈ V_in − I_L · R_DS(on).
+///
+/// Phase B. V_GS_HS holds at the Miller plateau while V_DS_HS slews UP
+/// (i.e. V_SW slews DOWN) from V_in − I_L·R_DS(on) toward 0. The
+/// Miller current direction is reversed vs turn-on: the gate is now
+/// SOURCING into C_gd as V_DS rises.
+///
+/// Phase C. V_SW crosses 0 going DOWN, the LS body diode forward-
+/// conducts as soon as V_SW ≤ −V_F; the inductor current commutates
+/// from HS-FET → LS body diode.
+///
+/// Phase D. V_GS_HS falls below V_th, HS-FET drain current goes to 0;
+/// the freewheel through the LS body diode is established.
+///
+/// Phase E. Parasitic-LC ringing damped by `loop_r` and the body-diode
+/// re-conduction clamp. No reverse-recovery snap (diode is entering
+/// forward conduction, not exiting).
+pub fn simulate_hs_turn_off(
+    parasitics: &BuckParasiticSet,
+    fet_hs: &FetModel,
+    fet_ls: &FetModel,
+    driver: &DriverModel,
+    op: &OperatingPoint,
+    cfg: &SimConfig,
+) -> EdgeWaveforms {
+    let l_gate_hs = parasitics.gate_loop_hs_l_henry.max(1e-12);
+    let l_gate_ls = parasitics.gate_loop_ls_l_henry.max(1e-12);
+    let l_power = parasitics.power_loop_l_henry.max(1e-12);
+    let l_s_hs = parasitics.source_degen_l_henry_top.max(0.0);
+    let l_s_ls = parasitics.source_degen_l_henry_bot.max(0.0);
+    let c_sw_total_initial =
+        parasitics.sw_node_c_farad + op.c_y_chassis_farad
+            + c_oss_eff(fet_hs, 0.0) + c_oss_eff(fet_ls, op.v_in);
+    let v_f_ls = body_diode_v_f(fet_ls, driver);
+
+    let f_ring_est = 1.0 / (2.0 * std::f64::consts::PI
+        * (l_power * c_sw_total_initial).sqrt());
+
+    // Gate-loop series R for each side. At turn-off the HS driver is
+    // SINKING (pulling the HS gate down through r_sink); LS driver is
+    // still sinking the LS gate low.
+    let r_gate_hs = driver.r_sink + driver.r_g_ext + fet_hs.r_g_int;
+    let r_gate_ls = driver.r_sink + driver.r_g_ext + fet_ls.r_g_int;
+
+    // ── Initial conditions ──────────────────────────────────────────
+    //   HS-FET fully ON in triode, conducting I_L from V_in into the
+    //   inductor; V_SW = V_in − I_L · R_DS(on). LS body diode OFF
+    //   (HS is supplying the load). q_rev=0.
+    let mut v_gs_hs = driver.v_drive;
+    let mut v_gs_ls = 0.0_f64;
+    let mut i_g_hs = 0.0_f64;
+    let mut i_g_ls = 0.0_f64;
+    let mut v_sw = (op.v_in - op.i_l_init * fet_hs.r_dson).max(0.0);
+    let mut i_l = op.i_l_init;
+    // q_rev tracked for state-machine completeness; RR never triggers
+    // at turn-off so it stays at 0 in practice.
+    #[allow(unused_assignments)]
+    let mut q_rev = 0.0_f64;
+    let mut diode = DiodeState::Off;
+
+    // Track previous-step values for derivative-feedback terms.
+    let mut prev_dvsw_dt = 0.0_f64;
+    let mut prev_di_d_hs_dt = 0.0_f64;
+    let mut prev_di_d_ls_dt = 0.0_f64;
+    let mut prev_i_d_hs = op.i_l_init; // HS-FET starts carrying I_L
+    let mut prev_i_d_ls = 0.0_f64;
+
+    let mut t = 0.0_f64;
+    let mut samples = Vec::with_capacity((cfg.duration / cfg.dt) as usize / cfg.record_stride);
+
+    // For turn-off, `t_v_th_crossed` records when V_GS_HS falls BELOW
+    // V_th (i.e. the HS-FET fully turns off).
+    let mut t_v_th_crossed: Option<f64> = None;
+    let t_rr_entered: Option<f64> = None; // no RR at turn-off
+    let t_rr_done: Option<f64> = None;
+    let mut i_rr_peak = 0.0_f64;          // re-purposed: peak |i_diode|
+    let mut v_sw_overshoot = 0.0_f64;
+    let mut v_gs_ls_peak = 0.0_f64;
+    let mut i_d_ls_peak = 0.0_f64;
+    let mut dv_sw_dt_peak = 0.0_f64;
+    let mut di_d_dt_peak = 0.0_f64;
+    let mut ls_parasitic_turn_on = false;
+
+    let mut step = 0usize;
+    let n_steps = (cfg.duration / cfg.dt) as usize;
+
+    // Helper: piecewise FET drain-current model (linear-gm in
+    // saturation, ohmic in triode). I_D ≥ 0 by construction.
+    let fet_i_d = |fet: &FetModel, v_gs: f64, v_ds: f64| -> f64 {
+        let v_ov = (v_gs - fet.v_th).max(0.0);
+        if v_ov <= 0.0 {
+            0.0
+        } else if v_ds > v_ov {
+            fet.g_fs * v_ov
+        } else {
+            v_ds.max(0.0) / fet.r_dson
+        }
+    };
+
+    let mut v_in_actual = op.v_in;
+    let mut v_in_min = op.v_in;
+    let mut v_in_max = op.v_in;
+
+    while step < n_steps {
+        // ── 1. FET drain currents + per-step nonlinear capacitances
+        let v_ds_hs = (v_in_actual - v_sw).max(0.0);
+        let v_ds_ls = v_sw.max(0.0);
+        let i_d_hs = fet_i_d(fet_hs, v_gs_hs, v_ds_hs);
+        let i_d_ls = fet_i_d(fet_ls, v_gs_ls, v_ds_ls);
+
+        if i_d_ls > i_d_ls_peak { i_d_ls_peak = i_d_ls; }
+
+        let c_rss_hs = c_rss_eff(fet_hs, v_ds_hs);
+        let c_rss_ls = c_rss_eff(fet_ls, v_ds_ls);
+        let c_sw_total = parasitics.sw_node_c_farad + op.c_y_chassis_farad
+            + c_oss_eff(fet_hs, v_ds_hs) + c_oss_eff(fet_ls, v_ds_ls);
+
+        // ── 2. Diode current (KCL at SW node) ──────────────────────
+        // At turn-off the LS body diode only ever transitions
+        // Off → Forward (no reverse recovery to model).
+        let i_diode_ls = match diode {
+            DiodeState::Forward => (i_l + i_d_ls - i_d_hs).max(0.0),
+            DiodeState::ReverseRecovery | DiodeState::Off => 0.0,
+        };
+
+        // Track the peak |i_diode|. At turn-off the diode is forward-
+        // conducting; we re-use the i_rr_peak field as "peak diode
+        // forward current magnitude" so the struct stays stable.
+        if i_diode_ls.abs() > i_rr_peak {
+            i_rr_peak = i_diode_ls.abs();
+        }
+
+        // ── 3. State derivatives ───────────────────────────────────
+        // HS driver is in SINK mode → V_drive_HS = 0.
+        // LS driver unchanged (sink, holding gate low).
+        let v_drive_hs = 0.0_f64;
+        let v_drive_ls = 0.0_f64;
+
+        // Gate loop ODE — same source-degeneration coupling
+        // L_s · dI_D/dt as turn-on (one-step lag).
+        let di_g_hs_dt = (v_drive_hs - i_g_hs * r_gate_hs - v_gs_hs
+                            - l_s_hs * prev_di_d_hs_dt) / l_gate_hs;
+        let di_g_ls_dt = (v_drive_ls - i_g_ls * r_gate_ls - v_gs_ls
+                            - l_s_ls * prev_di_d_ls_dt) / l_gate_ls;
+
+        // V_GS dynamics — Miller feedback through C_rss.
+        //   HS:  V_DS_HS = V_in − V_SW;  dV_DS_HS/dt = −dV_SW/dt.
+        //   LS:  V_DS_LS = V_SW;          dV_DS_LS/dt = +dV_SW/dt.
+        // At turn-off V_SW is FALLING (dV_SW/dt < 0), so:
+        //   HS V_DS rising  → Miller current FLOWS INTO C_iss (gate
+        //                     gives back charge through C_gd as V_DS↑)
+        //   LS V_DS falling → Miller current PULLS LS gate negative
+        //                     through C_rss. The V_GS_LS ≥ 0 clamp
+        //                     (driver pull-down) catches it.
+        // The sign convention from turn-on carries over unchanged:
+        let i_miller_hs = c_rss_hs * (-prev_dvsw_dt);
+        let i_miller_ls = c_rss_ls * (prev_dvsw_dt);
+        let dv_gs_hs_dt = (i_g_hs - i_miller_hs) / fet_hs.c_iss;
+        let dv_gs_ls_dt = (i_g_ls + i_miller_ls) / fet_ls.c_iss;
+
+        // SW node KCL → dV_SW/dt.
+        let dv_sw_dt = match diode {
+            DiodeState::Forward => 0.0,
+            DiodeState::ReverseRecovery | DiodeState::Off => {
+                (i_d_hs - i_l - i_d_ls - i_diode_ls) / c_sw_total
+            }
+        };
+
+        if dv_sw_dt.abs() > dv_sw_dt_peak { dv_sw_dt_peak = dv_sw_dt.abs(); }
+
+        let dv_in_dt = if op.c_in_farad > 0.0 {
+            -i_d_hs / op.c_in_farad
+        } else {
+            0.0
+        };
+
+        // Inductor di/dt = (V_SW − V_out) / L_inductor + loop R drop.
+        let di_l_dt = (v_sw - op.v_out - i_l * op.loop_r) / op.l_inductor;
+
+        // ── 4. Euler step ──────────────────────────────────────────
+        v_gs_hs += dv_gs_hs_dt * cfg.dt;
+        v_gs_ls += dv_gs_ls_dt * cfg.dt;
+        i_g_hs += di_g_hs_dt * cfg.dt;
+        i_g_ls += di_g_ls_dt * cfg.dt;
+        v_sw += dv_sw_dt * cfg.dt;
+        i_l += di_l_dt * cfg.dt;
+        v_in_actual += dv_in_dt * cfg.dt;
+        if v_in_actual < v_in_min { v_in_min = v_in_actual; }
+        if v_in_actual > v_in_max { v_in_max = v_in_actual; }
+
+        // V_GS_HS held ≥ driver v_off (driver pull-down or negative
+        // rail clamps further negative excursions).
+        let v_gs_min = driver.v_off.min(0.0);
+        if v_gs_hs < v_gs_min { v_gs_hs = v_gs_min; }
+        if v_gs_ls < v_gs_min { v_gs_ls = v_gs_min; }
+
+        // Accumulate reverse charge (only when i_diode flows reverse).
+        // Not expected at turn-off, but harmless if it sneaks in.
+        if i_diode_ls < 0.0 {
+            q_rev += -i_diode_ls * cfg.dt;
+        }
+
+        // ── 5. Diode state transitions ─────────────────────────────
+        // Turn-off goes Off → Forward when V_SW dips below −V_F. The
+        // diode never enters ReverseRecovery during turn-off (it is
+        // turning ON, not OFF).
+        match diode {
+            DiodeState::Off => {
+                if v_sw < -v_f_ls {
+                    v_sw = -v_f_ls;
+                    diode = DiodeState::Forward;
+                }
+            }
+            DiodeState::Forward => {
+                if i_diode_ls <= 0.0 && v_sw > -v_f_ls + 1e-3 {
+                    diode = DiodeState::Off;
+                }
+            }
+            DiodeState::ReverseRecovery => {
+                // Unreachable at turn-off; no-op.
+            }
+        }
+
+        // ── 6. Peaks + flags ──────────────────────────────────────
+        // V_GS_HS crossing V_th going DOWN ⇒ HS-FET fully turning off.
+        if t_v_th_crossed.is_none() && v_gs_hs <= fet_hs.v_th {
+            t_v_th_crossed = Some(t);
+        }
+        if v_sw > op.v_in + v_sw_overshoot {
+            v_sw_overshoot = v_sw - op.v_in;
+        }
+        if v_gs_ls > v_gs_ls_peak { v_gs_ls_peak = v_gs_ls; }
+        if v_gs_ls > fet_ls.v_th { ls_parasitic_turn_on = true; }
+        // dI_D_HS/dt is NEGATIVE during turn-off (drain current is
+        // falling). Track its magnitude.
+        let di_d_hs_dt = (i_d_hs - prev_i_d_hs) / cfg.dt;
+        if di_d_hs_dt.abs() > di_d_dt_peak { di_d_dt_peak = di_d_hs_dt.abs(); }
+
+        // ── 7. Recording ──────────────────────────────────────────
+        if step % cfg.record_stride == 0 {
+            samples.push(EdgeSample {
+                t_s: t,
+                v_gs_hs,
+                v_gs_ls,
+                v_sw,
+                i_l,
+                i_g_hs,
+                i_d_hs,
+                i_d_ls,
+                i_diode_ls,
+                diode_state: diode,
+            });
+        }
+
+        // ── 8. Carry over for next step's derivative-feedback terms.
+        prev_dvsw_dt = dv_sw_dt;
+        prev_di_d_hs_dt = di_d_hs_dt;
+        prev_di_d_ls_dt = (i_d_ls - prev_i_d_ls) / cfg.dt;
+        prev_i_d_hs = i_d_hs;
+        prev_i_d_ls = i_d_ls;
+        t += cfg.dt;
+        step += 1;
+    }
+
+    EdgeWaveforms {
+        samples,
+        t_v_th_crossed,
+        t_rr_entered,
+        t_rr_done,
+        i_rr_peak,
+        v_sw_overshoot,
+        f_ring_est,
+        v_gs_ls_peak,
+        ls_parasitic_turn_on,
+        i_d_ls_peak,
+        dv_sw_dt_peak,
+        di_d_dt_peak,
+        v_in_ripple_peak: (v_in_max - v_in_min).max(0.0),
     }
 }
 
@@ -620,7 +1093,7 @@ mod tests {
         let drv = DriverModel::generic_si_10v();
         let op = OperatingPoint {
             v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
-            loop_r: 20e-3, l_inductor: 4.7e-6,
+            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0,
         };
         let cfg = SimConfig::auto(&p, &fet);
         let w = simulate_hs_turn_on(&p, &fet, &fet, &drv, &op, &cfg);
@@ -635,7 +1108,7 @@ mod tests {
         let drv = DriverModel::generic_si_10v();
         let op = OperatingPoint {
             v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
-            loop_r: 20e-3, l_inductor: 4.7e-6,
+            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0,
         };
         let cfg = SimConfig::auto(&p, &fet);
         let w = simulate_hs_turn_on(&p, &fet, &fet, &drv, &op, &cfg);
@@ -653,7 +1126,7 @@ mod tests {
         let drv = DriverModel::generic_gan_5v();
         let op = OperatingPoint {
             v_in: 48.0, v_out: 12.0, i_l_init: 5.0,
-            loop_r: 15e-3, l_inductor: 2.2e-6,
+            loop_r: 15e-3, l_inductor: 2.2e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0,
         };
         let cfg = SimConfig::auto(&p, &fet);
         let w = simulate_hs_turn_on(&p, &fet, &fet, &drv, &op, &cfg);
@@ -668,5 +1141,120 @@ mod tests {
                 (done - enter) * 1e9
             );
         }
+    }
+
+    #[test]
+    fn hs_turn_off_runs_to_completion() {
+        let p = test_parasitics();
+        let fet = FetModel::bsc0902nsi();
+        let drv = DriverModel::generic_si_10v();
+        let op = OperatingPoint {
+            v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
+            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0,
+        };
+        let cfg = SimConfig::auto(&p, &fet);
+        let w = simulate_hs_turn_off(&p, &fet, &fet, &drv, &op, &cfg);
+        assert!(!w.samples.is_empty());
+        assert!(w.f_ring_est > 1e6);
+        // No reverse recovery at turn-off.
+        assert!(w.t_rr_entered.is_none());
+        assert!(w.t_rr_done.is_none());
+    }
+
+    #[test]
+    fn turn_off_v_gs_falls_below_v_th_within_window() {
+        let p = test_parasitics();
+        let fet = FetModel::bsc0902nsi();
+        let drv = DriverModel::generic_si_10v();
+        let op = OperatingPoint {
+            v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
+            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0,
+        };
+        let cfg = SimConfig::auto(&p, &fet);
+        let w = simulate_hs_turn_off(&p, &fet, &fet, &drv, &op, &cfg);
+        assert!(
+            w.t_v_th_crossed.is_some(),
+            "V_GS_HS never fell below V_th in {} samples (final V_GS_HS = {:?})",
+            w.samples.len(),
+            w.samples.last().map(|s| s.v_gs_hs)
+        );
+    }
+
+    #[test]
+    fn turn_off_v_sw_falls_to_diode_clamp() {
+        let p = test_parasitics();
+        let fet = FetModel::bsc0902nsi();
+        let drv = DriverModel::generic_si_10v();
+        let op = OperatingPoint {
+            v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
+            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0,
+        };
+        let cfg = SimConfig::auto(&p, &fet);
+        let w = simulate_hs_turn_off(&p, &fet, &fet, &drv, &op, &cfg);
+        let n = w.samples.len();
+        assert!(n >= 5, "too few samples: {}", n);
+        let tail_start = n - n / 5; // last 20 % of the window
+        let v_clamp = -fet.v_f_body;
+        for (i, s) in w.samples[tail_start..].iter().enumerate() {
+            assert!(
+                (s.v_sw - v_clamp).abs() < 0.3,
+                "tail sample {} at t={:.3} ns: V_SW = {:.3} V, expected ≈ {:.3} V (diode clamp)",
+                tail_start + i,
+                s.t_s * 1e9,
+                s.v_sw,
+                v_clamp,
+            );
+        }
+    }
+
+    #[test]
+    fn gan_third_quadrant_v_f_uses_v_th_plus_v_off() {
+        // GaN at V_off = -2 V should have V_F_eff = v_th + 2.0.
+        let mut drv = DriverModel::generic_gan_5v();
+        drv.v_off = -2.0;
+        let fet = FetModel::epc2034c();
+        let v_f = body_diode_v_f(&fet, &drv);
+        let expect = fet.v_th + 2.0;
+        assert!(
+            (v_f - expect).abs() < 1e-9,
+            "GaN V_F at v_off=-2 V: got {:.3} V, expected {:.3} V (v_th + 2)",
+            v_f, expect,
+        );
+
+        // Si body diode ignores v_off — always v_f_body.
+        let si = FetModel::bsc0902nsi();
+        let v_f_si = body_diode_v_f(&si, &drv);
+        assert_eq!(v_f_si, si.v_f_body);
+    }
+
+    #[test]
+    fn c_oss_eff_drops_with_higher_v_ds() {
+        // sqrt(V_test/V_DS) scaling — at V_DS = 4·V_test, C_oss should
+        // be half of the datasheet value.
+        let fet = FetModel::bsc0902nsi(); // C_oss = 180 pF @ V_test = 20 V
+        let c_lo = c_oss_eff(&fet, 20.0); // ≈ 180 pF
+        let c_hi = c_oss_eff(&fet, 80.0); // ≈ 90 pF
+        assert!((c_lo - 180e-12).abs() < 1e-13);
+        assert!((c_hi - 90e-12).abs() < 5e-13);
+        assert!(c_hi < c_lo, "C_oss should drop with rising V_DS");
+    }
+
+    #[test]
+    fn soft_recovery_profile_peaks_at_t_a() {
+        // S=0.5, t_rr=50ns, Q_rr=80nC → t_a=t_rr/1.5≈33.3 ns,
+        // I_RR_peak = 2·Q_rr/t_rr = 3.2 A.
+        let fet = FetModel::bsc0902nsi();
+        let i_at_zero = soft_recovery_i_diode(&fet, 0.0).unwrap();
+        let t_a = fet.t_rr / (1.0 + fet.softness_factor);
+        let i_at_ta = soft_recovery_i_diode(&fet, t_a).unwrap();
+        let i_after = soft_recovery_i_diode(&fet, fet.t_rr + 1e-12);
+        assert!((i_at_zero).abs() < 1e-9, "i(0) should be 0");
+        let expect_peak = -2.0 * fet.q_rr / fet.t_rr;
+        assert!(
+            (i_at_ta - expect_peak).abs() / expect_peak.abs() < 1e-3,
+            "i(t_a) = {:.4} A, expected {:.4} A",
+            i_at_ta, expect_peak,
+        );
+        assert!(i_after.is_none(), "RR should be done past t_rr");
     }
 }

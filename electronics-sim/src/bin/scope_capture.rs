@@ -30,8 +30,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use electronics_sim::edge_transient::{
-    default_loop_r, simulate_hs_turn_on, DriverModel, EdgeSample, EdgeWaveforms, FetModel,
-    OperatingPoint, SimConfig,
+    default_loop_r, simulate_hs_turn_off, simulate_hs_turn_on, DriverModel, EdgeSample,
+    EdgeWaveforms, FetModel, OperatingPoint, SimConfig,
 };
 use pdn_schema::BuckParasiticSet;
 
@@ -52,9 +52,13 @@ FET PRESETS:
 
 DRIVER PRESETS:
   --driver si10v          10 V Si MOSFET driver (default).
-  --driver gan5v          5 V GaN driver.
+  --driver gan5v          5 V GaN driver, V_off = 0 V.
+  --driver gan5v_neg      5 V GaN driver, V_off = -2 V (anti-Cdv/dt).
 
 OPTIONAL:
+  --edge turn-on|turn-off Which switching event to capture (default: turn-on).
+  --c-in FARAD            Input bypass cap value (enables V_in ripple modelling).
+  --c-y-chassis FARAD     Assembly-level Y-cap SW→chassis (CM EMI path).
   --l-inductor HENRY      Buck filter inductance (default 4.7e-6).
   --loop-r OHM            Power-loop DC resistance (default 20e-3).
   --duration SECONDS      Sim window (default auto from L·C ring period).
@@ -78,6 +82,9 @@ struct Args {
     dt: Option<f64>,
     csv: Option<PathBuf>,
     json: Option<PathBuf>,
+    edge: Option<String>,
+    c_in: Option<f64>,
+    c_y: Option<f64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -101,6 +108,9 @@ fn parse_args() -> Result<Args, String> {
             "--dt" => a.dt = Some(need(&mut it, &k)?.parse().map_err(|e| format!("{e}"))?),
             "--csv" => a.csv = Some(PathBuf::from(need(&mut it, &k)?)),
             "--json" => a.json = Some(PathBuf::from(need(&mut it, &k)?)),
+            "--edge" => a.edge = Some(need(&mut it, &k)?),
+            "--c-in" => a.c_in = Some(need(&mut it, &k)?.parse().map_err(|e| format!("{e}"))?),
+            "--c-y-chassis" => a.c_y = Some(need(&mut it, &k)?.parse().map_err(|e| format!("{e}"))?),
             _ => return Err(format!("unknown arg: {k}")),
         }
     }
@@ -119,7 +129,8 @@ fn pick_driver(name: &str) -> Result<DriverModel, String> {
     match name {
         "si10v" => Ok(DriverModel::generic_si_10v()),
         "gan5v" => Ok(DriverModel::generic_gan_5v()),
-        _ => Err(format!("unknown --driver preset {:?}; try si10v or gan5v", name)),
+        "gan5v_neg" => Ok(DriverModel::generic_gan_5v_neg_off()),
+        _ => Err(format!("unknown --driver preset {:?}; try si10v, gan5v, or gan5v_neg", name)),
     }
 }
 
@@ -174,6 +185,8 @@ fn run() -> Result<(), String> {
         v_in, v_out, i_l_init: i_l,
         loop_r: a.loop_r.unwrap_or_else(|| default_loop_r(&parasitics)),
         l_inductor: a.l_inductor.unwrap_or(4.7e-6),
+        c_in_farad: a.c_in.unwrap_or(0.0),
+        c_y_chassis_farad: a.c_y.unwrap_or(0.0),
     };
     let mut cfg = SimConfig::auto(&parasitics, &fet);
     if let Some(dur) = a.duration { cfg.duration = dur; }
@@ -199,7 +212,12 @@ fn run() -> Result<(), String> {
                 * (parasitics.sw_node_c_farad + 2.0 * fet.c_oss)).sqrt()) / 1e6,
     );
 
-    let w = simulate_hs_turn_on(&parasitics, &fet, &fet, &driver, &op, &cfg);
+    let edge = a.edge.as_deref().unwrap_or("turn-on");
+    let w = match edge {
+        "turn-on" => simulate_hs_turn_on(&parasitics, &fet, &fet, &driver, &op, &cfg),
+        "turn-off" => simulate_hs_turn_off(&parasitics, &fet, &fet, &driver, &op, &cfg),
+        _ => return Err(format!("--edge must be turn-on or turn-off; got {:?}", edge)),
+    };
 
     println!();
     println!("summary:");
@@ -223,6 +241,9 @@ fn run() -> Result<(), String> {
         println!("  ⚠ LS-FET parasitic turn-on detected — peak I_D_LS = {:.3} A", w.i_d_ls_peak);
     } else {
         println!("  LS-FET parasitic turn-on:  none (peak V_GS_LS below V_th)");
+    }
+    if w.v_in_ripple_peak > 0.0 {
+        println!("  V_in ripple (peak-peak)= {:>8.3} mV", w.v_in_ripple_peak * 1e3);
     }
 
     if let Some(path) = a.csv.as_ref() {
