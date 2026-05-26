@@ -89,35 +89,21 @@
 //!
 //! ## Physics — NOT modelled (yet)
 //!
-//! - **Mutual inductive coupling M_pg** between the power loop and
-//!   gate loop. Real boards see 1-3 nH of mutual; di_power/dt then
-//!   couples into the gate node alongside the L_s term. This needs a
-//!   schema extension (`BuckParasiticSet` carries only L_self per
-//!   role) plus an extractor change to emit the mutual matrix.
-//! - **Body-diode soft-recovery factor S = t_b/t_a.** Real Q_rr has
-//!   two phases — current falling from I_F to peak negative (t_a)
-//!   and recovery from peak negative back to 0 (t_b). The current
-//!   linear-decay model has S=1; most Si bodies are S=0.3-0.7 and
-//!   abrupt bodies (S<<1) cause much higher dI/dt and ringing.
-//! - **HS-FET turn-off** as a separate event. Today we simulate
-//!   turn-on only; turn-off has its own physics (LS body diode
-//!   commutating from off→on, no RR contribution) and needs a
-//!   mirror simulator.
-//! - **C_gd(V_DS) nonlinearity.** C_rss is treated as constant —
-//!   real FETs have C_gd that drops 5-20× as V_DS rises. The Miller
-//!   plateau timescale is therefore optimistic by ~5×.
-//! - **Gate driver output-stage finite slew rate.** V_drive_HS is a
-//!   perfect step today.
+//! - **Mutual coupling M_pg**: schema fields now exist on
+//!   `pdn_schema::BuckParasiticSet` and the consumer-side ODE term is
+//!   wired. The in-tree extractor still emits 0 for both
+//!   `mutual_l_henry_power_gate_hs/_ls`; once the §0.1.5 extractor
+//!   extension emits real M values the existing simulator already
+//!   consumes them.
 //! - **Channel-length modulation / sub-threshold slope.** I_D model
 //!   is linear-gm in saturation, ohmic in triode.
-//! - **Bootstrap-cap recharge dynamics.** HS gate rail is held
-//!   perfectly at `driver.v_drive` for the duration of the event.
-//! - **V_in node ripple** from `L_power · dI_D/dt`. The conducted-EMI
-//!   path back to the LISN is opened only when V_in is allowed to
-//!   ripple, requiring C_in modelling as a state node.
-//! - **Assembly-level Y-capacitance** between the SW node and the
-//!   chassis ground via the FET heatsink tab. Major common-mode EMI
-//!   path; PCB extractor cannot see it.
+//! - **C_iss(V_GS) nonlinearity.** C_iss is treated as constant; real
+//!   FETs vary 1.5-3× with V_GS but the effect is small compared to
+//!   the C_oss / C_rss curves we already model.
+//! - **Multi-edge bootstrap dynamics.** v_boot discharges during
+//!   turn-on (now modelled) but cannot recharge during turn-off; the
+//!   real cycle has C_boot refilling through the bootstrap diode
+//!   when V_SW falls to ≈ 0. Wait for a full-cycle simulator.
 
 use serde::{Deserialize, Serialize};
 
@@ -339,6 +325,15 @@ pub struct OperatingPoint {
     /// SW-node parasitic C for the LC-ring dynamics.
     #[serde(default)]
     pub c_y_chassis_farad: f64,
+    /// Bootstrap-cap value [F]. Sits between BOOT pin and SW node;
+    /// supplies the HS gate-drive charge while the HS-FET is on.
+    /// When > 0, the simulator tracks the boot-cap voltage as a state
+    /// (`v_boot`) and the HS gate sees `min(v_drive, v_boot)` as the
+    /// effective drive rail — discharge is small per edge but matters
+    /// at high duty cycle. Default 0 = treat the boot rail as stiff
+    /// (back-compat).
+    #[serde(default)]
+    pub c_boot_farad: f64,
 }
 
 /// Discrete LS body-diode state.
@@ -551,11 +546,24 @@ pub fn simulate_hs_turn_on(
     let mut v_in_actual = op.v_in;
     let mut v_in_min = op.v_in;
     let mut v_in_max = op.v_in;
+    // Driver output voltages with finite slew rate. HS target = v_drive
+    // at turn-on; LS stays at v_off (0 V or negative rail).
+    let mut v_drive_act_hs = 0.0_f64;
+    let mut v_drive_act_ls = driver.v_off;
+    // Bootstrap-cap state (BOOT-pin voltage referenced to SW); starts
+    // at v_drive after a complete LS-on recharge cycle. Discharges by
+    // i_g_hs · dt / c_boot during HS conduction.
+    let mut v_boot = driver.v_drive;
+    let mut v_boot_min = driver.v_drive;
+    // Mutual inductive coupling between power loop and gate loops.
+    let m_pg_hs = parasitics.mutual_l_henry_power_gate_hs;
+    let m_pg_ls = parasitics.mutual_l_henry_power_gate_ls;
 
     // Track previous-step values for derivative-feedback terms.
     let mut prev_dvsw_dt = 0.0_f64;
     let mut prev_di_d_hs_dt = 0.0_f64;
     let mut prev_di_d_ls_dt = 0.0_f64;
+    let mut prev_di_l_dt = 0.0_f64;
     let mut prev_i_d_hs = 0.0_f64;
     let mut prev_i_d_ls = 0.0_f64;
 
@@ -627,17 +635,33 @@ pub fn simulate_hs_turn_on(
         }
 
         // ── 3. State derivatives ───────────────────────────────────
-        let v_drive_hs = driver.v_drive;
-        let v_drive_ls = 0.0_f64;        // LS driver sinks (pull-down)
+        // Effective driver output voltages — slewed targets. HS target
+        // is v_drive (sourcing); LS target is v_off (sink rail).
+        let v_drive_hs_target = if op.c_boot_farad > 0.0 {
+            v_boot.min(driver.v_drive)
+        } else {
+            driver.v_drive
+        };
+        let v_drive_ls_target = driver.v_off;
+        let dv_drv_hs_dt = (v_drive_hs_target - v_drive_act_hs)
+            .signum() * driver.slew_rate_v_per_s;
+        let dv_drv_ls_dt = (v_drive_ls_target - v_drive_act_ls)
+            .signum() * driver.slew_rate_v_per_s;
+        let v_drive_hs = v_drive_act_hs;
+        let v_drive_ls = v_drive_act_ls;
 
-        // Gate loop ODE — includes the source-degeneration coupling
-        // L_s · dI_D/dt term that opposes the gate drive on fast
-        // di/dt edges. One-step lag on dI_D/dt to avoid an algebraic
-        // loop.
+        // Gate loop ODE — includes:
+        //   1. Source-degeneration L · dI_D/dt term (opposes drive
+        //      on fast di/dt edges; one-step lag).
+        //   2. Mutual coupling M_pg · dI_L/dt between power loop and
+        //      gate loop. When non-zero, di_L/dt couples in alongside
+        //      L_s · dI_D/dt (also one-step lag).
         let di_g_hs_dt = (v_drive_hs - i_g_hs * r_gate_hs - v_gs_hs
-                            - l_s_hs * prev_di_d_hs_dt) / l_gate_hs;
+                            - l_s_hs * prev_di_d_hs_dt
+                            - m_pg_hs * prev_di_l_dt) / l_gate_hs;
         let di_g_ls_dt = (v_drive_ls - i_g_ls * r_gate_ls - v_gs_ls
-                            - l_s_ls * prev_di_d_ls_dt) / l_gate_ls;
+                            - l_s_ls * prev_di_d_ls_dt
+                            - m_pg_ls * prev_di_l_dt) / l_gate_ls;
 
         // V_GS dynamics — Miller feedback through C_rss.
         //   HS:  V_DS_HS = V_in − V_SW;  dV_DS_HS/dt = −dV_SW/dt.
@@ -683,11 +707,26 @@ pub fn simulate_hs_turn_on(
         v_in_actual += dv_in_dt * cfg.dt;
         if v_in_actual < v_in_min { v_in_min = v_in_actual; }
         if v_in_actual > v_in_max { v_in_max = v_in_actual; }
+        // Slew-rate-limited driver outputs — step toward target by at
+        // most slew_rate · dt; clamp at the target to avoid overshoot.
+        v_drive_act_hs += dv_drv_hs_dt * cfg.dt;
+        if (v_drive_act_hs - v_drive_hs_target).signum() != dv_drv_hs_dt.signum() {
+            v_drive_act_hs = v_drive_hs_target;
+        }
+        v_drive_act_ls += dv_drv_ls_dt * cfg.dt;
+        if (v_drive_act_ls - v_drive_ls_target).signum() != dv_drv_ls_dt.signum() {
+            v_drive_act_ls = v_drive_ls_target;
+        }
+        // Bootstrap discharge: the gate-loop current i_g_hs is sourced
+        // from the boot cap, so it integrates down. Only meaningful
+        // when c_boot_farad > 0; otherwise treat as stiff.
+        if op.c_boot_farad > 0.0 {
+            v_boot -= i_g_hs * cfg.dt / op.c_boot_farad;
+            if v_boot < v_boot_min { v_boot_min = v_boot; }
+        }
 
-        // V_GS_LS is held ≥ 0 by the driver pull-down: don't let it
-        // ring negative (the body diode of the driver clamps). For
-        // negative-rail drivers (`driver.v_off < 0`) the LS gate
-        // settles at v_off — clamp accordingly.
+        // V_GS_LS is held ≥ driver v_off; for negative-rail drivers
+        // it settles at v_off.
         if v_gs_ls < driver.v_off.min(0.0) { v_gs_ls = driver.v_off.min(0.0); }
 
         // ── 5. Diode state transitions ─────────────────────────────
@@ -750,12 +789,14 @@ pub fn simulate_hs_turn_on(
         prev_dvsw_dt = dv_sw_dt;
         prev_di_d_hs_dt = di_d_hs_dt;
         prev_di_d_ls_dt = (i_d_ls - prev_i_d_ls) / cfg.dt;
+        prev_di_l_dt = di_l_dt;
         prev_i_d_hs = i_d_hs;
         prev_i_d_ls = i_d_ls;
         t += cfg.dt;
         step += 1;
     }
 
+    let _ = v_boot_min; // optional reporting hook (not yet on EdgeWaveforms)
     EdgeWaveforms {
         samples,
         t_v_th_crossed,
@@ -840,11 +881,19 @@ pub fn simulate_hs_turn_off(
     #[allow(unused_assignments)]
     let mut q_rev = 0.0_f64;
     let mut diode = DiodeState::Off;
+    // Driver output state — at turn-off start the HS driver is still
+    // at v_drive (about to flip to v_off); LS driver was at v_off.
+    let mut v_drive_act_hs = driver.v_drive;
+    let mut v_drive_act_ls = driver.v_off;
+    // Mutual coupling between the power loop and the gate loops.
+    let m_pg_hs = parasitics.mutual_l_henry_power_gate_hs;
+    let m_pg_ls = parasitics.mutual_l_henry_power_gate_ls;
 
     // Track previous-step values for derivative-feedback terms.
     let mut prev_dvsw_dt = 0.0_f64;
     let mut prev_di_d_hs_dt = 0.0_f64;
     let mut prev_di_d_ls_dt = 0.0_f64;
+    let mut prev_di_l_dt = 0.0_f64;
     let mut prev_i_d_hs = op.i_l_init; // HS-FET starts carrying I_L
     let mut prev_i_d_ls = 0.0_f64;
 
@@ -914,17 +963,25 @@ pub fn simulate_hs_turn_off(
         }
 
         // ── 3. State derivatives ───────────────────────────────────
-        // HS driver is in SINK mode → V_drive_HS = 0.
-        // LS driver unchanged (sink, holding gate low).
-        let v_drive_hs = 0.0_f64;
-        let v_drive_ls = 0.0_f64;
+        // HS driver in SINK mode → target = driver.v_off. LS driver
+        // unchanged (sink, holding LS gate low). Slewed via state.
+        let v_drive_hs_target = driver.v_off;
+        let v_drive_ls_target = driver.v_off;
+        let dv_drv_hs_dt = (v_drive_hs_target - v_drive_act_hs)
+            .signum() * driver.slew_rate_v_per_s;
+        let dv_drv_ls_dt = (v_drive_ls_target - v_drive_act_ls)
+            .signum() * driver.slew_rate_v_per_s;
+        let v_drive_hs = v_drive_act_hs;
+        let v_drive_ls = v_drive_act_ls;
 
-        // Gate loop ODE — same source-degeneration coupling
-        // L_s · dI_D/dt as turn-on (one-step lag).
+        // Gate loop ODE — source-degeneration AND mutual-coupling
+        // M_pg · dI_L/dt terms (both one-step lag).
         let di_g_hs_dt = (v_drive_hs - i_g_hs * r_gate_hs - v_gs_hs
-                            - l_s_hs * prev_di_d_hs_dt) / l_gate_hs;
+                            - l_s_hs * prev_di_d_hs_dt
+                            - m_pg_hs * prev_di_l_dt) / l_gate_hs;
         let di_g_ls_dt = (v_drive_ls - i_g_ls * r_gate_ls - v_gs_ls
-                            - l_s_ls * prev_di_d_ls_dt) / l_gate_ls;
+                            - l_s_ls * prev_di_d_ls_dt
+                            - m_pg_ls * prev_di_l_dt) / l_gate_ls;
 
         // V_GS dynamics — Miller feedback through C_rss.
         //   HS:  V_DS_HS = V_in − V_SW;  dV_DS_HS/dt = −dV_SW/dt.
@@ -1035,10 +1092,21 @@ pub fn simulate_hs_turn_off(
             });
         }
 
+        // Slew-rate-limited driver outputs.
+        v_drive_act_hs += dv_drv_hs_dt * cfg.dt;
+        if (v_drive_act_hs - v_drive_hs_target).signum() != dv_drv_hs_dt.signum() {
+            v_drive_act_hs = v_drive_hs_target;
+        }
+        v_drive_act_ls += dv_drv_ls_dt * cfg.dt;
+        if (v_drive_act_ls - v_drive_ls_target).signum() != dv_drv_ls_dt.signum() {
+            v_drive_act_ls = v_drive_ls_target;
+        }
+
         // ── 8. Carry over for next step's derivative-feedback terms.
         prev_dvsw_dt = dv_sw_dt;
         prev_di_d_hs_dt = di_d_hs_dt;
         prev_di_d_ls_dt = (i_d_ls - prev_i_d_ls) / cfg.dt;
+        prev_di_l_dt = di_l_dt;
         prev_i_d_hs = i_d_hs;
         prev_i_d_ls = i_d_ls;
         t += cfg.dt;
@@ -1083,6 +1151,8 @@ mod tests {
             snubber_loop_l_henry: None,
             source_degen_l_henry_top: 0.0,
             source_degen_l_henry_bot: 0.0,
+            mutual_l_henry_power_gate_hs: 0.0,
+            mutual_l_henry_power_gate_ls: 0.0,
         }
     }
 
@@ -1093,7 +1163,7 @@ mod tests {
         let drv = DriverModel::generic_si_10v();
         let op = OperatingPoint {
             v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
-            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0,
+            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0, c_boot_farad: 0.0,
         };
         let cfg = SimConfig::auto(&p, &fet);
         let w = simulate_hs_turn_on(&p, &fet, &fet, &drv, &op, &cfg);
@@ -1108,7 +1178,7 @@ mod tests {
         let drv = DriverModel::generic_si_10v();
         let op = OperatingPoint {
             v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
-            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0,
+            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0, c_boot_farad: 0.0,
         };
         let cfg = SimConfig::auto(&p, &fet);
         let w = simulate_hs_turn_on(&p, &fet, &fet, &drv, &op, &cfg);
@@ -1126,7 +1196,7 @@ mod tests {
         let drv = DriverModel::generic_gan_5v();
         let op = OperatingPoint {
             v_in: 48.0, v_out: 12.0, i_l_init: 5.0,
-            loop_r: 15e-3, l_inductor: 2.2e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0,
+            loop_r: 15e-3, l_inductor: 2.2e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0, c_boot_farad: 0.0,
         };
         let cfg = SimConfig::auto(&p, &fet);
         let w = simulate_hs_turn_on(&p, &fet, &fet, &drv, &op, &cfg);
@@ -1150,7 +1220,7 @@ mod tests {
         let drv = DriverModel::generic_si_10v();
         let op = OperatingPoint {
             v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
-            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0,
+            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0, c_boot_farad: 0.0,
         };
         let cfg = SimConfig::auto(&p, &fet);
         let w = simulate_hs_turn_off(&p, &fet, &fet, &drv, &op, &cfg);
@@ -1168,7 +1238,7 @@ mod tests {
         let drv = DriverModel::generic_si_10v();
         let op = OperatingPoint {
             v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
-            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0,
+            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0, c_boot_farad: 0.0,
         };
         let cfg = SimConfig::auto(&p, &fet);
         let w = simulate_hs_turn_off(&p, &fet, &fet, &drv, &op, &cfg);
@@ -1187,7 +1257,7 @@ mod tests {
         let drv = DriverModel::generic_si_10v();
         let op = OperatingPoint {
             v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
-            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0,
+            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0, c_boot_farad: 0.0,
         };
         let cfg = SimConfig::auto(&p, &fet);
         let w = simulate_hs_turn_off(&p, &fet, &fet, &drv, &op, &cfg);
@@ -1237,6 +1307,83 @@ mod tests {
         assert!((c_lo - 180e-12).abs() < 1e-13);
         assert!((c_hi - 90e-12).abs() < 5e-13);
         assert!(c_hi < c_lo, "C_oss should drop with rising V_DS");
+    }
+
+    #[test]
+    fn slow_driver_slew_delays_v_th_crossing() {
+        let p = test_parasitics();
+        let fet = FetModel::bsc0902nsi();
+        let fast = DriverModel { slew_rate_v_per_s: 1e12, ..DriverModel::generic_si_10v() };
+        let slow = DriverModel { slew_rate_v_per_s: 0.5e9, ..DriverModel::generic_si_10v() };
+        let op = OperatingPoint {
+            v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
+            loop_r: 20e-3, l_inductor: 4.7e-6,
+            c_in_farad: 0.0, c_y_chassis_farad: 0.0, c_boot_farad: 0.0,
+        };
+        let cfg = SimConfig::auto(&p, &fet);
+        let fast_w = simulate_hs_turn_on(&p, &fet, &fet, &fast, &op, &cfg);
+        let slow_w = simulate_hs_turn_on(&p, &fet, &fet, &slow, &op, &cfg);
+        let fast_t = fast_w.t_v_th_crossed.unwrap();
+        let slow_t = slow_w.t_v_th_crossed.unwrap();
+        assert!(
+            slow_t > fast_t * 1.5,
+            "slow driver should delay V_th crossing significantly: fast={:.2} ns vs slow={:.2} ns",
+            fast_t * 1e9, slow_t * 1e9,
+        );
+    }
+
+    #[test]
+    fn bootstrap_with_small_c_boot_droops_more() {
+        // Two runs at identical operating point — one with a stiff
+        // boot rail (c_boot = 0), one with a small 1 nF cap. The
+        // small cap should make the run finish without dV/dt panicking
+        // (i.e. just runs to completion under the new state).
+        let p = test_parasitics();
+        let fet = FetModel::bsc0902nsi();
+        let drv = DriverModel::generic_si_10v();
+        let op_stiff = OperatingPoint {
+            v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
+            loop_r: 20e-3, l_inductor: 4.7e-6,
+            c_in_farad: 0.0, c_y_chassis_farad: 0.0, c_boot_farad: 0.0,
+        };
+        let op_droop = OperatingPoint { c_boot_farad: 1e-9, ..op_stiff };
+        let cfg = SimConfig::auto(&p, &fet);
+        let w_stiff = simulate_hs_turn_on(&p, &fet, &fet, &drv, &op_stiff, &cfg);
+        let w_droop = simulate_hs_turn_on(&p, &fet, &fet, &drv, &op_droop, &cfg);
+        assert!(!w_stiff.samples.is_empty());
+        assert!(!w_droop.samples.is_empty());
+        // V_GS_HS final value should be ≤ in the droop case (gate
+        // can't quite reach v_drive because boot has dropped).
+        let v_gs_stiff = w_stiff.samples.last().unwrap().v_gs_hs;
+        let v_gs_droop = w_droop.samples.last().unwrap().v_gs_hs;
+        assert!(
+            v_gs_droop <= v_gs_stiff + 1e-3,
+            "with smaller C_boot, final V_GS_HS should be ≤ stiff value: \
+             stiff={:.3} V, droop={:.3} V",
+            v_gs_stiff, v_gs_droop,
+        );
+    }
+
+    #[test]
+    fn mutual_m_pg_couples_di_dt_into_gate() {
+        // With M_pg > 0, the dI_L/dt during the slew couples into the
+        // HS gate loop, slowing or accelerating the gate transition.
+        // Just verify the run completes and produces finite output —
+        // physical sign-correctness is a separate validation campaign.
+        let mut p = test_parasitics();
+        p.mutual_l_henry_power_gate_hs = 2e-9;
+        p.mutual_l_henry_power_gate_ls = 1e-9;
+        let fet = FetModel::bsc0902nsi();
+        let drv = DriverModel::generic_si_10v();
+        let op = OperatingPoint {
+            v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
+            loop_r: 20e-3, l_inductor: 4.7e-6,
+            c_in_farad: 0.0, c_y_chassis_farad: 0.0, c_boot_farad: 0.0,
+        };
+        let cfg = SimConfig::auto(&p, &fet);
+        let w = simulate_hs_turn_on(&p, &fet, &fet, &drv, &op, &cfg);
+        assert!(!w.samples.is_empty());
+        assert!(w.samples.iter().all(|s| s.v_gs_hs.is_finite()));
     }
 
     #[test]

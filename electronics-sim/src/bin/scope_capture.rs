@@ -85,6 +85,7 @@ struct Args {
     edge: Option<String>,
     c_in: Option<f64>,
     c_y: Option<f64>,
+    c_boot: Option<f64>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -111,6 +112,7 @@ fn parse_args() -> Result<Args, String> {
             "--edge" => a.edge = Some(need(&mut it, &k)?),
             "--c-in" => a.c_in = Some(need(&mut it, &k)?.parse().map_err(|e| format!("{e}"))?),
             "--c-y-chassis" => a.c_y = Some(need(&mut it, &k)?.parse().map_err(|e| format!("{e}"))?),
+            "--c-boot" => a.c_boot = Some(need(&mut it, &k)?.parse().map_err(|e| format!("{e}"))?),
             _ => return Err(format!("unknown arg: {k}")),
         }
     }
@@ -187,6 +189,7 @@ fn run() -> Result<(), String> {
         l_inductor: a.l_inductor.unwrap_or(4.7e-6),
         c_in_farad: a.c_in.unwrap_or(0.0),
         c_y_chassis_farad: a.c_y.unwrap_or(0.0),
+        c_boot_farad: a.c_boot.unwrap_or(0.0),
     };
     let mut cfg = SimConfig::auto(&parasitics, &fet);
     if let Some(dur) = a.duration { cfg.duration = dur; }
