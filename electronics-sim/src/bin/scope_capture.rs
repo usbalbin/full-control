@@ -59,6 +59,13 @@ OPTIONAL:
   --edge turn-on|turn-off Which switching event to capture (default: turn-on).
   --c-in FARAD            Input bypass cap value (enables V_in ripple modelling).
   --c-y-chassis FARAD     Assembly-level Y-cap SW→chassis (CM EMI path).
+  --filter-chain PATH     auto_filter_chain.py JSON. When --c-in is NOT set,
+                          sums shunt caps on the chain's start_net (or the
+                          net named via --filter-chain-net) and uses that
+                          as c_in_farad. Reads c_eff_at_v_bias_farad
+                          (derated) when present, else c_nominal_farad.
+  --filter-chain-net STR  Override which net to sum shunt caps on
+                          (default: the chain's start_net).
   --l-inductor HENRY      Buck filter inductance (default 4.7e-6).
   --loop-r OHM            Power-loop DC resistance (default 20e-3).
   --duration SECONDS      Sim window (default auto from L·C ring period).
@@ -86,6 +93,8 @@ struct Args {
     c_in: Option<f64>,
     c_y: Option<f64>,
     c_boot: Option<f64>,
+    filter_chain: Option<PathBuf>,
+    filter_chain_net: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -112,6 +121,8 @@ fn parse_args() -> Result<Args, String> {
             "--edge" => a.edge = Some(need(&mut it, &k)?),
             "--c-in" => a.c_in = Some(need(&mut it, &k)?.parse().map_err(|e| format!("{e}"))?),
             "--c-y-chassis" => a.c_y = Some(need(&mut it, &k)?.parse().map_err(|e| format!("{e}"))?),
+            "--filter-chain" => a.filter_chain = Some(PathBuf::from(need(&mut it, &k)?)),
+            "--filter-chain-net" => a.filter_chain_net = Some(need(&mut it, &k)?),
             "--c-boot" => a.c_boot = Some(need(&mut it, &k)?.parse().map_err(|e| format!("{e}"))?),
             _ => return Err(format!("unknown arg: {k}")),
         }
@@ -125,6 +136,42 @@ fn pick_fet(name: &str) -> Result<FetModel, String> {
         "epc2034c" => Ok(FetModel::epc2034c()),
         _ => Err(format!("unknown --fet preset {:?}; try bsc0902nsi or epc2034c", name)),
     }
+}
+
+/// Sum of effective shunt-cap capacitance on a given net inside an
+/// `auto_filter_chain.py` JSON output. When `target_net` is `None`,
+/// uses the chain's `start_net`. Prefers `c_eff_at_v_bias_farad`
+/// (derated) but falls back to `c_nominal_farad` then to the parsed
+/// value string.
+fn sum_shunt_caps_from_filter_chain(
+    path: &PathBuf,
+    target_net: Option<&str>,
+) -> Result<f64, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("read filter-chain JSON {:?}: {e}", path))?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("parse filter-chain JSON {:?}: {e}", path))?;
+    let chain_start = v["start_net"].as_str()
+        .ok_or("filter-chain JSON missing `start_net`")?;
+    let net = target_net.unwrap_or(chain_start);
+    let stages = v["stages"].as_array()
+        .ok_or("filter-chain JSON missing `stages`")?;
+    let mut total = 0.0_f64;
+    let mut n = 0usize;
+    for s in stages {
+        if s["role"].as_str() != Some("shunt_to_gnd") { continue; }
+        if s["on_net"].as_str() != Some(net) { continue; }
+        let c = s["c_eff_at_v_bias_farad"].as_f64()
+            .or_else(|| s["c_nominal_farad"].as_f64())
+            .unwrap_or(0.0);
+        if c > 0.0 {
+            total += c;
+            n += 1;
+        }
+    }
+    eprintln!("# filter-chain: net={net:?} Σ shunt-cap C = {:.3} µF ({n} caps)",
+              total * 1e6);
+    Ok(total)
 }
 
 fn pick_driver(name: &str) -> Result<DriverModel, String> {
@@ -183,11 +230,19 @@ fn run() -> Result<(), String> {
 
     let fet = pick_fet(a.fet.as_deref().unwrap_or("bsc0902nsi"))?;
     let driver = pick_driver(a.driver.as_deref().unwrap_or("si10v"))?;
+    // If --filter-chain is given, derive c_in_farad from the
+    // auto_filter_chain.py JSON output (sum of derated shunt caps on
+    // the chosen net). Explicit --c-in always wins.
+    let c_in_from_chain = if let (Some(path), None) = (&a.filter_chain, a.c_in) {
+        Some(sum_shunt_caps_from_filter_chain(path, a.filter_chain_net.as_deref())?)
+    } else {
+        None
+    };
     let op = OperatingPoint {
         v_in, v_out, i_l_init: i_l,
         loop_r: a.loop_r.unwrap_or_else(|| default_loop_r(&parasitics)),
         l_inductor: a.l_inductor.unwrap_or(4.7e-6),
-        c_in_farad: a.c_in.unwrap_or(0.0),
+        c_in_farad: a.c_in.or(c_in_from_chain).unwrap_or(0.0),
         c_y_chassis_farad: a.c_y.unwrap_or(0.0),
         c_boot_farad: a.c_boot.unwrap_or(0.0),
     };
