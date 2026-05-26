@@ -6,6 +6,7 @@ pub mod monte_carlo;
 pub mod pdn;
 pub mod pfc_bode;
 pub mod pfc_sim;
+pub mod scope_capture;
 pub mod sim;
 pub mod spectrum_export;
 pub mod zvs;

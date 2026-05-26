@@ -939,8 +939,10 @@ name = "electronics-sim"
 version = "0.1.0"
 dependencies = [
  "full-control",
+ "pdn-schema",
  "pid",
  "serde",
+ "serde_json",
 ]
 
 [[package]]

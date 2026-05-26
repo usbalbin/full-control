@@ -4,6 +4,7 @@ use full_control::control_2p2z::Topology as ControlTopology;
 
 use crate::bode::{BodeData, NonIdealParams, show_bode};
 use crate::pfc_bode::{PfcBodeData, show_pfc_bode};
+use crate::scope_capture::{ScopeUi, show_scope_capture};
 use crate::pfc_sim::{PfcSimParams, PfcSimPoint, PfcMetrics, PfcControlMode, PfcTopology, run_pfc_simulation, run_pfc_vin_sweep, SOFT_START_HALF_CYCLES};
 use crate::sim::{CapTypeUi, CurrentConduction, FetProfile, McuProfile, CsProfile, DacProfile, LossBreakdown, LoadKind, SimParams, SimPoint, build_ctrl_params_multi, compute_losses, computed_r_series_mohm, run_simulation, SOFT_START_CYCLES, STEADY_STATE_CYCLES, LOAD_STEP_CYCLES};
 use crate::spectrum_export::{export_input_current_spectrum, ExportMode, RingingParams};
@@ -17,6 +18,14 @@ enum ConverterMode {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Tab {
     Simulation,
+    /// Single-cycle steady-state oscilloscope view synthesised from
+    /// the running buck sim (rise/fall/Miller markers, ringing from
+    /// LoopExtraction). Re-uses the in-memory spectrum-export
+    /// primitive so the scope and the FFT'd export are guaranteed
+    /// bit-identical.
+    ScopeSynth,
+    /// New "Scope" tab — loads + renders the JSON / CSV waveforms
+    /// produced by the `electronics-sim` `scope-capture` binary.
     Scope,
     Bode,
     ConductedEmc,
@@ -138,6 +147,14 @@ pub struct BuckSimApp {
     // the FFT'd export are guaranteed bit-identical. Sample count
     // independent from the export's; defaults higher for crisp edges.
     scope_samples_per_cycle: u32,
+
+    // ── Scope-capture tab (loads JSON / CSV from `scope-capture`) ────────
+    // The new "Scope" tab — separate from the synth-scope view above
+    // — reads the time-domain edge-transient capture produced by
+    // `electronics-sim`'s `scope-capture` binary and renders it as
+    // three linked-x panels (voltages / currents / diode state) +
+    // summary readout.
+    scope_ui: ScopeUi,
 
     // ── Conducted EMC view ───────────────────────────────────────────────
     // In-process LISN evaluation of whatever spectrum the export
@@ -525,6 +542,7 @@ impl BuckSimApp {
             spectrum_pwm_trapezoidal: true,
             spectrum_export_status: None,
             scope_samples_per_cycle: 2048,
+            scope_ui: ScopeUi::new(),
             conducted_emc_input_cap_uf: 100.0,
             conducted_emc_input_cap_esr_mohm: 10.0,
             conducted_emc_input_cap_esl_nh: 10.0,
@@ -1552,6 +1570,7 @@ impl BuckSimApp {
         // Tab bar
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tab, Tab::Simulation, "Simulation");
+            ui.selectable_value(&mut self.tab, Tab::ScopeSynth, "Scope (Synth)");
             ui.selectable_value(&mut self.tab, Tab::Scope, "Scope");
             ui.selectable_value(&mut self.tab, Tab::Bode, "Bode");
             ui.selectable_value(&mut self.tab, Tab::ConductedEmc, "Conducted EMC");
@@ -1560,7 +1579,8 @@ impl BuckSimApp {
 
         match self.tab {
             Tab::Simulation => self.show_simulation(ui),
-            Tab::Scope => self.show_scope(ui),
+            Tab::ScopeSynth => self.show_scope(ui),
+            Tab::Scope => show_scope_capture(ui, &mut self.scope_ui),
             Tab::ConductedEmc => self.show_conducted_emc(ui),
             Tab::Bode => {
                 self.show_pdn_loader(ui);
