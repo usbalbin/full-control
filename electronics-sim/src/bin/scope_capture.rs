@@ -126,13 +126,13 @@ fn pick_driver(name: &str) -> Result<DriverModel, String> {
 fn write_csv(path: &PathBuf, samples: &[EdgeSample]) -> std::io::Result<()> {
     use std::io::Write;
     let mut w = std::io::BufWriter::new(std::fs::File::create(path)?);
-    writeln!(w, "t_ns,v_gs_hs,v_sw,i_l,i_g_hs,i_d_hs,i_diode_ls,diode_state")?;
+    writeln!(w, "t_ns,v_gs_hs,v_gs_ls,v_sw,i_l,i_g_hs,i_d_hs,i_d_ls,i_diode_ls,diode_state")?;
     for s in samples {
         writeln!(
             w,
-            "{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:?}",
-            s.t_s * 1e9, s.v_gs_hs, s.v_sw, s.i_l, s.i_g_hs,
-            s.i_d_hs, s.i_diode_ls, s.diode_state,
+            "{:.4},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:.6},{:?}",
+            s.t_s * 1e9, s.v_gs_hs, s.v_gs_ls, s.v_sw, s.i_l, s.i_g_hs,
+            s.i_d_hs, s.i_d_ls, s.i_diode_ls, s.diode_state,
         )?;
     }
     Ok(())
@@ -216,6 +216,14 @@ fn run() -> Result<(), String> {
     println!("  peak |I_RR|            = {:>8.3} A", w.i_rr_peak);
     println!("  V_SW overshoot vs V_in = {:>8.3} V", w.v_sw_overshoot);
     println!("  parasitic-LC ring est  = {:>8.3} MHz", w.f_ring_est / 1e6);
+    println!("  peak |dV_SW/dt|        = {:>8.3} V/ns", w.dv_sw_dt_peak / 1e9);
+    println!("  peak |dI_D/dt|         = {:>8.3} A/ns", w.di_d_dt_peak / 1e9);
+    println!("  peak V_GS_LS           = {:>8.3} V  (V_th_LS = {:.2} V)", w.v_gs_ls_peak, fet.v_th);
+    if w.ls_parasitic_turn_on {
+        println!("  ⚠ LS-FET parasitic turn-on detected — peak I_D_LS = {:.3} A", w.i_d_ls_peak);
+    } else {
+        println!("  LS-FET parasitic turn-on:  none (peak V_GS_LS below V_th)");
+    }
 
     if let Some(path) = a.csv.as_ref() {
         write_csv(path, &w.samples).map_err(|e| format!("write CSV: {e}"))?;

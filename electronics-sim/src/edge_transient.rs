@@ -69,23 +69,55 @@
 //! The diode state machine is encoded in [`DiodeState`]; transitions
 //! latch on threshold crossings between sub-steps.
 //!
-//! ## NOT modelled (yet)
+//! ## Physics — now modelled (as of this revision)
 //!
-//! - Source-degeneration inductance (`source_degen_l_henry_top/_bot`)
-//!   coupling between drain current and gate loop. Adds a fast Lg·dI/dt
-//!   feedback that suppresses dI/dt. Hook is wired (L_sd appears in the
-//!   schema) but the equations do not yet include the cross-coupling
-//!   term.
-//! - Cgd nonlinearity with V_DS. Today C_rss is treated as constant —
-//!   real FETs have Cgd that drops 5-20× as V_DS rises (the bulk of the
-//!   Cgd curve in datasheets is at V_DS < 5 V). Real curve would
-//!   stretch the Miller plateau timescale.
-//! - Gate driver output-stage finite slew rate. Today V_drive_HS is a
-//!   perfect step.
-//! - Channel-length modulation / sub-threshold slope. The FET I_D model
-//!   is the textbook square-law in saturation, ohmic in triode.
-//! - Bootstrap-cap recharge dynamics. The HS gate rail is held perfectly
-//!   at `driver.v_drive` for the duration of the event.
+//! - **LS-FET body-diode re-conduction clamp** on negative-going V_SW
+//!   ringing. Once the parasitic LC tries to swing V_SW below −V_F the
+//!   LS body diode catches it again; this is the dominant asymmetric-
+//!   damping mechanism on real boards.
+//! - **C_gd / dV/dt parasitic turn-on of the LS (off) FET.** A fast
+//!   rising V_SW couples through C_rss_LS into the LS gate node; if
+//!   that gate voltage crosses V_th_LS the off-FET partially conducts,
+//!   sourcing crow-bar current SW→GND — the #1 EMC/loss mechanism in
+//!   high-dV/dt buck and GaN stages.
+//! - **Source-degeneration (common-source) inductance** feedback. The
+//!   FET package source inductance L_s appears in both the gate-loop
+//!   return and the drain conduction path; `L_s · dI_D/dt` opposes
+//!   the gate drive and slows fast switching. Schema fields
+//!   `source_degen_l_henry_top/_bot` now flow into the gate-loop
+//!   ODE.
+//!
+//! ## Physics — NOT modelled (yet)
+//!
+//! - **Mutual inductive coupling M_pg** between the power loop and
+//!   gate loop. Real boards see 1-3 nH of mutual; di_power/dt then
+//!   couples into the gate node alongside the L_s term. This needs a
+//!   schema extension (`BuckParasiticSet` carries only L_self per
+//!   role) plus an extractor change to emit the mutual matrix.
+//! - **Body-diode soft-recovery factor S = t_b/t_a.** Real Q_rr has
+//!   two phases — current falling from I_F to peak negative (t_a)
+//!   and recovery from peak negative back to 0 (t_b). The current
+//!   linear-decay model has S=1; most Si bodies are S=0.3-0.7 and
+//!   abrupt bodies (S<<1) cause much higher dI/dt and ringing.
+//! - **HS-FET turn-off** as a separate event. Today we simulate
+//!   turn-on only; turn-off has its own physics (LS body diode
+//!   commutating from off→on, no RR contribution) and needs a
+//!   mirror simulator.
+//! - **C_gd(V_DS) nonlinearity.** C_rss is treated as constant —
+//!   real FETs have C_gd that drops 5-20× as V_DS rises. The Miller
+//!   plateau timescale is therefore optimistic by ~5×.
+//! - **Gate driver output-stage finite slew rate.** V_drive_HS is a
+//!   perfect step today.
+//! - **Channel-length modulation / sub-threshold slope.** I_D model
+//!   is linear-gm in saturation, ohmic in triode.
+//! - **Bootstrap-cap recharge dynamics.** HS gate rail is held
+//!   perfectly at `driver.v_drive` for the duration of the event.
+//! - **V_in node ripple** from `L_power · dI_D/dt`. The conducted-EMI
+//!   path back to the LISN is opened only when V_in is allowed to
+//!   ripple, requiring C_in modelling as a state node.
+//! - **Assembly-level Y-capacitance** between the SW node and the
+//!   chassis ground via the FET heatsink tab. Major common-mode EMI
+//!   path; PCB extractor cannot see it.
 
 use serde::{Deserialize, Serialize};
 
@@ -227,10 +259,12 @@ pub enum DiodeState {
 pub struct EdgeSample {
     pub t_s: f64,
     pub v_gs_hs: f64,
+    pub v_gs_ls: f64,
     pub v_sw: f64,
     pub i_l: f64,
     pub i_g_hs: f64,
     pub i_d_hs: f64,
+    pub i_d_ls: f64,
     pub i_diode_ls: f64,
     pub diode_state: DiodeState,
 }
@@ -253,6 +287,22 @@ pub struct EdgeWaveforms {
     pub v_sw_overshoot: f64,
     /// Estimated ringing frequency [Hz] from L_power · C_sw_total.
     pub f_ring_est: f64,
+    /// Peak V_GS_LS observed during the edge [V]. A value above
+    /// `fet_ls.v_th` means the off-side FET was momentarily driven
+    /// on by C_rss·dV_SW/dt — flag a shoot-through risk.
+    pub v_gs_ls_peak: f64,
+    /// `true` when v_gs_ls_peak exceeded `fet_ls.v_th` — i.e. the
+    /// LS-FET was parasitically driven on at some point.
+    pub ls_parasitic_turn_on: bool,
+    /// Peak parasitic LS-FET drain current [A] (zero unless
+    /// `ls_parasitic_turn_on`).
+    pub i_d_ls_peak: f64,
+    /// Peak `dV_SW/dt` magnitude [V/s] during the slew. Drives EMI
+    /// and is the headline number for FCC/CISPR predictions.
+    pub dv_sw_dt_peak: f64,
+    /// Peak `dI_D_HS/dt` magnitude [A/s] during the slew. Drives the
+    /// radiated H-field via the power-loop antenna area.
+    pub di_d_dt_peak: f64,
 }
 
 /// Configuration knobs for the simulator.
@@ -297,25 +347,37 @@ pub fn simulate_hs_turn_on(
     op: &OperatingPoint,
     cfg: &SimConfig,
 ) -> EdgeWaveforms {
-    let l_gate = parasitics.gate_loop_hs_l_henry.max(1e-12);
+    let l_gate_hs = parasitics.gate_loop_hs_l_henry.max(1e-12);
+    let l_gate_ls = parasitics.gate_loop_ls_l_henry.max(1e-12);
     let l_power = parasitics.power_loop_l_henry.max(1e-12);
+    let l_s_hs = parasitics.source_degen_l_henry_top.max(0.0);
+    let l_s_ls = parasitics.source_degen_l_henry_bot.max(0.0);
     let c_sw_total = parasitics.sw_node_c_farad + fet_hs.c_oss + fet_ls.c_oss;
 
     let f_ring_est = 1.0 / (2.0 * std::f64::consts::PI
         * (l_power * c_sw_total).sqrt());
 
-    // Gate-loop series R: driver source impedance + driver→gate trace
-    // not modelled separately (lumped into r_source) + external gate
-    // resistor + FET internal R_G.
-    let r_gate = driver.r_source + driver.r_g_ext + fet_hs.r_g_int;
+    // Gate-loop series R for each side.
+    let r_gate_hs = driver.r_source + driver.r_g_ext + fet_hs.r_g_int;
+    // The LS gate is being actively pulled LOW — driver in sink mode.
+    let r_gate_ls = driver.r_sink + driver.r_g_ext + fet_ls.r_g_int;
 
     // ── Initial conditions ──────────────────────────────────────────
     let mut v_gs_hs = 0.0_f64;
+    let mut v_gs_ls = 0.0_f64;       // LS driver pulling low
     let mut i_g_hs = 0.0_f64;
-    let mut v_sw = -fet_ls.v_f_body;       // diode clamping
+    let mut i_g_ls = 0.0_f64;
+    let mut v_sw = -fet_ls.v_f_body; // diode clamping initially
     let mut i_l = op.i_l_init;
     let mut q_rev = 0.0_f64;
     let mut diode = DiodeState::Forward;
+
+    // Track previous-step values for derivative-feedback terms.
+    let mut prev_dvsw_dt = 0.0_f64;
+    let mut prev_di_d_hs_dt = 0.0_f64;
+    let mut prev_di_d_ls_dt = 0.0_f64;
+    let mut prev_i_d_hs = 0.0_f64;
+    let mut prev_i_d_ls = 0.0_f64;
 
     let mut t = 0.0_f64;
     let mut samples = Vec::with_capacity((cfg.duration / cfg.dt) as usize / cfg.record_stride);
@@ -325,43 +387,50 @@ pub fn simulate_hs_turn_on(
     let mut t_rr_done: Option<f64> = None;
     let mut i_rr_peak = 0.0_f64;
     let mut v_sw_overshoot = 0.0_f64;
+    let mut v_gs_ls_peak = 0.0_f64;
+    let mut i_d_ls_peak = 0.0_f64;
+    let mut dv_sw_dt_peak = 0.0_f64;
+    let mut di_d_dt_peak = 0.0_f64;
+    let mut ls_parasitic_turn_on = false;
 
     let mut step = 0usize;
     let n_steps = (cfg.duration / cfg.dt) as usize;
 
-    // Previous dV_SW/dt for the Miller-feedback approximation.
-    let mut prev_dvsw_dt = 0.0_f64;
+    // Helper: piecewise FET drain-current model (linear-gm in
+    // saturation, ohmic in triode). I_D ≥ 0 by construction.
+    let fet_i_d = |fet: &FetModel, v_gs: f64, v_ds: f64| -> f64 {
+        let v_ov = (v_gs - fet.v_th).max(0.0);
+        if v_ov <= 0.0 {
+            0.0
+        } else if v_ds > v_ov {
+            fet.g_fs * v_ov
+        } else {
+            v_ds.max(0.0) / fet.r_dson
+        }
+    };
 
     while step < n_steps {
-        // ── 1. FET region + drain current ──────────────────────────
+        // ── 1. FET drain currents ──────────────────────────────────
         let v_ds_hs = (op.v_in - v_sw).max(0.0);
-        let v_ov = (v_gs_hs - fet_hs.v_th).max(0.0);
-        let i_d_hs = if v_ov <= 0.0 {
-            0.0
-        } else if v_ds_hs > v_ov {
-            // Saturation — linear-gm (velocity-saturated regime is
-            // the operating point for power MOSFETs; square-law
-            // would overshoot grossly at high overdrives).
-            fet_hs.g_fs * v_ov
-        } else {
-            // Triode — linear ohmic.
-            v_ds_hs / fet_hs.r_dson
-        };
+        let v_ds_ls = v_sw.max(0.0);    // V_DS_LS = V_SW − GND
+        let i_d_hs = fet_i_d(fet_hs, v_gs_hs, v_ds_hs);
+        let i_d_ls = fet_i_d(fet_ls, v_gs_ls, v_ds_ls);
+
+        if i_d_ls > i_d_ls_peak { i_d_ls_peak = i_d_ls; }
 
         // ── 2. Diode current (KCL at SW node) ──────────────────────
-        // The HS FET injects i_d_hs into SW. The inductor pulls i_l
-        // out (toward V_out). The diode behaviour depends on the
-        // state:
-        //
-        // - Forward: V_SW pinned at −V_F; diode swallows whatever
-        //   current closes the freewheel balance.
-        // - ReverseRecovery: linearly-decaying reverse current model
-        //   for Q_rr sweep-out (starts at −I_L_init when entering RR,
-        //   decays to 0 as q_rev integrates up to Q_rr). The SW-node
-        //   cap also slews, so Miller feedback can activate.
-        // - Off: diode is blocking; current is zero.
         let i_diode_ls = match diode {
-            DiodeState::Forward => (i_l - i_d_hs).max(0.0),
+            DiodeState::Forward => {
+                // V_SW pinned at −V_F. Diode swallows whatever current
+                // closes the freewheel balance (positive = SW→GND, the
+                // freewheel direction).
+                // KCL at SW: I_HS_in = I_L + I_LS_FET + I_diode_fwd
+                // → I_diode = I_HS_in − I_L − I_LS_FET, but I_HS_in flows
+                //   FROM V_in INTO SW (positive when FET on), and the
+                //   diode current is from SW TO GND positive, so:
+                //   I_diode = I_L + I_LS_FET − I_HS_in
+                (i_l + i_d_ls - i_d_hs).max(0.0)
+            }
             DiodeState::ReverseRecovery => {
                 if fet_ls.q_rr > 0.0 {
                     let frac_remaining = (1.0 - q_rev / fet_ls.q_rr).max(0.0);
@@ -379,33 +448,58 @@ pub fn simulate_hs_turn_on(
         }
 
         // ── 3. State derivatives ───────────────────────────────────
-        let v_drive = driver.v_drive;
-        let di_g_dt = (v_drive - i_g_hs * r_gate - v_gs_hs) / l_gate;
-        // Miller term: gate is also sourcing C_rss · dV_DS/dt.
-        // V_DS_HS = V_in − V_SW, so dV_DS/dt = −dV_SW/dt.
-        let i_miller = fet_hs.c_rss * (-prev_dvsw_dt);
-        let dv_gs_dt = (i_g_hs - i_miller) / fet_hs.c_iss;
+        let v_drive_hs = driver.v_drive;
+        let v_drive_ls = 0.0_f64;        // LS driver sinks (pull-down)
 
-        // SW node KCL → dV_SW/dt. V_SW is hard-pinned at −V_F only
-        // during the forward-conducting phase. Once the diode enters
-        // reverse recovery the cap takes whatever the diode doesn't
-        // absorb (Miller feedback then activates and forms the
-        // V_GS plateau as V_SW slews up).
+        // Gate loop ODE — includes the source-degeneration coupling
+        // L_s · dI_D/dt term that opposes the gate drive on fast
+        // di/dt edges. One-step lag on dI_D/dt to avoid an algebraic
+        // loop.
+        let di_g_hs_dt = (v_drive_hs - i_g_hs * r_gate_hs - v_gs_hs
+                            - l_s_hs * prev_di_d_hs_dt) / l_gate_hs;
+        let di_g_ls_dt = (v_drive_ls - i_g_ls * r_gate_ls - v_gs_ls
+                            - l_s_ls * prev_di_d_ls_dt) / l_gate_ls;
+
+        // V_GS dynamics — Miller feedback through C_rss.
+        //   HS:  V_DS_HS = V_in − V_SW;  dV_DS_HS/dt = −dV_SW/dt.
+        //   LS:  V_DS_LS = V_SW;          dV_DS_LS/dt = +dV_SW/dt.
+        // Miller current INTO C_iss from C_rss is C_rss · dV_DS/dt;
+        // when V_DS is FALLING (turn-on), this *robs* gate charge for
+        // the on-side and *injects* charge into the off-side gate.
+        let i_miller_hs = fet_hs.c_rss * (-prev_dvsw_dt);
+        let i_miller_ls = fet_ls.c_rss * (prev_dvsw_dt);
+        let dv_gs_hs_dt = (i_g_hs - i_miller_hs) / fet_hs.c_iss;
+        let dv_gs_ls_dt = (i_g_ls + i_miller_ls) / fet_ls.c_iss;
+
+        // SW node KCL → dV_SW/dt.
+        //   Forward (V_SW pinned at −V_F): dV_SW/dt = 0.
+        //   RR / Off: cap balances remaining current.
+        //     KCL: I_HS_in (= i_d_hs)  =  I_L + I_LS_FET + I_diode + I_cap
+        //     → I_cap = i_d_hs − i_l − i_d_ls − i_diode_ls
+        //     dV_SW/dt = I_cap / C_sw_total
         let dv_sw_dt = match diode {
             DiodeState::Forward => 0.0,
             DiodeState::ReverseRecovery | DiodeState::Off => {
-                (i_d_hs - i_l - i_diode_ls) / c_sw_total
+                (i_d_hs - i_l - i_d_ls - i_diode_ls) / c_sw_total
             }
         };
+
+        if dv_sw_dt.abs() > dv_sw_dt_peak { dv_sw_dt_peak = dv_sw_dt.abs(); }
 
         // Inductor di/dt = (V_SW − V_out) / L_inductor + loop R drop.
         let di_l_dt = (v_sw - op.v_out - i_l * op.loop_r) / op.l_inductor;
 
         // ── 4. Euler step ──────────────────────────────────────────
-        v_gs_hs += dv_gs_dt * cfg.dt;
-        i_g_hs += di_g_dt * cfg.dt;
+        v_gs_hs += dv_gs_hs_dt * cfg.dt;
+        v_gs_ls += dv_gs_ls_dt * cfg.dt;
+        i_g_hs += di_g_hs_dt * cfg.dt;
+        i_g_ls += di_g_ls_dt * cfg.dt;
         v_sw += dv_sw_dt * cfg.dt;
         i_l += di_l_dt * cfg.dt;
+
+        // V_GS_LS is held ≥ 0 by the driver pull-down: don't let it
+        // ring negative (the body diode of the driver clamps).
+        if v_gs_ls < 0.0 { v_gs_ls = 0.0; }
 
         // Accumulate reverse charge (only when i_diode flows reverse).
         if i_diode_ls < 0.0 {
@@ -422,42 +516,59 @@ pub fn simulate_hs_turn_on(
                 }
             }
             DiodeState::ReverseRecovery => {
-                // Done when 99 % of Q_rr is swept out (the last 1 %
-                // would never integrate with the linear-decay model
-                // since I_diode → 0 as frac_remaining → 0).
                 if fet_ls.q_rr <= 0.0 || q_rev >= 0.99 * fet_ls.q_rr {
                     diode = DiodeState::Off;
                     t_rr_done = Some(t);
                 }
             }
-            DiodeState::Off => {}
+            DiodeState::Off => {
+                // LS body-diode re-conduction clamp on negative-going
+                // ring. If V_SW swings below −V_F the diode catches
+                // it and we re-enter the Forward state. q_rev is
+                // *not* reset — the carriers from the prior RR are
+                // back, but for MVP we don't simulate a *second* RR
+                // when V_SW eventually rises again.
+                if v_sw < -fet_ls.v_f_body {
+                    v_sw = -fet_ls.v_f_body;
+                    diode = DiodeState::Forward;
+                }
+            }
         }
 
-        // ── 6. V_GS_HS V_th crossing ──────────────────────────────
+        // ── 6. Peaks + flags ──────────────────────────────────────
         if t_v_th_crossed.is_none() && v_gs_hs >= fet_hs.v_th {
             t_v_th_crossed = Some(t);
         }
-
-        // ── 7. V_SW overshoot above V_in ──────────────────────────
         if v_sw > op.v_in + v_sw_overshoot {
             v_sw_overshoot = v_sw - op.v_in;
         }
+        if v_gs_ls > v_gs_ls_peak { v_gs_ls_peak = v_gs_ls; }
+        if v_gs_ls > fet_ls.v_th { ls_parasitic_turn_on = true; }
+        let di_d_hs_dt = (i_d_hs - prev_i_d_hs) / cfg.dt;
+        if di_d_hs_dt.abs() > di_d_dt_peak { di_d_dt_peak = di_d_hs_dt.abs(); }
 
-        // ── 8. Recording ──────────────────────────────────────────
+        // ── 7. Recording ──────────────────────────────────────────
         if step % cfg.record_stride == 0 {
             samples.push(EdgeSample {
                 t_s: t,
                 v_gs_hs,
+                v_gs_ls,
                 v_sw,
                 i_l,
                 i_g_hs,
                 i_d_hs,
+                i_d_ls,
                 i_diode_ls,
                 diode_state: diode,
             });
         }
 
+        // ── 8. Carry over for next step's derivative-feedback terms.
         prev_dvsw_dt = dv_sw_dt;
+        prev_di_d_hs_dt = di_d_hs_dt;
+        prev_di_d_ls_dt = (i_d_ls - prev_i_d_ls) / cfg.dt;
+        prev_i_d_hs = i_d_hs;
+        prev_i_d_ls = i_d_ls;
         t += cfg.dt;
         step += 1;
     }
@@ -470,6 +581,11 @@ pub fn simulate_hs_turn_on(
         i_rr_peak,
         v_sw_overshoot,
         f_ring_est,
+        v_gs_ls_peak,
+        ls_parasitic_turn_on,
+        i_d_ls_peak,
+        dv_sw_dt_peak,
+        di_d_dt_peak,
     }
 }
 
