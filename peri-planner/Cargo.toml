@@ -20,6 +20,23 @@ name = "extract"
 path = "tools/extract.rs"
 required-features = ["extract"]
 
+# Whole-lineup catalog generator: distills stm32-data's per-chip JSON into the
+# embedded `assets/catalog.json` consumed by `src/catalog.rs`. Reads the
+# generated JSON directly (no metapac build), so one run emits all ~1600 parts.
+#   cargo run --bin gen_catalog --features gen-catalog -- <stm32-data>/build/data/chips
+[[bin]]
+name = "gen_catalog"
+path = "tools/gen_catalog.rs"
+required-features = ["gen-catalog"]
+
+# Tier-3 fabric generator: recovers analog cross-peripheral routing (DAC->COMP,
+# etc.) from stm32-data-sources CubeMX "modes" XML into `src/fabric_data.rs`.
+#   cargo run --bin gen_fabric --features gen-fabric -- <cubedb>/mcu/IP/COMP-..._G4_..._Modes.xml
+[[bin]]
+name = "gen_fabric"
+path = "tools/gen_fabric.rs"
+required-features = ["gen-fabric"]
+
 [dependencies]
 # egui + eframe + egui_plot must use the same major.minor version.
 eframe    = { version = "0.33", features = ["glow", "persistence"] }
@@ -36,6 +53,9 @@ stm32-metapac = { git = "https://github.com/embassy-rs/stm32-data-generated", ta
 
 [features]
 extract       = ["dep:stm32-metapac"]
+# Generator gates (no extra deps; keep the bins out of normal builds).
+gen-catalog   = []
+gen-fabric    = []
 # One feature per package letter. The flash-size suffix doesn't affect
 # pinout — `<letter>e` (max flash) is what we extract. Letter mapping:
 # G474: C=LQFP48, M=WLCSP81, P=TFBGA100, Q=UFBGA121, R=LQFP64, V=LQFP100

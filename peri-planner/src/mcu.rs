@@ -389,3 +389,31 @@ fn classify_timer(name: &str) -> Option<TimerInstance> {
     };
     Some(TimerInstance { number: n, kind, channels, has_complementary: comp, width_bits: width })
 }
+
+#[cfg(test)]
+mod fabric_validation {
+    use super::*;
+
+    /// The Tier-3 generator (`gen_fabric`) recovers DAC->COMP routing from
+    /// ST's CubeMX COMP modes XML. It must reproduce the hand-coded
+    /// `G474_EDGES` exactly — this is the oracle that lets us trust the
+    /// generated fabric and then retire the hand table.
+    #[test]
+    fn cubedb_dac_to_comp_matches_hand_table() {
+        let mut generated: Vec<(u8, u8, u8)> = crate::fabric_data::G4_DAC_TO_COMP.to_vec();
+        generated.sort_unstable();
+
+        let mut hand: Vec<(u8, u8, u8)> = G474_EDGES
+            .iter()
+            .filter(|e| e.kind == EdgeKind::DacToComp)
+            .map(|e| (e.from.instance, e.from.channel, e.to.instance))
+            .collect();
+        hand.sort_unstable();
+
+        assert_eq!(
+            generated, hand,
+            "cubedb-generated DAC->COMP must match hand-coded G474_EDGES \
+             (run `cargo run --bin gen_fabric --features gen-fabric -- <COMP modes xml>`)"
+        );
+    }
+}

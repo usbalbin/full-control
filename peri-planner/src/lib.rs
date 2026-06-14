@@ -1,6 +1,8 @@
 pub mod af_view;
 pub mod app;
+pub mod catalog;
 pub mod comms_view;
+pub mod fabric_data;
 pub mod fabric_view;
 pub mod g474;
 pub mod h523_design;

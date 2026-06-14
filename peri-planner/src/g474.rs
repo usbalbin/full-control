@@ -372,17 +372,19 @@ pub const DAC_TO_COMP: &[(DacId, &[CompId])] = &[
     (DacId::Dac4Ch2, &[CompId::Comp6]),
 ];
 
-// TODO: VERIFY FROM RM0440 §27 (HRTIM fault input section).
-// These are placeholder values to keep the solver runnable. The actual G474
-// COMP→FLT routing is documented in the reference manual; please replace.
+// Source: RM0440 Rev 9 "Table 228. Fault inputs" (on-chip COMP source per
+// fault channel): Fault1<-COMP2, Fault2<-COMP4, Fault3<-COMP6, Fault4<-COMP1,
+// Fault5<-COMP3, Fault6<-COMP5. A 1:1 map; COMP7 has no HRTIM fault input.
+// Cross-checked by the `gen_fabric` RM extractor (test
+// `cubedb_comp_to_flt_matches_hand_table`). Replaces an earlier placeholder.
 pub const COMP_TO_FLT: &[(CompId, &[HrtimFltId])] = &[
-    (CompId::Comp1, &[HrtimFltId::Flt1, HrtimFltId::Flt4]),
-    (CompId::Comp2, &[HrtimFltId::Flt2, HrtimFltId::Flt5]),
-    (CompId::Comp3, &[HrtimFltId::Flt3, HrtimFltId::Flt4]),
-    (CompId::Comp4, &[HrtimFltId::Flt1, HrtimFltId::Flt6]),
-    (CompId::Comp5, &[HrtimFltId::Flt2, HrtimFltId::Flt5]),
-    (CompId::Comp6, &[HrtimFltId::Flt3, HrtimFltId::Flt6]),
-    (CompId::Comp7, &[HrtimFltId::Flt6]),
+    (CompId::Comp1, &[HrtimFltId::Flt4]),
+    (CompId::Comp2, &[HrtimFltId::Flt1]),
+    (CompId::Comp3, &[HrtimFltId::Flt5]),
+    (CompId::Comp4, &[HrtimFltId::Flt2]),
+    (CompId::Comp5, &[HrtimFltId::Flt6]),
+    (CompId::Comp6, &[HrtimFltId::Flt3]),
+    (CompId::Comp7, &[]),
 ];
 
 pub const COMP_TO_EEV: &[(CompId, &[CrossbarSource])] = &[
@@ -450,9 +452,11 @@ pub const CROSSBAR_TO_ADC_TRIGGER: &[(CrossbarSource, &[AdcTriggerId])] = &[
     (CrossbarSource::TimDCrRst, TRIG_24),
 
     (CrossbarSource::TimECr2, TRIG_24),
-    (CrossbarSource::TimECr3, TRIG_13),
+    // RM0440 HRTIM_ADC1R..4R: TimE CMP3 present in all four triggers; TimE
+    // period in ADC1R/ADC3R (odd) only. (Both were wrong in the old hand table.)
+    (CrossbarSource::TimECr3, TRIG_1234),
     (CrossbarSource::TimECr4, TRIG_1234),
-    (CrossbarSource::TimECrPer, TRIG_1234),
+    (CrossbarSource::TimECrPer, TRIG_13),
     (CrossbarSource::TimECrRst, TRIG_24),
 
     (CrossbarSource::TimFCr2, TRIG_24),
@@ -542,4 +546,107 @@ pub fn adc_channels_for(trig: AdcTriggerId) -> &'static [AdcChannel] {
         .find(|(t, _)| *t == trig)
         .map(|(_, c)| *c)
         .unwrap_or(&[])
+}
+
+#[cfg(test)]
+mod fabric_validation {
+    use super::*;
+
+    fn comp_num(c: CompId) -> u8 {
+        use CompId::*;
+        match c {
+            Comp1 => 1, Comp2 => 2, Comp3 => 3, Comp4 => 4,
+            Comp5 => 5, Comp6 => 6, Comp7 => 7,
+        }
+    }
+    fn eev_num(s: CrossbarSource) -> Option<u8> {
+        use CrossbarSource::*;
+        Some(match s {
+            Eev1 => 1, Eev2 => 2, Eev3 => 3, Eev4 => 4, Eev5 => 5,
+            Eev6 => 6, Eev7 => 7, Eev8 => 8, Eev9 => 9, Eev10 => 10,
+            _ => return None,
+        })
+    }
+
+    /// `gen_fabric` recovers COMP->EEV from ST's CubeMX HRTIM modes XML (plus a
+    /// documented fixup for a cubedb bug). It must reproduce the hand-coded
+    /// `COMP_TO_EEV` exactly — the oracle for trusting the generated fabric.
+    #[test]
+    fn cubedb_comp_to_eev_matches_hand_table() {
+        let mut generated: Vec<(u8, u8)> = crate::fabric_data::G4_COMP_TO_EEV.to_vec();
+        generated.sort_unstable();
+
+        let mut hand: Vec<(u8, u8)> = COMP_TO_EEV
+            .iter()
+            .flat_map(|(c, eevs)| {
+                eevs.iter()
+                    .map(move |e| (comp_num(*c), eev_num(*e).expect("EEV source")))
+            })
+            .collect();
+        hand.sort_unstable();
+
+        assert_eq!(
+            generated, hand,
+            "cubedb-generated COMP->EEV (with fixups) must match hand-coded COMP_TO_EEV"
+        );
+    }
+
+    fn flt_num(f: HrtimFltId) -> u8 {
+        use HrtimFltId::*;
+        match f {
+            Flt1 => 1, Flt2 => 2, Flt3 => 3, Flt4 => 4, Flt5 => 5, Flt6 => 6,
+        }
+    }
+
+    /// `gen_fabric` parses COMP->FLT from RM0440 Table 228 (cubedb only
+    /// abstracts faults to a source type, so it lacks this). Must match the
+    /// hand-coded `COMP_TO_FLT`, which replaced a wrong placeholder.
+    #[test]
+    fn cubedb_comp_to_flt_matches_hand_table() {
+        let mut generated: Vec<(u8, u8)> = crate::fabric_data::G4_COMP_TO_FLT.to_vec();
+        generated.sort_unstable();
+
+        let mut hand: Vec<(u8, u8)> = COMP_TO_FLT
+            .iter()
+            .flat_map(|(c, flts)| flts.iter().map(move |f| (comp_num(*c), flt_num(*f))))
+            .collect();
+        hand.sort_unstable();
+
+        assert_eq!(
+            generated, hand,
+            "RM0440-Table228 COMP->FLT must match hand-coded COMP_TO_FLT"
+        );
+    }
+
+    fn trig_num(t: AdcTriggerId) -> u8 {
+        format!("{t:?}").trim_start_matches("Trig").parse().unwrap()
+    }
+
+    /// `gen_fabric` extracts the HRTIM crossbar->ADC-trigger map from CubeMX
+    /// `ADCTRIGGEREVENT{13|24}` modes (one RM0440-verified fixup). Cross-checking
+    /// it against the hand table found TWO bugs in the hand table (TimECr3,
+    /// TimECrPer) and ONE in cubedb (TimFCr2); all three are now RM-correct.
+    #[test]
+    fn cubedb_crossbar_to_adc_trigger_matches_hand_table() {
+        let mut generated: Vec<(String, Vec<u8>)> = crate::fabric_data::G4_CROSSBAR_TO_ADC_TRIGGER
+            .iter()
+            .map(|(s, ts)| (s.to_string(), ts.to_vec()))
+            .collect();
+        generated.sort();
+
+        let mut hand: Vec<(String, Vec<u8>)> = CROSSBAR_TO_ADC_TRIGGER
+            .iter()
+            .map(|(src, trigs)| {
+                let mut ts: Vec<u8> = trigs.iter().map(|t| trig_num(*t)).collect();
+                ts.sort_unstable();
+                (format!("{src:?}"), ts)
+            })
+            .collect();
+        hand.sort();
+
+        assert_eq!(
+            generated, hand,
+            "cubedb+RM-fixup crossbar->ADC must match (corrected) CROSSBAR_TO_ADC_TRIGGER"
+        );
+    }
 }
