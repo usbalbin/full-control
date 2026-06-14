@@ -49,7 +49,9 @@ serde_json = "1"
 # Optional, only pulled in when an `extract-*` feature is enabled. The
 # regular `cargo build` does not depend on this — it's used solely by the
 # `extract` bin to dump chip metadata into `src/mcu_data/`.
-stm32-metapac = { git = "https://github.com/embassy-rs/stm32-data-generated", tag = "stm32-data-631122a41c0d22b3ba452c1717ca1dd61ef45881", default-features = false, features = ["metadata"], optional = true }
+# Pinned to a rev that includes the STM32C5 series (added upstream 2026). The
+# old die-level chip features (stm32g474re, stm32h523ze, ...) still exist here.
+stm32-metapac = { git = "https://github.com/embassy-rs/stm32-data-generated", rev = "2ab6df2582c6ef8b218272b26aa3db1b74998aa5", default-features = false, features = ["metadata"], optional = true }
 
 [features]
 extract       = ["dep:stm32-metapac"]
@@ -71,6 +73,9 @@ extract-h523h = ["extract", "stm32-metapac/stm32h523he"]
 extract-h523r = ["extract", "stm32-metapac/stm32h523re"]
 extract-h523v = ["extract", "stm32-metapac/stm32h523ve"]
 extract-h523z = ["extract", "stm32-metapac/stm32h523ze"]
+# STM32C5 (Cortex-M33, no HRTIM but DAC/COMP/OPAMP + TIM1/TIM8). Ordering-code
+# level feature names. C5A3Z = flagship line, LQFP144.
+extract-c5a3z = ["extract", "stm32-metapac/stm32c5a3zgt6"]
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Pinned to match trunk 0.21.x's supported wasm-bindgen runtime — newer

@@ -20,15 +20,19 @@ use crate::pinout::ChipVariant;
 // ---------- Mcu / Package ----------
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum Mcu { G474, H523 }
+pub enum Mcu { G474, H523, C5A3 }
 
 impl Default for Mcu { fn default() -> Self { Self::G474 } }
 
 impl Mcu {
-    pub const ALL: &'static [Mcu] = &[Mcu::G474, Mcu::H523];
+    pub const ALL: &'static [Mcu] = &[Mcu::G474, Mcu::H523, Mcu::C5A3];
 
     pub fn label(self) -> &'static str {
-        match self { Self::G474 => "STM32G474", Self::H523 => "STM32H523" }
+        match self {
+            Self::G474 => "STM32G474",
+            Self::H523 => "STM32H523",
+            Self::C5A3 => "STM32C5A3",
+        }
     }
 
     pub fn packages(self) -> &'static [Package] {
@@ -41,17 +45,25 @@ impl Mcu {
                 Package::H523C, Package::H523H, Package::H523R,
                 Package::H523V, Package::H523Z,
             ],
+            Self::C5A3 => &[Package::C5A3Z],
         }
     }
 
     pub fn default_package(self) -> Package {
-        match self { Self::G474 => Package::G474R, Self::H523 => Package::H523R }
+        match self {
+            Self::G474 => Package::G474R,
+            Self::H523 => Package::H523R,
+            Self::C5A3 => Package::C5A3Z,
+        }
     }
 
     /// True when planning views (fabric, HRTIM, package-view) are wired
-    /// up. H523 currently exposes Inventory + Pin/AF only.
+    /// up. H523 and C5A3 currently expose Inventory + Pin/AF only.
     pub fn is_implemented(self) -> bool {
-        match self { Self::G474 => true, Self::H523 => false }
+        match self {
+            Self::G474 => true,
+            Self::H523 | Self::C5A3 => false,
+        }
     }
 }
 
@@ -59,6 +71,7 @@ impl Mcu {
 pub enum Package {
     G474C, G474M, G474P, G474Q, G474R, G474V,
     H523C, H523H, H523R, H523V, H523Z,
+    C5A3Z,
 }
 
 impl Default for Package { fn default() -> Self { Self::G474R } }
@@ -67,13 +80,16 @@ impl Package {
     pub const ALL: &'static [Package] = &[
         Self::G474C, Self::G474M, Self::G474P, Self::G474Q, Self::G474R, Self::G474V,
         Self::H523C, Self::H523H, Self::H523R, Self::H523V, Self::H523Z,
+        Self::C5A3Z,
     ];
 
     pub fn mcu(self) -> Mcu {
         match self {
             Self::G474C | Self::G474M | Self::G474P
             | Self::G474Q | Self::G474R | Self::G474V => Mcu::G474,
-            _ => Mcu::H523,
+            Self::H523C | Self::H523H | Self::H523R
+            | Self::H523V | Self::H523Z => Mcu::H523,
+            Self::C5A3Z => Mcu::C5A3,
         }
     }
 
@@ -91,6 +107,7 @@ impl Package {
             Self::H523R => "LQFP64",
             Self::H523V => "LQFP100",
             Self::H523Z => "LQFP144",
+            Self::C5A3Z => "LQFP144",
         }
     }
 
@@ -103,6 +120,7 @@ impl Package {
             Self::H523C => ("H523", 'C'), Self::H523H => ("H523", 'H'),
             Self::H523R => ("H523", 'R'), Self::H523V => ("H523", 'V'),
             Self::H523Z => ("H523", 'Z'),
+            Self::C5A3Z => ("C5A3", 'Z'),
         };
         format!("STM32{}{} ({})", mcu, letter, self.package_label())
     }
@@ -120,6 +138,7 @@ impl Package {
             Self::H523R => &crate::mcu_data::h523r::RAW,
             Self::H523V => &crate::mcu_data::h523v::RAW,
             Self::H523Z => &crate::mcu_data::h523z::RAW,
+            Self::C5A3Z => &crate::mcu_data::c5a3z::RAW,
         }
     }
 
@@ -288,6 +307,11 @@ fn build_descriptor(pkg: Package) -> McuDescriptor {
         Mcu::H523 => {
             for a in &mut d.adcs { a.fast_channels = H523_FAST_ADC; }
         }
+        Mcu::C5A3 => {
+            // Inventory-only for now. C5 has DAC/COMP/OPAMP + TIM1/TIM8 but no
+            // HRTIM; its fabric (RM0522 Table 84/85) is timer-based and would
+            // attach here once the descriptor model is family-generic.
+        }
     }
 
     d
@@ -415,5 +439,33 @@ mod fabric_validation {
             "cubedb-generated DAC->COMP must match hand-coded G474_EDGES \
              (run `cargo run --bin gen_fabric --features gen-fabric -- <COMP modes xml>`)"
         );
+    }
+}
+
+#[cfg(test)]
+mod c5_support {
+    use super::*;
+
+    /// C5A3 is registered as a 3rd (inventory-only) family; its descriptor must
+    /// build from the extracted data and surface the analog/control + serial
+    /// peripherals, with no HRTIM.
+    #[test]
+    fn c5a3_descriptor_inventories_expected_peripherals() {
+        let d = Package::C5A3Z.descriptor();
+        assert_eq!(d.mcu, Mcu::C5A3);
+        assert_eq!(d.name, "STM32C5A3ZGT6");
+        assert!(d.comps.iter().any(|c| c.number == 1), "COMP1");
+        assert!(d.dacs.iter().any(|x| x.number == 1), "DAC1");
+        assert!(
+            d.timers
+                .iter()
+                .any(|t| t.number == 1 && matches!(t.kind, TimerKind::Advanced)),
+            "TIM1 advanced"
+        );
+        assert!(d.timers.iter().any(|t| t.number == 8), "TIM8");
+        let serial = d.comms.usart.len() + d.comms.uart.len() + d.comms.lpuart.len();
+        assert!(serial >= 7, "expected many async-serial channels, got {serial}");
+        assert!(d.comms.fdcan.len() >= 2, "FDCAN1/2");
+        assert!(d.hrtim.is_none(), "C5 has no HRTIM");
     }
 }

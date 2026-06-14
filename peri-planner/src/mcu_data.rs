@@ -13,3 +13,4 @@ pub mod h523h;
 pub mod h523r;
 pub mod h523v;
 pub mod h523z;
+pub mod c5a3z;
