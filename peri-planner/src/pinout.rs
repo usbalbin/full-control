@@ -545,10 +545,15 @@ fn to_signal_id(
     Some(crate::mcu_pinout::SignalId { peripheral: p.name, role: pp.signal })
 }
 
-pub fn pins_for(signal: Signal, variant: ChipVariant) -> Vec<Pin> {
-    let raw = crate::mcu::Package::from_g474_variant(variant).raw();
-    // Delegate to the generic engine, preserving data order (no sort/dedup) so
-    // candidate-dropdown ordering is byte-identical to the old implementation.
+/// Pins a signal can be placed on, resolved against ANY package's data — not
+/// just G474. This is the package-generic entry point: the signal's
+/// (peripheral, role) is matched against the chosen chip's `RawMcuData` via the
+/// descriptor-driven `mcu_pinout` engine. Works for any family's
+/// TIM/COMP/DAC/ADC/comms signals (the basis for planning a non-G474 chip).
+pub fn pins_for_pkg(signal: Signal, pkg: crate::mcu::Package) -> Vec<Pin> {
+    let raw = pkg.raw();
+    // Preserve data order (no sort/dedup) so candidate-dropdown ordering is
+    // byte-identical to the old implementation.
     match to_signal_id(raw, signal) {
         Some(id) => crate::mcu_pinout::placements_for(raw, id)
             .into_iter()
@@ -556,6 +561,10 @@ pub fn pins_for(signal: Signal, variant: ChipVariant) -> Vec<Pin> {
             .collect(),
         None => Vec::new(),
     }
+}
+
+pub fn pins_for(signal: Signal, variant: ChipVariant) -> Vec<Pin> {
+    pins_for_pkg(signal, crate::mcu::Package::from_g474_variant(variant))
 }
 
 pub fn signals_on(pin: Pin, variant: ChipVariant) -> Vec<(u8, Signal)> {
@@ -718,5 +727,22 @@ mod generic_engine_equiv {
                     .collect();
             assert_eq!(typed, generic, "candidates differ for {}.{}", id.peripheral, id.role);
         }
+    }
+
+    /// The Inc-2 unlock: `pins_for_pkg` resolves a signal against a NON-G474
+    /// package's data. C531 USART1.TX must land on a real pin purely via the
+    /// descriptor-driven engine — no G474 assumptions on the path.
+    #[test]
+    fn pins_for_pkg_resolves_non_g474_family() {
+        let c531 = pins_for_pkg(Signal::UsartTx(UsartId::Usart1), Package::C531R);
+        assert!(
+            !c531.is_empty(),
+            "expected C531 USART1.TX to resolve to a pin via the generic engine"
+        );
+
+        // The G474 `ChipVariant` wrapper must agree with the package-generic call.
+        let via_variant = pins_for(Signal::UsartTx(UsartId::Usart1), ChipVariant::G474R);
+        let via_pkg = pins_for_pkg(Signal::UsartTx(UsartId::Usart1), Package::G474R);
+        assert_eq!(via_variant, via_pkg);
     }
 }
