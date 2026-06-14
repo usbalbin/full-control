@@ -593,3 +593,102 @@ pub fn pin_candidates_respecting_locks(
         .filter(|p| !taken.contains(p))
         .collect()
 }
+
+#[cfg(test)]
+mod generic_engine_equiv {
+    use super::*;
+    use crate::mcu::Package;
+    use crate::mcu_pinout as gp;
+    use std::collections::HashMap;
+    use std::collections::HashSet;
+
+    fn g474_raw() -> &'static crate::mcu_raw::RawMcuData {
+        Package::G474R.raw()
+    }
+
+    /// All distinct (peripheral, role) signals present in the G474 data.
+    fn g474_signal_ids() -> Vec<gp::SignalId> {
+        let mut ids: Vec<gp::SignalId> = gp::af_rows(g474_raw()).map(|r| r.signal).collect();
+        ids.sort_by(|a, b| (a.peripheral, a.role).cmp(&(b.peripheral, b.role)));
+        ids.dedup();
+        ids
+    }
+
+    /// Every G474 signal that `pinout` models must resolve to the same pin set
+    /// through the generic `mcu_pinout` engine as through the typed `pins_for`.
+    /// This pins the behavior the Signal-enum refactor must preserve.
+    #[test]
+    fn generic_pins_for_matches_typed() {
+        let raw = g474_raw();
+        let mut checked = 0;
+        for id in g474_signal_ids() {
+            let Some(sig) = metapac_to_signal(id.peripheral, id.role) else { continue };
+            let typed: HashSet<(char, u8)> = pins_for(sig, ChipVariant::G474R)
+                .into_iter()
+                .map(|p| (p.port, p.num))
+                .collect();
+            let generic: HashSet<(char, u8)> = gp::pins_for(raw, id)
+                .into_iter()
+                .map(|p| (p.port, p.num))
+                .collect();
+            assert_eq!(typed, generic, "pin set mismatch for {}.{}", id.peripheral, id.role);
+            checked += 1;
+        }
+        assert!(checked > 30, "expected to check many modeled signals, only {checked}");
+    }
+
+    /// Conflict detection and lock-respecting candidate enumeration agree
+    /// between the typed and generic engines for a representative G474 set.
+    #[test]
+    fn generic_conflict_and_candidates_match_typed() {
+        let raw = g474_raw();
+        let modeled: Vec<(Signal, gp::SignalId)> = g474_signal_ids()
+            .into_iter()
+            .filter_map(|id| metapac_to_signal(id.peripheral, id.role).map(|s| (s, id)))
+            .take(40)
+            .collect();
+        let used_typed: Vec<Signal> = modeled.iter().map(|(s, _)| *s).collect();
+        let used_ids: Vec<gp::SignalId> = modeled.iter().map(|(_, id)| *id).collect();
+
+        let canon =
+            |p: &str, r: &str| -> (String, String) { (p.to_string(), r.to_string()) };
+
+        let typed_pairs: HashSet<((String, String), (String, String), (char, u8))> =
+            conflicting_signal_pairs(&used_typed, ChipVariant::G474R)
+                .into_iter()
+                .map(|(a, b, p)| {
+                    let (ap, ar) = signal_to_metapac(a);
+                    let (bp, br) = signal_to_metapac(b);
+                    let mut k = [canon(ap, &ar), canon(bp, &br)];
+                    k.sort();
+                    (k[0].clone(), k[1].clone(), (p.port, p.num))
+                })
+                .collect();
+        let generic_pairs: HashSet<((String, String), (String, String), (char, u8))> =
+            gp::conflicting_pairs(raw, &used_ids)
+                .into_iter()
+                .map(|(a, b, p)| {
+                    let mut k = [canon(a.peripheral, a.role), canon(b.peripheral, b.role)];
+                    k.sort();
+                    (k[0].clone(), k[1].clone(), (p.port, p.num))
+                })
+                .collect();
+        assert_eq!(typed_pairs, generic_pairs, "conflict pairs differ");
+
+        let no_typed_locks: HashMap<Signal, Pin> = HashMap::new();
+        let no_generic_locks: HashMap<gp::SignalId, gp::PinId> = HashMap::new();
+        for (sig, id) in &modeled {
+            let typed: HashSet<(char, u8)> =
+                pin_candidates_respecting_locks(*sig, ChipVariant::G474R, &no_typed_locks)
+                    .into_iter()
+                    .map(|p| (p.port, p.num))
+                    .collect();
+            let generic: HashSet<(char, u8)> =
+                gp::pin_candidates_respecting_locks(raw, *id, &no_generic_locks)
+                    .into_iter()
+                    .map(|p| (p.port, p.num))
+                    .collect();
+            assert_eq!(typed, generic, "candidates differ for {}.{}", id.peripheral, id.role);
+        }
+    }
+}

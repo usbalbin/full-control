@@ -5,6 +5,7 @@
 //! will be extended later when other H523 packages are needed.
 
 use crate::mcu_raw::{RawMcuData, RawPin};
+use std::collections::{HashMap, HashSet};
 
 /// MCU-independent pin identity. "PA0" → `PinId { port: 'A', num: 0 }`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -83,4 +84,72 @@ pub fn peripherals_with_pins(raw: &'static RawMcuData) -> Vec<&'static str> {
     v.sort();
     v.dedup();
     v
+}
+
+// ---------- Generic pin allocation / conflict engine ----------
+//
+// These are the MCU-agnostic equivalents of the G474-only `pinout.rs`
+// functions (`pins_for`, `conflicting_signal_pairs`, `unreachable_signals`,
+// `pin_candidates_respecting_locks`), keyed on `SignalId`/`PinId` + the
+// extracted `RawMcuData` instead of the typed `Signal` + `ChipVariant`.
+// Proven equivalent to the typed versions for G474 by tests in `pinout.rs`.
+
+/// The distinct pins a logical signal can be placed on.
+pub fn pins_for(raw: &'static RawMcuData, sig: SignalId) -> Vec<PinId> {
+    let mut v: Vec<PinId> = placements_for(raw, sig).into_iter().map(|r| r.pin).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Signals from `used` that have no pin on this MCU (impossible to place).
+pub fn unreachable(raw: &'static RawMcuData, used: &[SignalId]) -> Vec<SignalId> {
+    used.iter()
+        .copied()
+        .filter(|s| pins_for(raw, *s).is_empty())
+        .collect()
+}
+
+/// Pairs of `used` signals that can collide on a shared pin, with that pin.
+pub fn conflicting_pairs(
+    raw: &'static RawMcuData,
+    used: &[SignalId],
+) -> Vec<(SignalId, SignalId, PinId)> {
+    let mut pairs = Vec::new();
+    for (i, a) in used.iter().enumerate() {
+        let a_pins = pins_for(raw, *a);
+        for b in &used[i + 1..] {
+            if a == b {
+                continue;
+            }
+            let b_pins = pins_for(raw, *b);
+            for pa in &a_pins {
+                if b_pins.contains(pa) {
+                    pairs.push((*a, *b, *pa));
+                }
+            }
+        }
+    }
+    pairs
+}
+
+/// Pin candidates for `sig`, excluding pins already taken by other locked
+/// signals. `sig`'s own lock (if present) is returned as the sole candidate.
+pub fn pin_candidates_respecting_locks(
+    raw: &'static RawMcuData,
+    sig: SignalId,
+    locked: &HashMap<SignalId, PinId>,
+) -> Vec<PinId> {
+    if let Some(pin) = locked.get(&sig) {
+        return vec![*pin];
+    }
+    let taken: HashSet<PinId> = locked
+        .iter()
+        .filter(|(s, _)| **s != sig)
+        .map(|(_, p)| *p)
+        .collect();
+    pins_for(raw, sig)
+        .into_iter()
+        .filter(|p| !taken.contains(p))
+        .collect()
 }
