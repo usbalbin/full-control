@@ -271,6 +271,16 @@ pub struct ChipFabric {
     pub comp_to_flt: &'static [(u8, u8)],
     /// (crossbar-source name, &[adc-trigger numbers])
     pub crossbar_to_adc_trigger: &'static [(&'static str, &'static [u8])],
+
+    // ---- Timer-based fabric (non-HRTIM families, e.g. C5). Empty for G4. ----
+    /// (comp_instance, tim_instance, break_input 1|2): a comparator output
+    /// routed to an advanced-timer break input — the hardware over-current
+    /// path for a timer-PWM converter.
+    pub comp_to_tim_break: &'static [(u8, u8, u8)],
+    /// (trigger-source name e.g. "TIM1_CC1", &[adc instances]). Display-only.
+    pub tim_to_adc_trigger: &'static [(&'static str, &'static [u8])],
+    /// (trigger-source name e.g. "TIM6_TRGO", dac instance). Display-only.
+    pub tim_to_dac_trigger: &'static [(&'static str, u8)],
 }
 
 pub struct McuDescriptor {
@@ -310,6 +320,10 @@ const G4_FABRIC: ChipFabric = ChipFabric {
     comp_to_eev: crate::fabric_data::G4_COMP_TO_EEV,
     comp_to_flt: crate::fabric_data::G4_COMP_TO_FLT,
     crossbar_to_adc_trigger: crate::fabric_data::G4_CROSSBAR_TO_ADC_TRIGGER,
+    // G4 uses the HRTIM fabric above, not the timer-based edges.
+    comp_to_tim_break: &[],
+    tim_to_adc_trigger: &[],
+    tim_to_dac_trigger: &[],
 };
 
 /// Build the descriptor's `edges` (DAC->COMP) from a fabric's numeric table.
