@@ -23,6 +23,7 @@ enum ViewMode {
     Package,
     Inventory,
     AfTable,
+    Catalog,
 }
 
 pub struct PeriPlannerApp {
@@ -42,6 +43,8 @@ pub struct PeriPlannerApp {
     picked: Option<crate::picker::PickedRole>,
     /// Filter state for the AfTable view. Ephemeral.
     af_filter: crate::af_view::AfFilter,
+    /// Part-finder query state (whole-lineup catalog search). Ephemeral.
+    catalog_query: crate::catalog::SearchQuery,
 }
 
 impl Default for PeriPlannerApp {
@@ -57,6 +60,7 @@ impl Default for PeriPlannerApp {
             redo: Vec::new(),
             picked: None,
             af_filter: Default::default(),
+            catalog_query: Default::default(),
         }
     }
 }
@@ -204,6 +208,7 @@ impl PeriPlannerApp {
                 }
                 ui.selectable_value(&mut self.view, ViewMode::Inventory, "Inventory");
                 ui.selectable_value(&mut self.view, ViewMode::AfTable, "Pin / AF");
+                ui.selectable_value(&mut self.view, ViewMode::Catalog, "Part finder");
                 ui.separator();
                 if ui.button("Export").clicked() {
                     let text = self.design.export_summary();
@@ -277,11 +282,13 @@ impl eframe::App for PeriPlannerApp {
             let view = self.view;
             let af_filter = &mut self.af_filter;
             let h523 = &mut self.h523_design;
+            let catalog_query = &mut self.catalog_query;
             egui::CentralPanel::default().show(ctx, |ui| {
                 match view {
                     ViewMode::AfTable => {
                         crate::af_view::show(ui, descriptor.raw, af_filter, Some(h523));
                     }
+                    ViewMode::Catalog => crate::catalog_view::show(ui, catalog_query),
                     _ => crate::inventory_view::show(ui, descriptor),
                 }
             });
@@ -998,6 +1005,9 @@ impl eframe::App for PeriPlannerApp {
                 }
                 ViewMode::Inventory => {
                     crate::inventory_view::show(ui, self.package.descriptor());
+                }
+                ViewMode::Catalog => {
+                    crate::catalog_view::show(ui, &mut self.catalog_query);
                 }
                 ViewMode::AfTable => {
                     // G474 path doesn't expose the lock UI yet — pin
