@@ -45,6 +45,9 @@ pub struct PeriPlannerApp {
     af_filter: crate::af_view::AfFilter,
     /// Part-finder query state (whole-lineup catalog search). Ephemeral.
     catalog_query: crate::catalog::SearchQuery,
+    /// A part clicked in the Part finder, applied at the start of the next
+    /// frame (deferred to avoid switching chips mid-render). Ephemeral.
+    pending_select: Option<Package>,
 }
 
 impl Default for PeriPlannerApp {
@@ -61,6 +64,7 @@ impl Default for PeriPlannerApp {
             picked: None,
             af_filter: Default::default(),
             catalog_query: Default::default(),
+            pending_select: None,
         }
     }
 }
@@ -264,6 +268,16 @@ impl eframe::App for PeriPlannerApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Apply a part clicked in the Part finder last frame (deferred so we
+        // never switch the active chip mid-render).
+        if let Some(pkg) = self.pending_select.take() {
+            self.mcu = pkg.mcu();
+            self.package = pkg;
+            if let Some(v) = pkg.to_g474_variant() {
+                self.variant = v;
+            }
+            self.view = ViewMode::Inventory;
+        }
         let ctrl = ctx.input(|i| i.modifiers.command);
         let shift = ctx.input(|i| i.modifiers.shift);
         if ctrl && ctx.input(|i| i.key_pressed(egui::Key::Z)) {
@@ -283,15 +297,19 @@ impl eframe::App for PeriPlannerApp {
             let af_filter = &mut self.af_filter;
             let h523 = &mut self.h523_design;
             let catalog_query = &mut self.catalog_query;
+            let mut jump = None;
             egui::CentralPanel::default().show(ctx, |ui| {
                 match view {
                     ViewMode::AfTable => {
                         crate::af_view::show(ui, descriptor.raw, af_filter, Some(h523));
                     }
-                    ViewMode::Catalog => crate::catalog_view::show(ui, catalog_query),
+                    ViewMode::Catalog => {
+                        jump = crate::catalog_view::show(ui, catalog_query);
+                    }
                     _ => crate::inventory_view::show(ui, descriptor),
                 }
             });
+            self.pending_select = jump;
             return;
         }
 
@@ -1007,7 +1025,7 @@ impl eframe::App for PeriPlannerApp {
                     crate::inventory_view::show(ui, self.package.descriptor());
                 }
                 ViewMode::Catalog => {
-                    crate::catalog_view::show(ui, &mut self.catalog_query);
+                    self.pending_select = crate::catalog_view::show(ui, &mut self.catalog_query);
                 }
                 ViewMode::AfTable => {
                     // G474 path doesn't expose the lock UI yet — pin

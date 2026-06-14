@@ -5,9 +5,13 @@
 //! `catalog::search`.
 
 use crate::catalog::{self, SearchQuery};
+use crate::mcu::Package;
 use eframe::egui;
 
-pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) {
+/// Renders the part finder. Returns the package to jump to if the user clicked
+/// a result that maps to a compiled-in part.
+pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) -> Option<Package> {
+    let mut jump = None;
     ui.heading("Part finder");
     ui.label(format!(
         "Parametric search across {} STM32 parts in {} families. All numeric \
@@ -71,7 +75,10 @@ pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) {
 
     ui.separator();
     let results = catalog::search(q);
-    ui.label(format!("{} matching parts", results.len()));
+    ui.label(format!(
+        "{} matching parts — fully-supported parts are clickable (open in Inventory / Pin-AF).",
+        results.len()
+    ));
 
     const CAP: usize = 400;
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -88,7 +95,21 @@ pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) {
                 }
                 ui.end_row();
                 for e in results.iter().take(CAP) {
-                    ui.label(&e.name);
+                    // Parts that are compiled in are clickable -> jump to them.
+                    match Package::for_chip_name(&e.name) {
+                        Some(pkg) => {
+                            if ui
+                                .selectable_label(false, &e.name)
+                                .on_hover_text("Open this part (Inventory / Pin-AF)")
+                                .clicked()
+                            {
+                                jump = Some(pkg);
+                            }
+                        }
+                        None => {
+                            ui.label(&e.name);
+                        }
+                    }
                     ui.label(&e.family);
                     ui.label(format!("{} k", e.flash_kb));
                     ui.label(format!("{} k", e.ram_kb));
@@ -111,4 +132,6 @@ pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) {
             ));
         }
     });
+
+    jump
 }

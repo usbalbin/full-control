@@ -151,6 +151,13 @@ impl Package {
         }
     }
 
+    /// The compiled-in package whose extracted chip data has this exact name
+    /// (e.g. "STM32G474RE", "STM32C531RCT6"), if any. Lets a Part-finder result
+    /// jump to that part's inventory/AF view.
+    pub fn for_chip_name(name: &str) -> Option<Package> {
+        Self::ALL.iter().copied().find(|p| p.raw().name == name)
+    }
+
     pub fn descriptor(self) -> &'static McuDescriptor {
         DESCRIPTORS
             .get_or_init(|| {
