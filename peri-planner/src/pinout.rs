@@ -513,21 +513,33 @@ fn metapac_to_signal(peripheral: &str, role: &str) -> Option<Signal> {
     None
 }
 
-pub fn pins_for(signal: Signal, variant: ChipVariant) -> Vec<Pin> {
-    let pkg = crate::mcu::Package::from_g474_variant(variant);
-    let raw = pkg.raw();
+/// The generic `SignalId` for a typed `Signal` on this chip's data, if the
+/// signal's (peripheral, role) exists in it. Bridges the typed G474 `Signal`
+/// façade to the descriptor-driven `mcu_pinout` engine.
+fn to_signal_id(
+    raw: &'static crate::mcu_raw::RawMcuData,
+    signal: Signal,
+) -> Option<crate::mcu_pinout::SignalId> {
     let (peripheral, role) = signal_to_metapac(signal);
-    if role.is_empty() { return Vec::new(); }
-    raw.peripherals.iter()
-        .filter(|p| p.name == peripheral)
-        .flat_map(|p| p.pins.iter())
-        .filter(|pp| pp.signal == role.as_str())
-        .filter_map(|pp| {
-            let port = pp.pin.as_bytes().get(1).copied()? as char;
-            let num: u8 = pp.pin.get(2..)?.parse().ok()?;
-            Some(Pin::new(port, num))
-        })
-        .collect()
+    if role.is_empty() {
+        return None;
+    }
+    let p = raw.peripherals.iter().find(|p| p.name == peripheral)?;
+    let pp = p.pins.iter().find(|pp| pp.signal == role.as_str())?;
+    Some(crate::mcu_pinout::SignalId { peripheral: p.name, role: pp.signal })
+}
+
+pub fn pins_for(signal: Signal, variant: ChipVariant) -> Vec<Pin> {
+    let raw = crate::mcu::Package::from_g474_variant(variant).raw();
+    // Delegate to the generic engine, preserving data order (no sort/dedup) so
+    // candidate-dropdown ordering is byte-identical to the old implementation.
+    match to_signal_id(raw, signal) {
+        Some(id) => crate::mcu_pinout::placements_for(raw, id)
+            .into_iter()
+            .map(|r| Pin::new(r.pin.port, r.pin.num))
+            .collect(),
+        None => Vec::new(),
+    }
 }
 
 pub fn signals_on(pin: Pin, variant: ChipVariant) -> Vec<(u8, Signal)> {
