@@ -242,6 +242,21 @@ pub struct HrtimFabric {
     pub flt_count: u8, pub adc_trigger_count: u8,
 }
 
+/// Generic, data-driven analog cross-peripheral routing for a chip. Numeric
+/// (instance/channel `u8`, plus the crossbar source's name) so it is
+/// family-agnostic — every field mirrors a `fabric_data` table. Adding a
+/// family's fabric is data: extract its tables, point a `ChipFabric` at them.
+pub struct ChipFabric {
+    /// (dac_instance, dac_channel, comp_instance)
+    pub dac_to_comp: &'static [(u8, u8, u8)],
+    /// (comp_instance, eev_number)
+    pub comp_to_eev: &'static [(u8, u8)],
+    /// (comp_instance, flt_number)
+    pub comp_to_flt: &'static [(u8, u8)],
+    /// (crossbar-source name, &[adc-trigger numbers])
+    pub crossbar_to_adc_trigger: &'static [(&'static str, &'static [u8])],
+}
+
 pub struct McuDescriptor {
     pub mcu: Mcu,
     pub package: Package,
@@ -253,8 +268,12 @@ pub struct McuDescriptor {
     pub comps: Vec<CompInstance>,
     pub opamps: Vec<OpampInstance>,
     pub comms: CommsInventory,
-    pub edges: &'static [PeripheralEdge],
+    /// DAC->COMP edges, derived from `fabric.dac_to_comp` (was `G474_EDGES`).
+    pub edges: Vec<PeripheralEdge>,
     pub hrtim: Option<&'static HrtimFabric>,
+    /// Generic analog routing, data-driven from `fabric_data`. `None` for
+    /// families whose fabric isn't modeled yet (H523, C5A3).
+    pub fabric: Option<&'static ChipFabric>,
     pub raw: &'static RawMcuData,
 }
 
@@ -267,24 +286,28 @@ const G474_HRTIM: HrtimFabric = HrtimFabric {
     sub_timer_count: 6, eev_count: 10, flt_count: 6, adc_trigger_count: 10,
 };
 
-/// DAC→COMP routing per RM0440 §25; metapac doesn't carry inter-peripheral
-/// analog connectivity so this stays hand-encoded.
-const G474_EDGES: &[PeripheralEdge] = &[
-    PeripheralEdge { from: dac_ref(1, 1), to: comp_ref(1), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(1, 1), to: comp_ref(3), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(1, 1), to: comp_ref(4), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(1, 2), to: comp_ref(2), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(1, 2), to: comp_ref(5), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(2, 1), to: comp_ref(6), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(2, 1), to: comp_ref(7), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(3, 1), to: comp_ref(1), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(3, 1), to: comp_ref(3), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(3, 2), to: comp_ref(2), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(3, 2), to: comp_ref(4), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(4, 1), to: comp_ref(5), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(4, 1), to: comp_ref(7), kind: EdgeKind::DacToComp },
-    PeripheralEdge { from: dac_ref(4, 2), to: comp_ref(6), kind: EdgeKind::DacToComp },
-];
+/// The G474 analog fabric, sourced entirely from the generated + validated
+/// `fabric_data` tables. The DAC->COMP edges (formerly the hand-coded
+/// `G474_EDGES`) are derived from `dac_to_comp` in `build_descriptor`.
+const G4_FABRIC: ChipFabric = ChipFabric {
+    dac_to_comp: crate::fabric_data::G4_DAC_TO_COMP,
+    comp_to_eev: crate::fabric_data::G4_COMP_TO_EEV,
+    comp_to_flt: crate::fabric_data::G4_COMP_TO_FLT,
+    crossbar_to_adc_trigger: crate::fabric_data::G4_CROSSBAR_TO_ADC_TRIGGER,
+};
+
+/// Build the descriptor's `edges` (DAC->COMP) from a fabric's numeric table.
+fn dac_to_comp_edges(fabric: &ChipFabric) -> Vec<PeripheralEdge> {
+    fabric
+        .dac_to_comp
+        .iter()
+        .map(|&(dac, ch, comp)| PeripheralEdge {
+            from: dac_ref(dac, ch),
+            to: comp_ref(comp),
+            kind: EdgeKind::DacToComp,
+        })
+        .collect()
+}
 
 // ---------- Build descriptor from raw data ----------
 
@@ -301,7 +324,8 @@ fn build_descriptor(pkg: Package) -> McuDescriptor {
             for dac in &mut d.dacs {
                 if matches!(dac.number, 3 | 4) { dac.fast = true; dac.channels = 2; }
             }
-            d.edges = G474_EDGES;
+            d.fabric = Some(&G4_FABRIC);
+            d.edges = dac_to_comp_edges(&G4_FABRIC);
             d.hrtim = Some(&G474_HRTIM);
         }
         Mcu::H523 => {
@@ -324,7 +348,7 @@ fn build_inventory(mcu: Mcu, package: Package, raw: &'static RawMcuData) -> McuD
         timers: Vec::new(), adcs: Vec::new(), dacs: Vec::new(),
         comps: Vec::new(), opamps: Vec::new(),
         comms: CommsInventory::default(),
-        edges: &[], hrtim: None, raw,
+        edges: Vec::new(), hrtim: None, fabric: None, raw,
     };
 
     for p in raw.peripherals {
@@ -418,27 +442,32 @@ fn classify_timer(name: &str) -> Option<TimerInstance> {
 mod fabric_validation {
     use super::*;
 
-    /// The Tier-3 generator (`gen_fabric`) recovers DAC->COMP routing from
-    /// ST's CubeMX COMP modes XML. It must reproduce the hand-coded
-    /// `G474_EDGES` exactly — this is the oracle that lets us trust the
-    /// generated fabric and then retire the hand table.
+    /// Golden snapshot of the RM0440-verified DAC->COMP routing. `fabric_data`
+    /// is now the source (the descriptor's `edges` are derived from it), so this
+    /// guards against a bad regeneration silently changing the data — the
+    /// expectation here is authored independently of the generator.
     #[test]
-    fn cubedb_dac_to_comp_matches_hand_table() {
-        let mut generated: Vec<(u8, u8, u8)> = crate::fabric_data::G4_DAC_TO_COMP.to_vec();
-        generated.sort_unstable();
+    fn g4_dac_to_comp_golden() {
+        let golden: &[(u8, u8, u8)] = &[
+            (1, 1, 1), (1, 1, 3), (1, 1, 4), (1, 2, 2), (1, 2, 5),
+            (2, 1, 6), (2, 1, 7), (3, 1, 1), (3, 1, 3), (3, 2, 2),
+            (3, 2, 4), (4, 1, 5), (4, 1, 7), (4, 2, 6),
+        ];
+        let mut got = crate::fabric_data::G4_DAC_TO_COMP.to_vec();
+        got.sort_unstable();
+        let mut want = golden.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want, "G4_DAC_TO_COMP drifted from RM-verified golden");
 
-        let mut hand: Vec<(u8, u8, u8)> = G474_EDGES
+        // The descriptor's derived edges must match the same data.
+        let d = Package::G474R.descriptor();
+        let mut edges: Vec<(u8, u8, u8)> = d
+            .edges
             .iter()
-            .filter(|e| e.kind == EdgeKind::DacToComp)
             .map(|e| (e.from.instance, e.from.channel, e.to.instance))
             .collect();
-        hand.sort_unstable();
-
-        assert_eq!(
-            generated, hand,
-            "cubedb-generated DAC->COMP must match hand-coded G474_EDGES \
-             (run `cargo run --bin gen_fabric --features gen-fabric -- <COMP modes xml>`)"
-        );
+        edges.sort_unstable();
+        assert_eq!(edges, want, "descriptor edges drifted from fabric data");
     }
 }
 

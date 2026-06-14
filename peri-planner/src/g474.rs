@@ -360,45 +360,76 @@ pub const fn is_fast_adc_channel(channel: u8) -> bool {
     channel >= 1 && channel <= 5
 }
 
-// ---------- Connectivity tables ----------
+// ---------- Connectivity tables (data-driven from `fabric_data`) ----------
+//
+// The analog routing is NO LONGER hand-authored here. It is grouped, once,
+// from the generated + validated numeric tables in `fabric_data` (extracted
+// from CubeMX modes + RM0440 by `gen_fabric`) into the solver's id-enum
+// vocabulary. Provenance/golden checks live in the `fabric_validation` tests.
 
-pub const DAC_TO_COMP: &[(DacId, &[CompId])] = &[
-    (DacId::Dac1Ch1, &[CompId::Comp1, CompId::Comp3, CompId::Comp4]),
-    (DacId::Dac1Ch2, &[CompId::Comp2, CompId::Comp5]),
-    (DacId::Dac2Ch1, &[CompId::Comp6, CompId::Comp7]),
-    (DacId::Dac3Ch1, &[CompId::Comp1, CompId::Comp3]),
-    (DacId::Dac3Ch2, &[CompId::Comp2, CompId::Comp4]),
-    (DacId::Dac4Ch1, &[CompId::Comp5, CompId::Comp7]),
-    (DacId::Dac4Ch2, &[CompId::Comp6]),
-];
+fn dac_id(inst: u8, ch: u8) -> Option<DacId> {
+    use DacId::*;
+    Some(match (inst, ch) {
+        (1, 1) => Dac1Ch1, (1, 2) => Dac1Ch2, (2, 1) => Dac2Ch1,
+        (3, 1) => Dac3Ch1, (3, 2) => Dac3Ch2, (4, 1) => Dac4Ch1, (4, 2) => Dac4Ch2,
+        _ => return None,
+    })
+}
+fn comp_id(n: u8) -> Option<CompId> {
+    use CompId::*;
+    Some(match n {
+        1 => Comp1, 2 => Comp2, 3 => Comp3, 4 => Comp4,
+        5 => Comp5, 6 => Comp6, 7 => Comp7, _ => return None,
+    })
+}
+fn eev_source(n: u8) -> Option<CrossbarSource> {
+    use CrossbarSource::*;
+    Some(match n {
+        1 => Eev1, 2 => Eev2, 3 => Eev3, 4 => Eev4, 5 => Eev5,
+        6 => Eev6, 7 => Eev7, 8 => Eev8, 9 => Eev9, 10 => Eev10,
+        _ => return None,
+    })
+}
+fn flt_id(n: u8) -> Option<HrtimFltId> {
+    use HrtimFltId::*;
+    Some(match n {
+        1 => Flt1, 2 => Flt2, 3 => Flt3, 4 => Flt4, 5 => Flt5, 6 => Flt6,
+        _ => return None,
+    })
+}
 
-// Source: RM0440 Rev 9 "Table 228. Fault inputs" (on-chip COMP source per
-// fault channel): Fault1<-COMP2, Fault2<-COMP4, Fault3<-COMP6, Fault4<-COMP1,
-// Fault5<-COMP3, Fault6<-COMP5. A 1:1 map; COMP7 has no HRTIM fault input.
-// Cross-checked by the `gen_fabric` RM extractor (test
-// `cubedb_comp_to_flt_matches_hand_table`). Replaces an earlier placeholder.
-pub const COMP_TO_FLT: &[(CompId, &[HrtimFltId])] = &[
-    (CompId::Comp1, &[HrtimFltId::Flt4]),
-    (CompId::Comp2, &[HrtimFltId::Flt1]),
-    (CompId::Comp3, &[HrtimFltId::Flt5]),
-    (CompId::Comp4, &[HrtimFltId::Flt2]),
-    (CompId::Comp5, &[HrtimFltId::Flt6]),
-    (CompId::Comp6, &[HrtimFltId::Flt3]),
-    (CompId::Comp7, &[]),
-];
+/// Group flat `(key, value)` pairs into `(key, Vec<value>)`, sorted by key —
+/// giving a stable, enum-defined order independent of the source row order.
+fn group_pairs<K: Ord + Copy, V: Copy>(
+    pairs: impl Iterator<Item = (K, V)>,
+) -> Vec<(K, Vec<V>)> {
+    let mut map: std::collections::BTreeMap<K, Vec<V>> = std::collections::BTreeMap::new();
+    for (k, v) in pairs {
+        map.entry(k).or_default().push(v);
+    }
+    map.into_iter().collect()
+}
 
-pub const COMP_TO_EEV: &[(CompId, &[CrossbarSource])] = &[
-    (CompId::Comp1, &[CrossbarSource::Eev4, CrossbarSource::Eev6]),
-    (CompId::Comp2, &[CrossbarSource::Eev1, CrossbarSource::Eev6]),
-    (CompId::Comp3, &[CrossbarSource::Eev5, CrossbarSource::Eev8]),
-    (
-        CompId::Comp4,
-        &[CrossbarSource::Eev2, CrossbarSource::Eev7, CrossbarSource::Eev9],
-    ),
-    (CompId::Comp5, &[CrossbarSource::Eev4, CrossbarSource::Eev9]),
-    (CompId::Comp6, &[CrossbarSource::Eev3, CrossbarSource::Eev8]),
-    (CompId::Comp7, &[CrossbarSource::Eev5, CrossbarSource::Eev10]),
-];
+pub static DAC_TO_COMP: std::sync::LazyLock<Vec<(DacId, Vec<CompId>)>> =
+    std::sync::LazyLock::new(|| {
+        group_pairs(crate::fabric_data::G4_DAC_TO_COMP.iter().map(|&(di, dc, ci)| {
+            (dac_id(di, dc).expect("bad DAC in fabric_data"), comp_id(ci).expect("bad COMP"))
+        }))
+    });
+
+pub static COMP_TO_EEV: std::sync::LazyLock<Vec<(CompId, Vec<CrossbarSource>)>> =
+    std::sync::LazyLock::new(|| {
+        group_pairs(crate::fabric_data::G4_COMP_TO_EEV.iter().map(|&(ci, e)| {
+            (comp_id(ci).expect("bad COMP"), eev_source(e).expect("bad EEV"))
+        }))
+    });
+
+pub static COMP_TO_FLT: std::sync::LazyLock<Vec<(CompId, Vec<HrtimFltId>)>> =
+    std::sync::LazyLock::new(|| {
+        group_pairs(crate::fabric_data::G4_COMP_TO_FLT.iter().map(|&(ci, f)| {
+            (comp_id(ci).expect("bad COMP"), flt_id(f).expect("bad FLT"))
+        }))
+    });
 
 const TRIG_1234: &[AdcTriggerId] = &[
     AdcTriggerId::Trig1,
@@ -506,7 +537,7 @@ pub fn comps_for_dac(dac: DacId) -> &'static [CompId] {
     DAC_TO_COMP
         .iter()
         .find(|(d, _)| *d == dac)
-        .map(|(_, c)| *c)
+        .map(|(_, c)| c.as_slice())
         .unwrap_or(&[])
 }
 
@@ -520,7 +551,7 @@ pub fn eevs_for_comp(comp: CompId) -> &'static [CrossbarSource] {
     COMP_TO_EEV
         .iter()
         .find(|(c, _)| *c == comp)
-        .map(|(_, e)| *e)
+        .map(|(_, e)| e.as_slice())
         .unwrap_or(&[])
 }
 
@@ -528,7 +559,7 @@ pub fn flts_for_comp(comp: CompId) -> &'static [HrtimFltId] {
     COMP_TO_FLT
         .iter()
         .find(|(c, _)| *c == comp)
-        .map(|(_, f)| *f)
+        .map(|(_, f)| f.as_slice())
         .unwrap_or(&[])
 }
 
@@ -552,70 +583,32 @@ pub fn adc_channels_for(trig: AdcTriggerId) -> &'static [AdcChannel] {
 mod fabric_validation {
     use super::*;
 
-    fn comp_num(c: CompId) -> u8 {
-        use CompId::*;
-        match c {
-            Comp1 => 1, Comp2 => 2, Comp3 => 3, Comp4 => 4,
-            Comp5 => 5, Comp6 => 6, Comp7 => 7,
-        }
-    }
-    fn eev_num(s: CrossbarSource) -> Option<u8> {
-        use CrossbarSource::*;
-        Some(match s {
-            Eev1 => 1, Eev2 => 2, Eev3 => 3, Eev4 => 4, Eev5 => 5,
-            Eev6 => 6, Eev7 => 7, Eev8 => 8, Eev9 => 9, Eev10 => 10,
-            _ => return None,
-        })
-    }
-
-    /// `gen_fabric` recovers COMP->EEV from ST's CubeMX HRTIM modes XML (plus a
-    /// documented fixup for a cubedb bug). It must reproduce the hand-coded
-    /// `COMP_TO_EEV` exactly — the oracle for trusting the generated fabric.
+    /// Golden snapshot of the RM-verified COMP->EEV routing (15 edges).
+    /// `fabric_data` is now the source for the typed `COMP_TO_EEV` view (the
+    /// solver consumes it via `eevs_for_comp`), so this guards the data with an
+    /// expectation authored independently of the generator.
     #[test]
-    fn cubedb_comp_to_eev_matches_hand_table() {
-        let mut generated: Vec<(u8, u8)> = crate::fabric_data::G4_COMP_TO_EEV.to_vec();
-        generated.sort_unstable();
-
-        let mut hand: Vec<(u8, u8)> = COMP_TO_EEV
-            .iter()
-            .flat_map(|(c, eevs)| {
-                eevs.iter()
-                    .map(move |e| (comp_num(*c), eev_num(*e).expect("EEV source")))
-            })
-            .collect();
-        hand.sort_unstable();
-
-        assert_eq!(
-            generated, hand,
-            "cubedb-generated COMP->EEV (with fixups) must match hand-coded COMP_TO_EEV"
-        );
+    fn g4_comp_to_eev_golden() {
+        let golden: &[(u8, u8)] = &[
+            (1, 4), (1, 6), (2, 1), (2, 6), (3, 5), (3, 8), (4, 2), (4, 7),
+            (4, 9), (5, 4), (5, 9), (6, 3), (6, 8), (7, 5), (7, 10),
+        ];
+        let mut got = crate::fabric_data::G4_COMP_TO_EEV.to_vec();
+        got.sort_unstable();
+        let mut want = golden.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want, "G4_COMP_TO_EEV drifted from RM-verified golden");
     }
 
-    fn flt_num(f: HrtimFltId) -> u8 {
-        use HrtimFltId::*;
-        match f {
-            Flt1 => 1, Flt2 => 2, Flt3 => 3, Flt4 => 4, Flt5 => 5, Flt6 => 6,
-        }
-    }
-
-    /// `gen_fabric` parses COMP->FLT from RM0440 Table 228 (cubedb only
-    /// abstracts faults to a source type, so it lacks this). Must match the
-    /// hand-coded `COMP_TO_FLT`, which replaced a wrong placeholder.
+    /// Golden snapshot of RM0440 Table 228 COMP->FLT (6 edges; COMP7 has none).
     #[test]
-    fn cubedb_comp_to_flt_matches_hand_table() {
-        let mut generated: Vec<(u8, u8)> = crate::fabric_data::G4_COMP_TO_FLT.to_vec();
-        generated.sort_unstable();
-
-        let mut hand: Vec<(u8, u8)> = COMP_TO_FLT
-            .iter()
-            .flat_map(|(c, flts)| flts.iter().map(move |f| (comp_num(*c), flt_num(*f))))
-            .collect();
-        hand.sort_unstable();
-
-        assert_eq!(
-            generated, hand,
-            "RM0440-Table228 COMP->FLT must match hand-coded COMP_TO_FLT"
-        );
+    fn g4_comp_to_flt_golden() {
+        let golden: &[(u8, u8)] = &[(1, 4), (2, 1), (3, 5), (4, 2), (5, 6), (6, 3)];
+        let mut got = crate::fabric_data::G4_COMP_TO_FLT.to_vec();
+        got.sort_unstable();
+        let mut want = golden.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want, "G4_COMP_TO_FLT drifted from RM0440 Table 228 golden");
     }
 
     fn trig_num(t: AdcTriggerId) -> u8 {

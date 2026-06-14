@@ -245,19 +245,19 @@ pub fn show(ui: &mut egui::Ui, sel: &Selection, locks: &ResourceBag) -> Option<R
     let master_pos = pos(&column_rect, COL_TIMER, 0, timer_slots_total);
     let pf = |f: HrtimFltId| pos(&column_rect, COL_FLT, layout.flts.iter().position(|&x| x == f).unwrap(), layout.flts.len());
 
-    for &(dac, comps) in DAC_TO_COMP {
+    for (dac, comps) in DAC_TO_COMP.iter() {
         for &c in comps {
-            draw_edge(&painter, pd(dac), pc(c), Stroke::new(1.0, C_EDGE_BG));
+            draw_edge(&painter, pd(*dac), pc(c), Stroke::new(1.0, C_EDGE_BG));
         }
     }
-    for &(comp, eevs) in COMP_TO_EEV {
+    for (comp, eevs) in COMP_TO_EEV.iter() {
         for &e in eevs {
-            draw_edge(&painter, pc(comp), pe(e), Stroke::new(1.0, C_EDGE_BG));
+            draw_edge(&painter, pc(*comp), pe(e), Stroke::new(1.0, C_EDGE_BG));
         }
     }
-    for &(comp, flts) in COMP_TO_FLT {
+    for (comp, flts) in COMP_TO_FLT.iter() {
         for &f in flts {
-            draw_edge(&painter, pc(comp), pf(f), Stroke::new(1.0, C_EDGE_BG));
+            draw_edge(&painter, pc(*comp), pf(f), Stroke::new(1.0, C_EDGE_BG));
         }
     }
 
