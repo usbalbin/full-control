@@ -305,18 +305,13 @@ pub fn current_pin_signals(design: &Design, variant: ChipVariant) -> HashMap<Pin
 }
 
 fn all_gpio_pins(variant: ChipVariant) -> HashSet<Pin> {
-    use crate::pinout::signals_on;
-    let mut out = HashSet::new();
-    // Brute: try every port/num combination seen in practice on G474 LQFP64.
-    for port in ['A', 'B', 'C', 'D', 'F', 'G'] {
-        for num in 0..=15u8 {
-            let p = Pin::new(port, num);
-            if !signals_on(p, variant).is_empty() {
-                out.insert(p);
-            }
-        }
-    }
-    out
+    // Data-driven: every pin that carries at least one signal, straight from
+    // the extracted chip data (no hardcoded port list / 0..15 range — so this
+    // is correct for any package, incl. parts with ports beyond G).
+    let raw = crate::mcu::Package::from_g474_variant(variant).raw();
+    crate::mcu_pinout::af_rows(raw)
+        .map(|r| Pin::new(r.pin.port, r.pin.num))
+        .collect()
 }
 
 fn compute_move(
