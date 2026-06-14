@@ -283,6 +283,30 @@ pub struct ChipFabric {
     pub tim_to_dac_trigger: &'static [(&'static str, u8)],
 }
 
+impl ChipFabric {
+    /// Comparator instances whose output can drive `tim`'s break input
+    /// `break_input` (1 = BRK, 2 = BRK2) — the candidate hardware over-current
+    /// sources for a timer-PWM converter. Table order is preserved (candidate
+    /// ordering); empty if that timer/input has no comparator break path.
+    pub fn comps_for_tim_break(&self, tim: u8, break_input: u8) -> Vec<u8> {
+        self.comp_to_tim_break
+            .iter()
+            .filter(|&&(_, t, b)| t == tim && b == break_input)
+            .map(|&(comp, _, _)| comp)
+            .collect()
+    }
+
+    /// DAC `(instance, channel)` sources that can set comparator `comp`'s
+    /// inverting-input threshold. Empty if no DAC routes to that comparator.
+    pub fn dac_threshold_sources_for_comp(&self, comp: u8) -> Vec<(u8, u8)> {
+        self.dac_to_comp
+            .iter()
+            .filter(|&&(_, _, c)| c == comp)
+            .map(|&(dac, ch, _)| (dac, ch))
+            .collect()
+    }
+}
+
 pub struct McuDescriptor {
     pub mcu: Mcu,
     pub package: Package,
@@ -609,5 +633,35 @@ mod c5_support {
             .collect();
         edges.sort_unstable();
         assert_eq!(edges, want, "C531 descriptor edges drifted from fabric data");
+    }
+
+    /// The fabric query layer that Inc 5 (`TimerDesign` break-validation) and the
+    /// Inc 6 UI (COMP/DAC dropdowns) will consume must answer the C531 routing
+    /// correctly, and be empty where there is no hardware path.
+    #[test]
+    fn c531_fabric_queries() {
+        let d = Package::C531R.descriptor();
+        let fab = d.fabric.expect("C531 fabric");
+
+        // Both advanced timers, both break inputs, accept COMP1 and COMP2.
+        assert_eq!(fab.comps_for_tim_break(1, 1), vec![1, 2], "TIM1 BRK");
+        assert_eq!(fab.comps_for_tim_break(1, 2), vec![1, 2], "TIM1 BRK2");
+        assert_eq!(fab.comps_for_tim_break(8, 1), vec![1, 2], "TIM8 BRK");
+        assert_eq!(fab.comps_for_tim_break(8, 2), vec![1, 2], "TIM8 BRK2");
+        // A general-purpose timer has no comparator break path; nor a 3rd input.
+        assert!(fab.comps_for_tim_break(2, 1).is_empty(), "TIM2 has no break");
+        assert!(fab.comps_for_tim_break(1, 3).is_empty(), "no 3rd break input");
+
+        // DAC threshold sources: COMP1 <- dac1_ch1, COMP2 <- dac1_ch2.
+        assert_eq!(fab.dac_threshold_sources_for_comp(1), vec![(1, 1)], "COMP1");
+        assert_eq!(fab.dac_threshold_sources_for_comp(2), vec![(1, 2)], "COMP2");
+        assert!(fab.dac_threshold_sources_for_comp(3).is_empty(), "no COMP3");
+
+        // G4 routes OCP through HRTIM EEV, not timer breaks — the timer-break
+        // accessor is empty there even though G4 has a rich DAC->COMP fabric.
+        let g4 = Package::G474R.descriptor();
+        let g4f = g4.fabric.expect("G4 fabric");
+        assert!(g4f.comps_for_tim_break(1, 1).is_empty(), "G4 uses HRTIM breaks");
+        assert!(!g4f.dac_threshold_sources_for_comp(1).is_empty(), "G4 DAC1->COMP1");
     }
 }
