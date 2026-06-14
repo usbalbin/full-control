@@ -81,8 +81,13 @@ pub struct SearchQuery {
     pub min_dac: u8,
     pub min_comp: u8,
     pub min_opamp: u8,
+    pub min_i3c: u8,
+    pub min_ucpd: u8,
+    pub min_octospi: u8,
     pub require_usb: bool,
     pub require_hrtim: bool,
+    pub require_sdmmc: bool,
+    pub require_fmc: bool,
 }
 
 impl SearchQuery {
@@ -102,8 +107,13 @@ impl SearchQuery {
             && e.dac >= self.min_dac
             && e.comp >= self.min_comp
             && e.opamp >= self.min_opamp
+            && e.i3c >= self.min_i3c
+            && e.ucpd >= self.min_ucpd
+            && e.octospi >= self.min_octospi
             && (!self.require_usb || e.has_usb)
             && (!self.require_hrtim || e.has_hrtim)
+            && (!self.require_sdmmc || e.has_sdmmc)
+            && (!self.require_fmc || e.has_fmc)
     }
 }
 
@@ -170,5 +180,34 @@ mod tests {
             c5.iter().any(|e| e.dac >= 1 && e.comp >= 1 && e.tim_adv >= 1),
             "expected at least one C5 part with DAC + COMP + advanced timer"
         );
+    }
+
+    #[test]
+    fn new_filters_narrow_results() {
+        let sdmmc = search(&SearchQuery {
+            require_sdmmc: true,
+            ..Default::default()
+        });
+        assert!(!sdmmc.is_empty() && sdmmc.iter().all(|e| e.has_sdmmc));
+
+        let octo = search(&SearchQuery {
+            min_octospi: 1,
+            ..Default::default()
+        });
+        assert!(!octo.is_empty() && octo.iter().all(|e| e.octospi >= 1));
+
+        // Adding a constraint only narrows the result set (monotonic).
+        let base = search(&SearchQuery {
+            min_flash_kb: 256,
+            ..Default::default()
+        })
+        .len();
+        let tighter = search(&SearchQuery {
+            min_flash_kb: 256,
+            require_fmc: true,
+            ..Default::default()
+        })
+        .len();
+        assert!(tighter <= base && tighter > 0);
     }
 }

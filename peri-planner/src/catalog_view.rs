@@ -45,11 +45,18 @@ pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) -> Option<Package> {
             num(ui, "Min COMP", &mut q.min_comp);
             num(ui, "Min OPAMP", &mut q.min_opamp);
             ui.end_row();
+            num(ui, "Min I3C", &mut q.min_i3c);
+            num(ui, "Min UCPD", &mut q.min_ucpd);
+            ui.end_row();
+            num(ui, "Min OctoSPI", &mut q.min_octospi);
+            ui.end_row();
         });
 
     ui.horizontal(|ui| {
         ui.checkbox(&mut q.require_usb, "USB");
         ui.checkbox(&mut q.require_hrtim, "HRTIM");
+        ui.checkbox(&mut q.require_sdmmc, "SDMMC");
+        ui.checkbox(&mut q.require_fmc, "FMC");
         ui.separator();
         ui.label("Family:");
         let current = q.family.clone().unwrap_or_else(|| "(any)".to_string());
