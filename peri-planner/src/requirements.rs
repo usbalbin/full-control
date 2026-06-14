@@ -315,6 +315,102 @@ fn tim_claim_signals(
     s
 }
 
+/// All pin-bearing signals a single assignment uses — the single source of
+/// truth for the design's signal set (`used_signals` maps this over every
+/// assignment). NOTE: `forced_pin_claims` intentionally DIFFERS (it omits
+/// `AdcConversion` inputs from its pin-claim set), so it is deliberately not
+/// unified with this function.
+fn assignment_signals(a: &Assignment) -> Vec<crate::pinout::Signal> {
+    use crate::pinout::{HrtimCh, Signal};
+    let mut out = Vec::new();
+    match a {
+        Assignment::ShortCircuitFault(f) => { out.push(Signal::HrtimFlt(f.flt)); }
+        Assignment::ShareBusDrive(d) => { out.push(Signal::DacOut(d.dac)); }
+        Assignment::AdcConversion { adc, channel, .. } => {
+            out.push(Signal::AdcIn { adc: *adc, channel: *channel });
+        }
+        Assignment::AdcSequencer { .. } => {}
+        Assignment::Opamp { instance, external_vinp, external_vinm, external_vout } => {
+            if *external_vinp { out.push(Signal::OpampVinp(*instance)); }
+            if *external_vinm { out.push(Signal::OpampVinm(*instance)); }
+            if *external_vout { out.push(Signal::OpampVout(*instance)); }
+        }
+        Assignment::Spi { instance, needs_miso, needs_nss } => {
+            out.push(Signal::SpiMosi(*instance));
+            out.push(Signal::SpiSck(*instance));
+            if *needs_miso { out.push(Signal::SpiMiso(*instance)); }
+            if *needs_nss  { out.push(Signal::SpiNss(*instance)); }
+        }
+        Assignment::I2c { instance, needs_smba } => {
+            out.push(Signal::I2cSda(*instance));
+            out.push(Signal::I2cScl(*instance));
+            if *needs_smba { out.push(Signal::I2cSmba(*instance)); }
+        }
+        Assignment::Usart { instance, flow_control, synchronous } => {
+            out.push(Signal::UsartTx(*instance));
+            out.push(Signal::UsartRx(*instance));
+            if *flow_control {
+                out.push(Signal::UsartCts(*instance));
+                out.push(Signal::UsartRts(*instance));
+            }
+            if *synchronous { out.push(Signal::UsartCk(*instance)); }
+        }
+        Assignment::Uart { instance, flow_control } => {
+            out.push(Signal::UartTx(*instance));
+            out.push(Signal::UartRx(*instance));
+            if *flow_control {
+                out.push(Signal::UartCts(*instance));
+                out.push(Signal::UartRts(*instance));
+            }
+        }
+        Assignment::Lpuart { instance, flow_control } => {
+            out.push(Signal::LpuartTx(*instance));
+            out.push(Signal::LpuartRx(*instance));
+            if *flow_control {
+                out.push(Signal::LpuartCts(*instance));
+                out.push(Signal::LpuartRts(*instance));
+            }
+        }
+        Assignment::Can { instance } => {
+            out.push(Signal::CanTx(*instance));
+            out.push(Signal::CanRx(*instance));
+        }
+        Assignment::Usb => {
+            out.push(Signal::UsbDp);
+            out.push(Signal::UsbDm);
+        }
+        Assignment::Ucpd { instance } => {
+            out.push(Signal::UcpdCc1(*instance));
+            out.push(Signal::UcpdCc2(*instance));
+        }
+        Assignment::Tim {
+            instance, channels_mask, complementary, bkin, etr, mode, ..
+        } => {
+            out.extend(tim_claim_signals(
+                *instance, *channels_mask, *complementary, *bkin, *etr, *mode,
+            ));
+        }
+        Assignment::HrtimSub { sub_timer, outputs, resolved, .. } => {
+            out.push(Signal::HrtimChannel { timer: *sub_timer, ch: HrtimCh::Ch1 });
+            if matches!(outputs, OutputMode::Ch1AndCh2) {
+                out.push(Signal::HrtimChannel { timer: *sub_timer, ch: HrtimCh::Ch2 });
+            }
+            match resolved {
+                HrtimResolved::PcmExternal { peak_eev, zcd_eev, dac, .. } => {
+                    out.push(Signal::HrtimEev(*peak_eev));
+                    if let Some(z) = zcd_eev { out.push(Signal::HrtimEev(*z)); }
+                    if let Some(d) = dac { out.push(Signal::DacOut(*d)); }
+                }
+                HrtimResolved::PcmInternal { zcd_eev, .. } => {
+                    if let Some(z) = zcd_eev { out.push(Signal::HrtimEev(*z)); }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum TimMode {
     /// Output-compare / PWM generation on the claimed channels. Default.
@@ -1851,96 +1947,11 @@ impl Design {
     }
 
     pub fn used_signals(&self) -> Vec<crate::pinout::Signal> {
-        use crate::pinout::{HrtimCh, Signal};
-        let mut out = Vec::new();
-        for a in self.assignments.iter().flatten() {
-            match a {
-                Assignment::ShortCircuitFault(f) => { out.push(Signal::HrtimFlt(f.flt)); }
-                Assignment::ShareBusDrive(d) => { out.push(Signal::DacOut(d.dac)); }
-                Assignment::AdcConversion { adc, channel, .. } => {
-                    out.push(Signal::AdcIn { adc: *adc, channel: *channel });
-                }
-                Assignment::AdcSequencer { .. } => {}
-                Assignment::Opamp { instance, external_vinp, external_vinm, external_vout } => {
-                    if *external_vinp { out.push(Signal::OpampVinp(*instance)); }
-                    if *external_vinm { out.push(Signal::OpampVinm(*instance)); }
-                    if *external_vout { out.push(Signal::OpampVout(*instance)); }
-                }
-                Assignment::Spi { instance, needs_miso, needs_nss } => {
-                    out.push(Signal::SpiMosi(*instance));
-                    out.push(Signal::SpiSck(*instance));
-                    if *needs_miso { out.push(Signal::SpiMiso(*instance)); }
-                    if *needs_nss  { out.push(Signal::SpiNss(*instance)); }
-                }
-                Assignment::I2c { instance, needs_smba } => {
-                    out.push(Signal::I2cSda(*instance));
-                    out.push(Signal::I2cScl(*instance));
-                    if *needs_smba { out.push(Signal::I2cSmba(*instance)); }
-                }
-                Assignment::Usart { instance, flow_control, synchronous } => {
-                    out.push(Signal::UsartTx(*instance));
-                    out.push(Signal::UsartRx(*instance));
-                    if *flow_control {
-                        out.push(Signal::UsartCts(*instance));
-                        out.push(Signal::UsartRts(*instance));
-                    }
-                    if *synchronous { out.push(Signal::UsartCk(*instance)); }
-                }
-                Assignment::Uart { instance, flow_control } => {
-                    out.push(Signal::UartTx(*instance));
-                    out.push(Signal::UartRx(*instance));
-                    if *flow_control {
-                        out.push(Signal::UartCts(*instance));
-                        out.push(Signal::UartRts(*instance));
-                    }
-                }
-                Assignment::Lpuart { instance, flow_control } => {
-                    out.push(Signal::LpuartTx(*instance));
-                    out.push(Signal::LpuartRx(*instance));
-                    if *flow_control {
-                        out.push(Signal::LpuartCts(*instance));
-                        out.push(Signal::LpuartRts(*instance));
-                    }
-                }
-                Assignment::Can { instance } => {
-                    out.push(Signal::CanTx(*instance));
-                    out.push(Signal::CanRx(*instance));
-                }
-                Assignment::Usb => {
-                    out.push(Signal::UsbDp);
-                    out.push(Signal::UsbDm);
-                }
-                Assignment::Ucpd { instance } => {
-                    out.push(Signal::UcpdCc1(*instance));
-                    out.push(Signal::UcpdCc2(*instance));
-                }
-                Assignment::Tim {
-                    instance, channels_mask, complementary, bkin, etr, mode, ..
-                } => {
-                    out.extend(tim_claim_signals(
-                        *instance, *channels_mask, *complementary, *bkin, *etr, *mode,
-                    ));
-                }
-                Assignment::HrtimSub { sub_timer, outputs, resolved, .. } => {
-                    out.push(Signal::HrtimChannel { timer: *sub_timer, ch: HrtimCh::Ch1 });
-                    if matches!(outputs, OutputMode::Ch1AndCh2) {
-                        out.push(Signal::HrtimChannel { timer: *sub_timer, ch: HrtimCh::Ch2 });
-                    }
-                    match resolved {
-                        HrtimResolved::PcmExternal { peak_eev, zcd_eev, dac, .. } => {
-                            out.push(Signal::HrtimEev(*peak_eev));
-                            if let Some(z) = zcd_eev { out.push(Signal::HrtimEev(*z)); }
-                            if let Some(d) = dac { out.push(Signal::DacOut(*d)); }
-                        }
-                        HrtimResolved::PcmInternal { zcd_eev, .. } => {
-                            if let Some(z) = zcd_eev { out.push(Signal::HrtimEev(*z)); }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        out
+        self.assignments
+            .iter()
+            .flatten()
+            .flat_map(assignment_signals)
+            .collect()
     }
 
     pub fn warnings(&self) -> Vec<CapabilityCheck> {
