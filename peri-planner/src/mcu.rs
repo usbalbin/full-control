@@ -326,6 +326,20 @@ const G4_FABRIC: ChipFabric = ChipFabric {
     tim_to_dac_trigger: &[],
 };
 
+/// The STM32C531 analog fabric, hand-cited from RM0522 (see `fabric_data_c5`).
+/// C5 has no HRTIM, so the EEV/FLT/crossbar fields are empty; the power-analog
+/// chain lives in `dac_to_comp` (threshold) + `comp_to_tim_break` (hardware
+/// over-current trip into the TIM1/TIM8 break inputs).
+const C5_FABRIC: ChipFabric = ChipFabric {
+    dac_to_comp: crate::fabric_data_c5::C5_DAC_TO_COMP,
+    comp_to_eev: &[],
+    comp_to_flt: &[],
+    crossbar_to_adc_trigger: &[],
+    comp_to_tim_break: crate::fabric_data_c5::C5_COMP_TO_TIM_BREAK,
+    tim_to_adc_trigger: &[],
+    tim_to_dac_trigger: &[],
+};
+
 /// Build the descriptor's `edges` (DAC->COMP) from a fabric's numeric table.
 fn dac_to_comp_edges(fabric: &ChipFabric) -> Vec<PeripheralEdge> {
     fabric
@@ -361,10 +375,16 @@ fn build_descriptor(pkg: Package) -> McuDescriptor {
         Mcu::H523 => {
             for a in &mut d.adcs { a.fast_channels = H523_FAST_ADC; }
         }
-        Mcu::C5A3 | Mcu::C531 => {
-            // Inventory-only for now. C5 has DAC/COMP/OPAMP + TIM1/TIM8 but no
-            // HRTIM; its fabric (RM0522 Table 84/85) is timer-based and would
-            // attach here once the descriptor model is family-generic.
+        Mcu::C531 => {
+            // C531 is the first plannable C5: attach its RM0522-cited timer-based
+            // fabric (DAC->COMP threshold + COMP->TIM-break over-current). Still
+            // no HRTIM.
+            d.fabric = Some(&C5_FABRIC);
+            d.edges = dac_to_comp_edges(&C5_FABRIC);
+        }
+        Mcu::C5A3 => {
+            // Inventory-only for now: its analog fabric is not yet transcribed
+            // (C531 is the verified first plannable C5).
         }
     }
 
@@ -545,5 +565,49 @@ mod c5_support {
             "TIM1 advanced"
         );
         assert!(d.hrtim.is_none(), "C5 has no HRTIM");
+    }
+
+    /// Golden snapshot of the RM0522-verified C531 analog fabric. The C5 tables
+    /// are hand-transcribed (no CubeMX/metapac source for them), so these
+    /// expectations — authored independently of `fabric_data_c5` and
+    /// cross-checked by a separate RM0522 re-read — guard against an edit
+    /// silently changing the hardware over-current routing.
+    #[test]
+    fn c531_fabric_golden() {
+        // DAC channel -> COMP inverting input (RM0522 Table 172, INMSEL=0b0100).
+        let dac_to_comp: &[(u8, u8, u8)] = &[(1, 1, 1), (1, 2, 2)];
+        let mut got = crate::fabric_data_c5::C5_DAC_TO_COMP.to_vec();
+        got.sort_unstable();
+        let mut want = dac_to_comp.to_vec();
+        want.sort_unstable();
+        assert_eq!(got, want, "C5_DAC_TO_COMP drifted from RM0522 golden");
+
+        // COMP output -> advanced-timer break (RM0522 section 31.3.2). TIM1 and
+        // TIM8 each take COMP1 and COMP2 on BOTH break input 1 (BRK) and 2 (BRK2).
+        let comp_to_break: &[(u8, u8, u8)] = &[
+            (1, 1, 1), (2, 1, 1), (1, 1, 2), (2, 1, 2),
+            (1, 8, 1), (2, 8, 1), (1, 8, 2), (2, 8, 2),
+        ];
+        let mut gotb = crate::fabric_data_c5::C5_COMP_TO_TIM_BREAK.to_vec();
+        gotb.sort_unstable();
+        let mut wantb = comp_to_break.to_vec();
+        wantb.sort_unstable();
+        assert_eq!(gotb, wantb, "C5_COMP_TO_TIM_BREAK drifted from RM0522 golden");
+
+        // The descriptor must attach the fabric and derive its DAC->COMP edges.
+        let d = Package::C531R.descriptor();
+        let fab = d.fabric.expect("C531 should have an attached fabric");
+        assert_eq!(
+            fab.comp_to_tim_break,
+            crate::fabric_data_c5::C5_COMP_TO_TIM_BREAK,
+            "descriptor fabric must point at the C5 break table"
+        );
+        let mut edges: Vec<(u8, u8, u8)> = d
+            .edges
+            .iter()
+            .map(|e| (e.from.instance, e.from.channel, e.to.instance))
+            .collect();
+        edges.sort_unstable();
+        assert_eq!(edges, want, "C531 descriptor edges drifted from fabric data");
     }
 }

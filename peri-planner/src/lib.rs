@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod catalog_view;
 pub mod comms_view;
 pub mod fabric_data;
+pub mod fabric_data_c5;
 pub mod fabric_view;
 pub mod g474;
 pub mod h523_design;
