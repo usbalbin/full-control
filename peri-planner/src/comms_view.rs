@@ -225,10 +225,8 @@ fn render_pin_row(
             ui.label(all_cands[0].name());
             return;
         }
-        let cands = pinout::pin_candidates_respecting_locks(
-            signal, variant, &design.pin_assignments,
-        );
-        let current = design.pin_assignments.get(&signal).copied();
+        let cands = design.pin_candidates(signal, variant);
+        let current = design.pinned(signal);
         let label = current.map(|p| p.name()).unwrap_or_else(|| format!("{} opts", cands.len()));
         egui::ComboBox::from_id_salt(("comms-pin", signal))
             .width(110.0)

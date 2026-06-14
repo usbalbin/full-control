@@ -289,8 +289,8 @@ pub fn current_pin_signals(design: &Design, variant: ChipVariant) -> HashMap<Pin
                 pinout::pins_for(Signal::AdcIn { adc, channel }, variant).first().copied()
             }
             _ => {
-                if let Some(p) = design.pin_assignments.get(&s) {
-                    Some(*p)
+                if let Some(p) = design.pinned(s) {
+                    Some(p)
                 } else {
                     let opts = pinout::pins_for(s, variant);
                     if opts.len() == 1 { Some(opts[0]) } else { None }

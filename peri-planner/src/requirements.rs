@@ -1483,8 +1483,11 @@ pub struct Design {
     pub requirements: Vec<RequirementSpec>,
     pub assignments: Vec<Option<Assignment>>,
     pub locks: ResourceBag,
+    /// Persisted pin locks, keyed by the durable owned (peripheral, role) form
+    /// (regeneration-stable, MCU-agnostic) rather than the typed G474 `Signal`.
     #[serde(default)]
-    pub pin_assignments: std::collections::HashMap<crate::pinout::Signal, crate::pinout::Pin>,
+    pub pin_assignments:
+        std::collections::HashMap<crate::mcu_pinout::OwnedSignal, crate::mcu_pinout::PinId>,
     pub next_id: u32,
     /// Chip package variant. Drives per-package pin-availability in the
     /// AF table; persisted with the design so loading a saved file
@@ -1614,12 +1617,53 @@ impl Design {
     }
 
     pub fn set_pin(&mut self, signal: crate::pinout::Signal, pin: crate::pinout::Pin) {
-        self.pin_assignments.insert(signal, pin);
+        if let Some(o) = crate::pinout::signal_to_owned(signal) {
+            self.pin_assignments
+                .insert(o, crate::mcu_pinout::PinId { port: pin.port, num: pin.num });
+        }
     }
     pub fn clear_pin(&mut self, signal: crate::pinout::Signal) {
-        self.pin_assignments.remove(&signal);
+        if let Some(o) = crate::pinout::signal_to_owned(signal) {
+            self.pin_assignments.remove(&o);
+        }
     }
     pub fn clear_all_pins(&mut self) { self.pin_assignments.clear(); }
+
+    /// The pin a signal is locked to, if any.
+    pub fn pinned(&self, signal: crate::pinout::Signal) -> Option<crate::pinout::Pin> {
+        let o = crate::pinout::signal_to_owned(signal)?;
+        self.pin_assignments
+            .get(&o)
+            .map(|p| crate::pinout::Pin::new(p.port, p.num))
+    }
+    pub fn is_pinned(&self, signal: crate::pinout::Signal) -> bool {
+        crate::pinout::signal_to_owned(signal)
+            .is_some_and(|o| self.pin_assignments.contains_key(&o))
+    }
+    pub fn has_pins(&self) -> bool { !self.pin_assignments.is_empty() }
+
+    /// Reconstruct the `Signal`-keyed lock view from the owned storage, for the
+    /// typed pin-candidate / conflict helpers.
+    fn pin_locks(
+        &self,
+    ) -> std::collections::HashMap<crate::pinout::Signal, crate::pinout::Pin> {
+        self.pin_assignments
+            .iter()
+            .filter_map(|(o, p)| {
+                crate::pinout::owned_to_signal(o)
+                    .map(|s| (s, crate::pinout::Pin::new(p.port, p.num)))
+            })
+            .collect()
+    }
+
+    /// Pin candidates for a signal, excluding pins taken by other locks.
+    pub fn pin_candidates(
+        &self,
+        signal: crate::pinout::Signal,
+        variant: crate::pinout::ChipVariant,
+    ) -> Vec<crate::pinout::Pin> {
+        crate::pinout::pin_candidates_respecting_locks(signal, variant, &self.pin_locks())
+    }
 
     pub fn set_variant(&mut self, variant: crate::pinout::ChipVariant) {
         self.variant = variant;
@@ -1775,8 +1819,8 @@ impl Design {
                 _ => Vec::new(),
             };
             for sig in signals {
-                let pin = if let Some(p) = self.pin_assignments.get(&sig) {
-                    Some(*p)
+                let pin = if let Some(p) = self.pinned(sig) {
+                    Some(p)
                 } else {
                     let pins = pins_for(sig, variant);
                     if pins.len() == 1 { Some(pins[0]) } else { None }
@@ -2313,5 +2357,23 @@ mod tests {
         });
         d.normalize();
         assert!(d.assignments[0].is_none());
+    }
+
+    #[test]
+    fn pin_locks_round_trip_through_owned_key() {
+        use crate::pinout::{Pin, Signal};
+        let mut d = Design::default();
+        let sig = Signal::SpiMosi(crate::g474::SpiId::Spi1);
+        let pin = Pin::new('A', 7);
+        d.set_pin(sig, pin);
+        assert_eq!(d.pinned(sig), Some(pin));
+        assert!(d.is_pinned(sig) && d.has_pins());
+        // Stored under the durable (peripheral, role) key, not a typed enum.
+        assert!(d
+            .pin_assignments
+            .keys()
+            .any(|o| o.peripheral == "SPI1" && o.role == "MOSI"));
+        d.clear_pin(sig);
+        assert!(d.pinned(sig).is_none() && !d.has_pins());
     }
 }

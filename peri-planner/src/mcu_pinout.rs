@@ -8,7 +8,10 @@ use crate::mcu_raw::{RawMcuData, RawPin};
 use std::collections::{HashMap, HashSet};
 
 /// MCU-independent pin identity. "PA0" → `PinId { port: 'A', num: 0 }`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord,
+    serde::Serialize, serde::Deserialize,
+)]
 pub struct PinId {
     pub port: char,
     pub num: u8,
@@ -34,6 +37,16 @@ impl PinId {
 pub struct SignalId {
     pub peripheral: &'static str,
     pub role: &'static str,
+}
+
+/// Owned, serializable form of `SignalId` — the durable, regeneration-stable
+/// key for persisted pin assignments (a `(peripheral, role)` pair survives
+/// stm32-data renumbering, unlike a typed enum discriminant). H523's
+/// `PinLock` uses the same shape.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct OwnedSignal {
+    pub peripheral: String,
+    pub role: String,
 }
 
 /// One AF-table row: a pin that carries `signal` at AF `af`. `None` AF

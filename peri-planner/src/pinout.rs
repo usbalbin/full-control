@@ -513,6 +513,22 @@ fn metapac_to_signal(peripheral: &str, role: &str) -> Option<Signal> {
     None
 }
 
+/// Owned, serializable `(peripheral, role)` form of a typed `Signal` — the
+/// durable key for persisted pin assignments.
+pub fn signal_to_owned(signal: Signal) -> Option<crate::mcu_pinout::OwnedSignal> {
+    let (peripheral, role) = signal_to_metapac(signal);
+    if role.is_empty() {
+        return None;
+    }
+    Some(crate::mcu_pinout::OwnedSignal { peripheral: peripheral.to_string(), role })
+}
+
+/// Inverse of `signal_to_owned`: recover the typed `Signal` from a stored
+/// `(peripheral, role)` pair, if `pinout` models it.
+pub fn owned_to_signal(o: &crate::mcu_pinout::OwnedSignal) -> Option<Signal> {
+    metapac_to_signal(&o.peripheral, &o.role)
+}
+
 /// The generic `SignalId` for a typed `Signal` on this chip's data, if the
 /// signal's (peripheral, role) exists in it. Bridges the typed G474 `Signal`
 /// façade to the descriptor-driven `mcu_pinout` engine.

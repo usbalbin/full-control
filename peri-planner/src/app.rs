@@ -10,7 +10,9 @@ use crate::pinout::{self, ChipVariant};
 use crate::requirements::*;
 use crate::solver::{TimerSlotUsage, ALL_CR_SLOTS_HELPER};
 
-const STORAGE_KEY: &str = "peri_planner_design_v3";
+// v4: pin_assignments re-keyed from the typed Signal enum to the owned
+// (peripheral, role) form. Old v3 saves are intentionally dropped.
+const STORAGE_KEY: &str = "peri_planner_design_v4";
 const HISTORY_CAP: usize = 40;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -399,7 +401,7 @@ impl eframe::App for PeriPlannerApp {
                 let mut pending_clear_all_pins = false;
                 ui.horizontal(|ui| {
                     ui.label("Pin map:");
-                    if !self.design.pin_assignments.is_empty()
+                    if self.design.has_pins()
                         && ui.small_button("Clear pin locks").clicked()
                     {
                         pending_clear_all_pins = true;
@@ -411,12 +413,8 @@ impl eframe::App for PeriPlannerApp {
                 } else {
                     let unreachable = pinout::unreachable_signals(&signals, self.variant);
                     for (idx, s) in signals.iter().enumerate() {
-                        let cands = pinout::pin_candidates_respecting_locks(
-                            *s,
-                            self.variant,
-                            &self.design.pin_assignments,
-                        );
-                        let locked = self.design.pin_assignments.contains_key(s);
+                        let cands = self.design.pin_candidates(*s, self.variant);
+                        let locked = self.design.is_pinned(*s);
                         ui.horizontal(|ui| {
                             ui.label(format!("  {:<14} ->", s.name()));
                             let all_cands = pinout::pins_for(*s, self.variant);
@@ -428,8 +426,7 @@ impl eframe::App for PeriPlannerApp {
                             } else if all_cands.len() == 1 {
                                 ui.label(all_cands[0].name());
                             } else {
-                                let current =
-                                    self.design.pin_assignments.get(s).copied();
+                                let current = self.design.pinned(*s);
                                 let label = current
                                     .map(|p| p.name())
                                     .unwrap_or_else(|| format!("{} options", cands.len()));
