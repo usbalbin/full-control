@@ -431,71 +431,52 @@ pub static COMP_TO_FLT: std::sync::LazyLock<Vec<(CompId, Vec<HrtimFltId>)>> =
         }))
     });
 
-const TRIG_1234: &[AdcTriggerId] = &[
-    AdcTriggerId::Trig1,
-    AdcTriggerId::Trig2,
-    AdcTriggerId::Trig3,
-    AdcTriggerId::Trig4,
-];
-const TRIG_13: &[AdcTriggerId] = &[AdcTriggerId::Trig1, AdcTriggerId::Trig3];
-const TRIG_24: &[AdcTriggerId] = &[AdcTriggerId::Trig2, AdcTriggerId::Trig4];
+fn trig_id(n: u8) -> Option<AdcTriggerId> {
+    use AdcTriggerId::*;
+    Some(match n {
+        1 => Trig1, 2 => Trig2, 3 => Trig3, 4 => Trig4, 5 => Trig5,
+        6 => Trig6, 7 => Trig7, 8 => Trig8, 9 => Trig9, 10 => Trig10,
+        _ => return None,
+    })
+}
 
-pub const CROSSBAR_TO_ADC_TRIGGER: &[(CrossbarSource, &[AdcTriggerId])] = &[
-    (CrossbarSource::Mcr1, TRIG_1234),
-    (CrossbarSource::Mcr2, TRIG_1234),
-    (CrossbarSource::Mcr3, TRIG_1234),
-    (CrossbarSource::Mcr4, TRIG_1234),
-    (CrossbarSource::Mper, TRIG_1234),
+/// Inverse of `format!("{:?}", CrossbarSource)` — maps the name-keyed
+/// `fabric_data` crossbar table back to the enum. A round-trip test
+/// (`crossbar_name_roundtrips`) guards this against enum/name drift.
+fn crossbar_from_name(name: &str) -> Option<CrossbarSource> {
+    use CrossbarSource::*;
+    Some(match name {
+        "Mcr1" => Mcr1, "Mcr2" => Mcr2, "Mcr3" => Mcr3, "Mcr4" => Mcr4, "Mper" => Mper,
+        "Eev1" => Eev1, "Eev2" => Eev2, "Eev3" => Eev3, "Eev4" => Eev4, "Eev5" => Eev5,
+        "Eev6" => Eev6, "Eev7" => Eev7, "Eev8" => Eev8, "Eev9" => Eev9, "Eev10" => Eev10,
+        "TimACr2" => TimACr2, "TimACr3" => TimACr3, "TimACr4" => TimACr4, "TimACrPer" => TimACrPer, "TimACrRst" => TimACrRst,
+        "TimBCr2" => TimBCr2, "TimBCr3" => TimBCr3, "TimBCr4" => TimBCr4, "TimBCrPer" => TimBCrPer, "TimBCrRst" => TimBCrRst,
+        "TimCCr2" => TimCCr2, "TimCCr3" => TimCCr3, "TimCCr4" => TimCCr4, "TimCCrPer" => TimCCrPer, "TimCCrRst" => TimCCrRst,
+        "TimDCr2" => TimDCr2, "TimDCr3" => TimDCr3, "TimDCr4" => TimDCr4, "TimDCrPer" => TimDCrPer, "TimDCrRst" => TimDCrRst,
+        "TimECr2" => TimECr2, "TimECr3" => TimECr3, "TimECr4" => TimECr4, "TimECrPer" => TimECrPer, "TimECrRst" => TimECrRst,
+        "TimFCr2" => TimFCr2, "TimFCr3" => TimFCr3, "TimFCr4" => TimFCr4, "TimFCrPer" => TimFCrPer, "TimFCrRst" => TimFCrRst,
+        _ => return None,
+    })
+}
 
-    (CrossbarSource::Eev1, TRIG_13),
-    (CrossbarSource::Eev2, TRIG_13),
-    (CrossbarSource::Eev3, TRIG_13),
-    (CrossbarSource::Eev4, TRIG_13),
-    (CrossbarSource::Eev5, TRIG_13),
-    (CrossbarSource::Eev6, TRIG_24),
-    (CrossbarSource::Eev7, TRIG_24),
-    (CrossbarSource::Eev8, TRIG_24),
-    (CrossbarSource::Eev9, TRIG_24),
-    (CrossbarSource::Eev10, TRIG_24),
-
-    (CrossbarSource::TimACr2, TRIG_24),
-    (CrossbarSource::TimACr3, TRIG_13),
-    (CrossbarSource::TimACr4, TRIG_1234),
-    (CrossbarSource::TimACrPer, TRIG_1234),
-    (CrossbarSource::TimACrRst, TRIG_13),
-
-    (CrossbarSource::TimBCr2, TRIG_24),
-    (CrossbarSource::TimBCr3, TRIG_13),
-    (CrossbarSource::TimBCr4, TRIG_1234),
-    (CrossbarSource::TimBCrPer, TRIG_1234),
-    (CrossbarSource::TimBCrRst, TRIG_13),
-
-    (CrossbarSource::TimCCr2, TRIG_24),
-    (CrossbarSource::TimCCr3, TRIG_13),
-    (CrossbarSource::TimCCr4, TRIG_1234),
-    (CrossbarSource::TimCCrPer, TRIG_1234),
-    (CrossbarSource::TimCCrRst, TRIG_24),
-
-    (CrossbarSource::TimDCr2, TRIG_24),
-    (CrossbarSource::TimDCr3, TRIG_13),
-    (CrossbarSource::TimDCr4, TRIG_1234),
-    (CrossbarSource::TimDCrPer, TRIG_1234),
-    (CrossbarSource::TimDCrRst, TRIG_24),
-
-    (CrossbarSource::TimECr2, TRIG_24),
-    // RM0440 HRTIM_ADC1R..4R: TimE CMP3 present in all four triggers; TimE
-    // period in ADC1R/ADC3R (odd) only. (Both were wrong in the old hand table.)
-    (CrossbarSource::TimECr3, TRIG_1234),
-    (CrossbarSource::TimECr4, TRIG_1234),
-    (CrossbarSource::TimECrPer, TRIG_13),
-    (CrossbarSource::TimECrRst, TRIG_24),
-
-    (CrossbarSource::TimFCr2, TRIG_24),
-    (CrossbarSource::TimFCr3, TRIG_1234),
-    (CrossbarSource::TimFCr4, TRIG_1234),
-    (CrossbarSource::TimFCrPer, TRIG_1234),
-    (CrossbarSource::TimFCrRst, TRIG_13),
-];
+/// HRTIM crossbar source -> ADC triggers, grouped from `fabric_data` (which
+/// carries the RM0440-verified routing, incl. the TimE/TimF fixes). Sorted by
+/// `CrossbarSource` for stable, enum-defined ordering.
+pub static CROSSBAR_TO_ADC_TRIGGER: std::sync::LazyLock<Vec<(CrossbarSource, Vec<AdcTriggerId>)>> =
+    std::sync::LazyLock::new(|| {
+        let mut v: Vec<(CrossbarSource, Vec<AdcTriggerId>)> =
+            crate::fabric_data::G4_CROSSBAR_TO_ADC_TRIGGER
+                .iter()
+                .map(|&(name, trigs)| {
+                    (
+                        crossbar_from_name(name).expect("unknown crossbar source name in fabric_data"),
+                        trigs.iter().map(|&t| trig_id(t).expect("bad trigger number")).collect(),
+                    )
+                })
+                .collect();
+        v.sort_by_key(|(k, _)| *k);
+        v
+    });
 
 const ADC_ODD: &[AdcChannel] = &[
     AdcChannel::Adc1Regular,
@@ -567,7 +548,7 @@ pub fn adc_triggers_for(event: CrossbarSource) -> &'static [AdcTriggerId] {
     CROSSBAR_TO_ADC_TRIGGER
         .iter()
         .find(|(e, _)| *e == event)
-        .map(|(_, t)| *t)
+        .map(|(_, t)| t.as_slice())
         .unwrap_or(&[])
 }
 
@@ -611,35 +592,55 @@ mod fabric_validation {
         assert_eq!(got, want, "G4_COMP_TO_FLT drifted from RM0440 Table 228 golden");
     }
 
-    fn trig_num(t: AdcTriggerId) -> u8 {
-        format!("{t:?}").trim_start_matches("Trig").parse().unwrap()
-    }
-
-    /// `gen_fabric` extracts the HRTIM crossbar->ADC-trigger map from CubeMX
-    /// `ADCTRIGGEREVENT{13|24}` modes (one RM0440-verified fixup). Cross-checking
-    /// it against the hand table found TWO bugs in the hand table (TimECr3,
-    /// TimECrPer) and ONE in cubedb (TimFCr2); all three are now RM-correct.
+    /// Golden snapshot of the RM0440-verified HRTIM crossbar->ADC-trigger map
+    /// (45 sources; odd triggers = {1,3}, even = {2,4}, both = {1,2,3,4}).
+    /// `fabric_data` is the source for the typed `CROSSBAR_TO_ADC_TRIGGER` view
+    /// (the solver consumes it via `adc_triggers_for`); this guards it — incl.
+    /// the TimECr3/TimECrPer/TimFCr2 fixes — independently of the generator.
     #[test]
-    fn cubedb_crossbar_to_adc_trigger_matches_hand_table() {
-        let mut generated: Vec<(String, Vec<u8>)> = crate::fabric_data::G4_CROSSBAR_TO_ADC_TRIGGER
+    fn g4_crossbar_to_adc_trigger_golden() {
+        let all = vec![1u8, 2, 3, 4];
+        let odd = vec![1u8, 3];
+        let even = vec![2u8, 4];
+        let golden: Vec<(&str, Vec<u8>)> = vec![
+            ("Mcr1", all.clone()), ("Mcr2", all.clone()), ("Mcr3", all.clone()),
+            ("Mcr4", all.clone()), ("Mper", all.clone()),
+            ("Eev1", odd.clone()), ("Eev2", odd.clone()), ("Eev3", odd.clone()),
+            ("Eev4", odd.clone()), ("Eev5", odd.clone()),
+            ("Eev6", even.clone()), ("Eev7", even.clone()), ("Eev8", even.clone()),
+            ("Eev9", even.clone()), ("Eev10", even.clone()),
+            ("TimACr2", even.clone()), ("TimACr3", odd.clone()), ("TimACr4", all.clone()), ("TimACrPer", all.clone()), ("TimACrRst", odd.clone()),
+            ("TimBCr2", even.clone()), ("TimBCr3", odd.clone()), ("TimBCr4", all.clone()), ("TimBCrPer", all.clone()), ("TimBCrRst", odd.clone()),
+            ("TimCCr2", even.clone()), ("TimCCr3", odd.clone()), ("TimCCr4", all.clone()), ("TimCCrPer", all.clone()), ("TimCCrRst", even.clone()),
+            ("TimDCr2", even.clone()), ("TimDCr3", odd.clone()), ("TimDCr4", all.clone()), ("TimDCrPer", all.clone()), ("TimDCrRst", even.clone()),
+            ("TimECr2", even.clone()), ("TimECr3", all.clone()), ("TimECr4", all.clone()), ("TimECrPer", odd.clone()), ("TimECrRst", even.clone()),
+            ("TimFCr2", even.clone()), ("TimFCr3", all.clone()), ("TimFCr4", all.clone()), ("TimFCrPer", all.clone()), ("TimFCrRst", odd.clone()),
+        ];
+        let mut want: Vec<(String, Vec<u8>)> =
+            golden.into_iter().map(|(n, t)| (n.to_string(), t)).collect();
+        want.sort();
+        let mut got: Vec<(String, Vec<u8>)> = crate::fabric_data::G4_CROSSBAR_TO_ADC_TRIGGER
             .iter()
-            .map(|(s, ts)| (s.to_string(), ts.to_vec()))
-            .collect();
-        generated.sort();
-
-        let mut hand: Vec<(String, Vec<u8>)> = CROSSBAR_TO_ADC_TRIGGER
-            .iter()
-            .map(|(src, trigs)| {
-                let mut ts: Vec<u8> = trigs.iter().map(|t| trig_num(*t)).collect();
-                ts.sort_unstable();
-                (format!("{src:?}"), ts)
+            .map(|(n, t)| {
+                let mut t = t.to_vec();
+                t.sort_unstable();
+                (n.to_string(), t)
             })
             .collect();
-        hand.sort();
+        got.sort();
+        assert_eq!(got, want, "G4_CROSSBAR_TO_ADC_TRIGGER drifted from RM-verified golden");
+    }
 
-        assert_eq!(
-            generated, hand,
-            "cubedb+RM-fixup crossbar->ADC must match (corrected) CROSSBAR_TO_ADC_TRIGGER"
-        );
+    /// The typed crossbar view round-trips through the Debug-name inverse used to
+    /// build it — guards `crossbar_from_name` against enum/Debug drift.
+    #[test]
+    fn crossbar_name_roundtrips() {
+        for (src, _) in CROSSBAR_TO_ADC_TRIGGER.iter() {
+            assert_eq!(
+                crossbar_from_name(&format!("{src:?}")),
+                Some(*src),
+                "crossbar_from_name failed to round-trip {src:?}"
+            );
+        }
     }
 }

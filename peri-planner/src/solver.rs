@@ -289,7 +289,8 @@ pub struct AdcSamplingPlan {
 
 pub fn enumerate_adc_sampling_plans() -> Vec<AdcSamplingPlan> {
     let mut plans = Vec::new();
-    for &(event, triggers) in CROSSBAR_TO_ADC_TRIGGER {
+    for (event, triggers) in CROSSBAR_TO_ADC_TRIGGER.iter() {
+        let event = *event;
         for &trigger in triggers {
             let channels = adc_channels_for(trigger);
             for &pair in &[AdcPair::Adc12, AdcPair::Adc34] {

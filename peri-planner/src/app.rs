@@ -674,7 +674,8 @@ impl eframe::App for PeriPlannerApp {
                                                 },
                                             ));
                                         }
-                                        for &(ev, _) in crate::g474::CROSSBAR_TO_ADC_TRIGGER {
+                                        for (ev, _) in crate::g474::CROSSBAR_TO_ADC_TRIGGER.iter() {
+                                            let ev = *ev;
                                             let selected = matches!(
                                                 trigger,
                                                 TriggerSource::Event(e) if e == ev
