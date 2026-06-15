@@ -102,6 +102,45 @@ impl ConverterLeg {
     }
 }
 
+/// CompId -> instance number (CompId carries no `number()` helper).
+fn comp_num(c: CompId) -> u8 {
+    match c {
+        CompId::Comp1 => 1, CompId::Comp2 => 2, CompId::Comp3 => 3, CompId::Comp4 => 4,
+        CompId::Comp5 => 5, CompId::Comp6 => 6, CompId::Comp7 => 7,
+    }
+}
+
+/// DacId -> (instance, channel). `DacId` packs both into one variant.
+fn dac_inst_ch(d: DacId) -> (u8, u8) {
+    match d {
+        DacId::Dac1Ch1 => (1, 1), DacId::Dac1Ch2 => (1, 2),
+        DacId::Dac2Ch1 => (2, 1),
+        DacId::Dac3Ch1 => (3, 1), DacId::Dac3Ch2 => (3, 2),
+        DacId::Dac4Ch1 => (4, 1), DacId::Dac4Ch2 => (4, 2),
+    }
+}
+
+/// A reason a converter plan is not realizable on the chip. Validation is
+/// resource-level (no pin placement yet); pin conflicts come from the generic
+/// engine in the view layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Problem {
+    /// The chosen comparator cannot drive that timer's break input on this chip
+    /// (wrong comparator, a non-advanced timer, or a non-existent break input).
+    OcpUnroutable { leg: usize, comp: CompId, tim: TimId, break_input: BreakInput },
+    /// The chosen DAC channel cannot set that comparator's inverting-input
+    /// threshold on this chip.
+    ThresholdUnroutable { leg: usize, dac: DacId, comp: CompId },
+    /// Two legs claim the same timer instance.
+    TimerConflict { legs: (usize, usize), tim: TimId },
+    /// Two legs route their OCP through the same comparator.
+    CompConflict { legs: (usize, usize), comp: CompId },
+    /// Two legs use the same DAC channel as a threshold.
+    DacConflict { legs: (usize, usize), dac: DacId },
+    /// Two legs sense on the same ADC input channel.
+    AdcConflict { legs: (usize, usize), adc: AdcInstance, channel: u8 },
+}
+
 pub const C531_DESIGN_FORMAT_VERSION: u32 = 1;
 
 /// The C531 converter plan: an ordered list of timer-PWM legs.
@@ -124,6 +163,75 @@ impl C531Design {
         if index < self.legs.len() {
             self.legs.remove(index);
         }
+    }
+
+    /// Every reason this plan is not realizable on `package`: per-leg fabric
+    /// routability (can the comparator reach that break input? can the DAC reach
+    /// that comparator?) plus cross-leg resource conflicts (shared timer, comp,
+    /// DAC channel, or ADC input). Empty == realizable at the resource level.
+    pub fn validate(&self, package: Package) -> Vec<Problem> {
+        let descriptor = package.descriptor();
+        let fabric = descriptor.fabric;
+        let mut problems = Vec::new();
+
+        // Per-leg: the internal COMP->break and DAC->COMP routes must exist in
+        // the chip fabric. Without a modeled fabric we can't check, so skip.
+        for (i, leg) in self.legs.iter().enumerate() {
+            let Some(ocp) = &leg.ocp else { continue };
+            let Some(fab) = fabric else { continue };
+
+            if !fab
+                .comps_for_tim_break(leg.tim.number(), ocp.break_input)
+                .contains(&comp_num(ocp.comp))
+            {
+                problems.push(Problem::OcpUnroutable {
+                    leg: i, comp: ocp.comp, tim: leg.tim, break_input: ocp.break_input,
+                });
+            }
+
+            if let Some(dac) = ocp.threshold_dac {
+                if !fab
+                    .dac_threshold_sources_for_comp(comp_num(ocp.comp))
+                    .contains(&dac_inst_ch(dac))
+                {
+                    problems.push(Problem::ThresholdUnroutable { leg: i, dac, comp: ocp.comp });
+                }
+            }
+        }
+
+        // Cross-leg: each exclusive resource may be claimed by only one leg.
+        for a in 0..self.legs.len() {
+            for b in (a + 1)..self.legs.len() {
+                let (la, lb) = (&self.legs[a], &self.legs[b]);
+                if la.tim == lb.tim {
+                    problems.push(Problem::TimerConflict { legs: (a, b), tim: la.tim });
+                }
+                if let (Some(oa), Some(ob)) = (&la.ocp, &lb.ocp) {
+                    if oa.comp == ob.comp {
+                        problems.push(Problem::CompConflict { legs: (a, b), comp: oa.comp });
+                    }
+                    if let (Some(da), Some(db)) = (oa.threshold_dac, ob.threshold_dac) {
+                        if da == db {
+                            problems.push(Problem::DacConflict { legs: (a, b), dac: da });
+                        }
+                    }
+                }
+                if let (Some(sa), Some(sb)) = (la.adc_sense, lb.adc_sense) {
+                    if sa == sb {
+                        problems.push(Problem::AdcConflict {
+                            legs: (a, b), adc: sa.0, channel: sa.1,
+                        });
+                    }
+                }
+            }
+        }
+
+        problems
+    }
+
+    /// Whether the plan is realizable on `package` at the resource level.
+    pub fn is_valid(&self, package: Package) -> bool {
+        self.validate(package).is_empty()
     }
 }
 
@@ -194,5 +302,79 @@ mod tests {
         d.remove_leg(0);
         assert_eq!(d.legs.len(), 1);
         assert_eq!(d.legs[0].tim, TimId::Tim8);
+    }
+
+    /// Helper: a leg with an OCP route and ADC sense.
+    fn ocp_leg(
+        tim: TimId, comp: CompId, brk: BreakInput, dac: Option<DacId>, adc: (AdcInstance, u8),
+    ) -> ConverterLeg {
+        ConverterLeg {
+            tim, channels_mask: 0b0001, complementary: true, dead_time: true, bkin: false,
+            ocp: Some(Ocp { comp, break_input: brk, threshold_dac: dac }),
+            adc_sense: Some(adc),
+        }
+    }
+
+    /// Two well-formed legs that respect the RM0522 routing — TIM1/COMP1/BRK
+    /// with dac1_ch1, TIM8/COMP2/BRK2 with dac1_ch2, distinct ADC channels —
+    /// have no problems.
+    #[test]
+    fn valid_two_leg_design_has_no_problems() {
+        let mut d = C531Design::new();
+        d.add_leg(ocp_leg(TimId::Tim1, CompId::Comp1, 1, Some(DacId::Dac1Ch1), (AdcInstance::Adc1, 1)));
+        d.add_leg(ocp_leg(TimId::Tim8, CompId::Comp2, 2, Some(DacId::Dac1Ch2), (AdcInstance::Adc1, 2)));
+        assert!(d.is_valid(Package::C531R), "got {:?}", d.validate(Package::C531R));
+    }
+
+    /// Routability: COMP3 doesn't exist in the C531 break fabric (only COMP1/2),
+    /// and COMP1's threshold can only come from dac1_ch1 — dac1_ch2 is invalid.
+    #[test]
+    fn detects_unroutable_ocp_and_threshold() {
+        // COMP3 can't drive any C531 timer break.
+        let mut bad_comp = C531Design::new();
+        bad_comp.add_leg(ocp_leg(TimId::Tim1, CompId::Comp3, 1, None, (AdcInstance::Adc1, 1)));
+        assert_eq!(
+            bad_comp.validate(Package::C531R),
+            vec![Problem::OcpUnroutable {
+                leg: 0, comp: CompId::Comp3, tim: TimId::Tim1, break_input: 1,
+            }],
+        );
+
+        // A non-advanced timer (TIM2) has no comparator break path either.
+        let mut bad_tim = C531Design::new();
+        bad_tim.add_leg(ocp_leg(TimId::Tim2, CompId::Comp1, 1, None, (AdcInstance::Adc1, 1)));
+        assert_eq!(
+            bad_tim.validate(Package::C531R),
+            vec![Problem::OcpUnroutable {
+                leg: 0, comp: CompId::Comp1, tim: TimId::Tim2, break_input: 1,
+            }],
+        );
+
+        // COMP1 threshold from dac1_ch2 is not a valid route (Table 172).
+        let mut bad_dac = C531Design::new();
+        bad_dac.add_leg(ocp_leg(TimId::Tim1, CompId::Comp1, 1, Some(DacId::Dac1Ch2), (AdcInstance::Adc1, 1)));
+        assert_eq!(
+            bad_dac.validate(Package::C531R),
+            vec![Problem::ThresholdUnroutable {
+                leg: 0, dac: DacId::Dac1Ch2, comp: CompId::Comp1,
+            }],
+        );
+    }
+
+    /// Cross-leg conflicts: same timer, same comparator, same DAC, same ADC.
+    #[test]
+    fn detects_cross_leg_resource_conflicts() {
+        let mut d = C531Design::new();
+        // Both on TIM1, both COMP1/dac1_ch1, both sensing ADC1 ch1 — every
+        // exclusive resource collides.
+        d.add_leg(ocp_leg(TimId::Tim1, CompId::Comp1, 1, Some(DacId::Dac1Ch1), (AdcInstance::Adc1, 1)));
+        d.add_leg(ocp_leg(TimId::Tim1, CompId::Comp1, 1, Some(DacId::Dac1Ch1), (AdcInstance::Adc1, 1)));
+        let problems = d.validate(Package::C531R);
+        assert!(problems.contains(&Problem::TimerConflict { legs: (0, 1), tim: TimId::Tim1 }));
+        assert!(problems.contains(&Problem::CompConflict { legs: (0, 1), comp: CompId::Comp1 }));
+        assert!(problems.contains(&Problem::DacConflict { legs: (0, 1), dac: DacId::Dac1Ch1 }));
+        assert!(problems.contains(&Problem::AdcConflict {
+            legs: (0, 1), adc: AdcInstance::Adc1, channel: 1,
+        }));
     }
 }
