@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 
 use eframe::egui;
 
+use crate::c531_design::{C531Design, ConverterLeg};
+use crate::c531_view::ConverterAction;
 use crate::fabric_view::{self, Selection};
 use crate::g474::*;
 use crate::h523_design::H523Design;
@@ -26,6 +28,7 @@ enum ViewMode {
     Inventory,
     AfTable,
     Catalog,
+    Converter,
 }
 
 pub struct PeriPlannerApp {
@@ -34,6 +37,9 @@ pub struct PeriPlannerApp {
     /// because `Design` is HRTIM/COMP/OPAMP-shaped and would be all-empty
     /// fields here. Future H523 features extend this struct.
     h523_design: H523Design,
+    /// C531 timer-PWM converter plan. Like `h523_design`, kept separate from
+    /// the HRTIM-shaped G474 `Design` (C531 has no HRTIM).
+    c531_design: C531Design,
     mcu: Mcu,
     package: Package,
     variant: ChipVariant,
@@ -57,6 +63,7 @@ impl Default for PeriPlannerApp {
         Self {
             design: Design::default(),
             h523_design: H523Design::new(),
+            c531_design: C531Design::new(),
             mcu: Mcu::G474,
             package: Package::G474R,
             variant: ChipVariant::G474R,
@@ -96,6 +103,9 @@ impl PeriPlannerApp {
             }
             if let Some(d) = eframe::get_value::<H523Design>(storage, "peri_planner_h523_design_v1") {
                 slf.h523_design = d;
+            }
+            if let Some(d) = eframe::get_value::<C531Design>(storage, "peri_planner_c531_design_v1") {
+                slf.c531_design = d;
             }
             if let Some(p) = eframe::get_value::<Package>(storage, "peri_planner_package_v1") {
                 slf.package = p;
@@ -170,7 +180,15 @@ impl PeriPlannerApp {
                         self.variant = v;
                         self.mutate(|d| d.set_variant(v));
                     }
-                    if m != Mcu::G474
+                    if m == Mcu::C531 {
+                        // C531 has a real planner — land on it, not the inventory.
+                        if !matches!(
+                            self.view,
+                            ViewMode::Inventory | ViewMode::AfTable | ViewMode::Converter
+                        ) {
+                            self.view = ViewMode::Converter;
+                        }
+                    } else if m != Mcu::G474
                         && !matches!(self.view, ViewMode::Inventory | ViewMode::AfTable)
                     {
                         self.view = ViewMode::Inventory;
@@ -211,6 +229,9 @@ impl PeriPlannerApp {
                     ui.selectable_value(&mut self.view, ViewMode::Timers, "Timers");
                     ui.selectable_value(&mut self.view, ViewMode::Waveforms, "Waveforms");
                     ui.selectable_value(&mut self.view, ViewMode::Package, "Package");
+                }
+                if self.mcu == Mcu::C531 {
+                    ui.selectable_value(&mut self.view, ViewMode::Converter, "Converter");
                 }
                 ui.selectable_value(&mut self.view, ViewMode::Inventory, "Inventory");
                 ui.selectable_value(&mut self.view, ViewMode::AfTable, "Pin / AF");
@@ -257,6 +278,34 @@ impl PeriPlannerApp {
             None => {}
         }
     }
+
+    /// Apply an edit from the C531 Converter view to `c531_design`. Kept
+    /// outside the `Design` undo stack (like `h523_design`) — the converter
+    /// plan is a separate model.
+    fn apply_converter_action(&mut self, action: Option<ConverterAction>) {
+        let Some(action) = action else { return };
+        match action {
+            ConverterAction::AddLeg => {
+                // Default a new leg to the first advanced-control timer on the
+                // chip (TIM1 on C531) so OCP routing is available out of the box.
+                let default_tim = self
+                    .package
+                    .descriptor()
+                    .timers
+                    .iter()
+                    .filter(|t| t.kind == crate::mcu::TimerKind::Advanced)
+                    .find_map(|t| TimId::ALL.iter().copied().find(|id| id.number() == t.number))
+                    .unwrap_or(TimId::Tim1);
+                self.c531_design.add_leg(ConverterLeg::pwm(default_tim));
+            }
+            ConverterAction::RemoveLeg(i) => self.c531_design.remove_leg(i),
+            ConverterAction::SetLeg(i, leg) => {
+                if let Some(slot) = self.c531_design.legs.get_mut(i) {
+                    *slot = leg;
+                }
+            }
+        }
+    }
 }
 
 impl eframe::App for PeriPlannerApp {
@@ -267,6 +316,7 @@ impl eframe::App for PeriPlannerApp {
         eframe::set_value(storage, "peri_planner_mcu_v1", &self.mcu);
         eframe::set_value(storage, "peri_planner_package_v1", &self.package);
         eframe::set_value(storage, "peri_planner_h523_design_v1", &self.h523_design);
+        eframe::set_value(storage, "peri_planner_c531_design_v1", &self.c531_design);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -295,11 +345,14 @@ impl eframe::App for PeriPlannerApp {
         if self.mcu != Mcu::G474 {
             self.render_top_bar(ctx, can_undo, can_redo);
             let descriptor = self.package.descriptor();
+            let package = self.package;
             let view = self.view;
             let af_filter = &mut self.af_filter;
             let h523 = &mut self.h523_design;
+            let c531 = &self.c531_design;
             let catalog_query = &mut self.catalog_query;
             let mut jump = None;
+            let mut conv_action: Option<ConverterAction> = None;
             egui::CentralPanel::default().show(ctx, |ui| {
                 match view {
                     ViewMode::AfTable => {
@@ -308,10 +361,14 @@ impl eframe::App for PeriPlannerApp {
                     ViewMode::Catalog => {
                         jump = crate::catalog_view::show(ui, catalog_query);
                     }
+                    ViewMode::Converter if package.mcu() == Mcu::C531 => {
+                        conv_action = crate::c531_view::show(ui, c531, package);
+                    }
                     _ => crate::inventory_view::show(ui, descriptor),
                 }
             });
             self.pending_select = jump;
+            self.apply_converter_action(conv_action);
             return;
         }
 
@@ -1030,6 +1087,8 @@ impl eframe::App for PeriPlannerApp {
                     // map on `Design`. Pass None.
                     crate::af_view::show(ui, self.package.descriptor().raw, &mut self.af_filter, None);
                 }
+                // C531-only view; never selectable while the G474 planner is active.
+                ViewMode::Converter => {}
             }
         });
     }

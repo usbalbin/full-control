@@ -1,6 +1,7 @@
 pub mod af_view;
 pub mod app;
 pub mod c531_design;
+pub mod c531_view;
 pub mod catalog;
 pub mod catalog_view;
 pub mod comms_view;

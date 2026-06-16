@@ -103,21 +103,44 @@ impl ConverterLeg {
 }
 
 /// CompId -> instance number (CompId carries no `number()` helper).
-fn comp_num(c: CompId) -> u8 {
+pub fn comp_num(c: CompId) -> u8 {
     match c {
         CompId::Comp1 => 1, CompId::Comp2 => 2, CompId::Comp3 => 3, CompId::Comp4 => 4,
         CompId::Comp5 => 5, CompId::Comp6 => 6, CompId::Comp7 => 7,
     }
 }
 
+/// Instance number -> CompId. Inverse of `comp_num`; the view uses it to turn
+/// fabric query results (`comps_for_tim_break` yields raw `u8`s) back into the
+/// typed ids the model stores.
+pub fn comp_from_num(n: u8) -> Option<CompId> {
+    Some(match n {
+        1 => CompId::Comp1, 2 => CompId::Comp2, 3 => CompId::Comp3, 4 => CompId::Comp4,
+        5 => CompId::Comp5, 6 => CompId::Comp6, 7 => CompId::Comp7,
+        _ => return None,
+    })
+}
+
 /// DacId -> (instance, channel). `DacId` packs both into one variant.
-fn dac_inst_ch(d: DacId) -> (u8, u8) {
+pub fn dac_inst_ch(d: DacId) -> (u8, u8) {
     match d {
         DacId::Dac1Ch1 => (1, 1), DacId::Dac1Ch2 => (1, 2),
         DacId::Dac2Ch1 => (2, 1),
         DacId::Dac3Ch1 => (3, 1), DacId::Dac3Ch2 => (3, 2),
         DacId::Dac4Ch1 => (4, 1), DacId::Dac4Ch2 => (4, 2),
     }
+}
+
+/// (instance, channel) -> DacId. Inverse of `dac_inst_ch`; turns the fabric's
+/// `dac_threshold_sources_for_comp` pairs back into typed ids for the model.
+pub fn dac_from_inst_ch(inst: u8, ch: u8) -> Option<DacId> {
+    Some(match (inst, ch) {
+        (1, 1) => DacId::Dac1Ch1, (1, 2) => DacId::Dac1Ch2,
+        (2, 1) => DacId::Dac2Ch1,
+        (3, 1) => DacId::Dac3Ch1, (3, 2) => DacId::Dac3Ch2,
+        (4, 1) => DacId::Dac4Ch1, (4, 2) => DacId::Dac4Ch2,
+        _ => return None,
+    })
 }
 
 /// A reason a converter plan is not realizable on the chip. Validation is
