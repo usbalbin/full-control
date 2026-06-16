@@ -442,7 +442,7 @@ fn build_inventory(mcu: Mcu, package: Package, raw: &'static RawMcuData) -> McuD
             d.opamps.push(OpampInstance { number: n });
         } else if name == "HRTIM" || name == "HRTIM1" {
             // Presence detected; structural data carried in HrtimFabric.
-        } else if let Some(t) = classify_timer(name) {
+        } else if let Some(t) = classify_timer(name, p.block) {
             d.timers.push(t);
         } else if let Some(n) = strip_prefix_num(name, "SPI") {
             d.comms.spi.push(n);
@@ -491,7 +491,16 @@ fn strip_prefix_num(name: &str, prefix: &str) -> Option<u8> {
     rest.parse::<u8>().ok()
 }
 
-fn classify_timer(name: &str) -> Option<TimerInstance> {
+/// Classify a timer instance from its metapac register-block id (`block`) —
+/// the normalized, family-agnostic peripheral-variant signal. Replaces the old
+/// hard-coded per-number table: kind / channel count / complementary outputs /
+/// counter width all follow directly from the block. LPTIM carries no kind
+/// variation and is keyed by name.
+///
+/// Returns `None` for a non-timer name or an unknown/absent block. A missing
+/// classification would silently drop the timer from the inventory, so
+/// `every_timer_classifies` asserts full coverage across all supported chips.
+fn classify_timer(name: &str, block: Option<&str>) -> Option<TimerInstance> {
     if let Some(n) = strip_prefix_num(name, "LPTIM") {
         return Some(TimerInstance {
             number: n, kind: TimerKind::LowPower,
@@ -499,14 +508,18 @@ fn classify_timer(name: &str) -> Option<TimerInstance> {
         });
     }
     let n = strip_prefix_num(name, "TIM")?;
-    let (kind, channels, comp, width) = match n {
-        1 | 8 | 20 => (TimerKind::Advanced,  4, true,  16),
-        2 | 5      => (TimerKind::General32, 4, false, 32),
-        3 | 4      => (TimerKind::General16, 4, false, 16),
-        12         => (TimerKind::General16, 2, false, 16),
-        15         => (TimerKind::General16, 2, true,  16),
-        16 | 17    => (TimerKind::General16, 1, true,  16),
-        6 | 7      => (TimerKind::Basic,     0, false, 16),
+    // (kind, channels, complementary, counter width) straight from the block.
+    // Only TIM_GP32 is 32-bit; TIM_ADV and the *_CMP variants drive
+    // complementary outputs.
+    let (kind, channels, comp, width) = match block? {
+        "TIM_ADV"     => (TimerKind::Advanced,  4, true,  16),
+        "TIM_GP32"    => (TimerKind::General32, 4, false, 32),
+        "TIM_GP16"    => (TimerKind::General16, 4, false, 16),
+        "TIM_2CH"     => (TimerKind::General16, 2, false, 16),
+        "TIM_2CH_CMP" => (TimerKind::General16, 2, true,  16),
+        "TIM_1CH"     => (TimerKind::General16, 1, false, 16),
+        "TIM_1CH_CMP" => (TimerKind::General16, 1, true,  16),
+        "TIM_BASIC"   => (TimerKind::Basic,     0, false, 16),
         _ => return None,
     };
     Some(TimerInstance { number: n, kind, channels, has_complementary: comp, width_bits: width })
@@ -515,6 +528,28 @@ fn classify_timer(name: &str) -> Option<TimerInstance> {
 #[cfg(test)]
 mod fabric_validation {
     use super::*;
+
+    /// Every timer peripheral metapac reports — for every supported package —
+    /// must classify from its register block. A `None` here means a block id
+    /// the data-driven `classify_timer` doesn't map yet, which would silently
+    /// drop the timer from the inventory. Guards the de-hardcoded path.
+    #[test]
+    fn every_timer_classifies() {
+        for &pkg in Package::ALL {
+            let raw = pkg.raw();
+            for p in raw.peripherals {
+                let is_timer = strip_prefix_num(p.name, "LPTIM").is_some()
+                    || strip_prefix_num(p.name, "TIM").is_some();
+                if is_timer {
+                    assert!(
+                        classify_timer(p.name, p.block).is_some(),
+                        "{}: timer {:?} (block {:?}) failed to classify",
+                        raw.name, p.name, p.block,
+                    );
+                }
+            }
+        }
+    }
 
     /// Golden snapshot of the RM0440-verified DAC->COMP routing. `fabric_data`
     /// is now the source (the descriptor's `edges` are derived from it), so this
