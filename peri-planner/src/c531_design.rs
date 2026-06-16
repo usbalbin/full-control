@@ -338,14 +338,15 @@ mod tests {
         }
     }
 
-    /// Two well-formed legs that respect the RM0522 routing — TIM1/COMP1/BRK
-    /// with dac1_ch1, TIM8/COMP2/BRK2 with dac1_ch2, distinct ADC channels —
+    /// Two well-formed legs that respect the C531 fabric — TIM1/COMP1/BRK with a
+    /// DAC1 threshold, TIM8/COMP2/BRK2 with NO DAC threshold (COMP2 has no
+    /// internal DAC on C531 — only DAC1->COMP1 exists), distinct ADC channels —
     /// have no problems.
     #[test]
     fn valid_two_leg_design_has_no_problems() {
         let mut d = C531Design::new();
         d.add_leg(ocp_leg(TimId::Tim1, CompId::Comp1, 1, Some(DacId::Dac1Ch1), (AdcInstance::Adc1, 1)));
-        d.add_leg(ocp_leg(TimId::Tim8, CompId::Comp2, 2, Some(DacId::Dac1Ch2), (AdcInstance::Adc1, 2)));
+        d.add_leg(ocp_leg(TimId::Tim8, CompId::Comp2, 2, None, (AdcInstance::Adc1, 2)));
         assert!(d.is_valid(Package::C531R), "got {:?}", d.validate(Package::C531R));
     }
 

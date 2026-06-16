@@ -591,15 +591,16 @@ mod c5_support {
         assert!(d.hrtim.is_none(), "C5 has no HRTIM");
     }
 
-    /// Golden snapshot of the RM0522-verified C531 analog fabric. The C5 tables
-    /// are hand-transcribed (no CubeMX/metapac source for them), so these
-    /// expectations — authored independently of `fabric_data_c5` and
-    /// cross-checked by a separate RM0522 re-read — guard against an edit
-    /// silently changing the hardware over-current routing.
+    /// Golden snapshot of the C531 analog fabric, cross-checked against ST's
+    /// CubeMX2 die descriptor (D44F_peripherals.json) intersected with C531's
+    /// actual peripheral set. Guards against an edit silently changing the
+    /// hardware over-current routing. NB: the die lists `COMP2 <- DAC2`, but
+    /// DAC2 is absent on C531, so COMP2 has no internal DAC threshold here.
     #[test]
     fn c531_fabric_golden() {
-        // DAC channel -> COMP inverting input (RM0522 Table 172, INMSEL=0b0100).
-        let dac_to_comp: &[(u8, u8, u8)] = &[(1, 1, 1), (1, 2, 2)];
+        // DAC -> COMP inverting input: only DAC1 -> COMP1 on C531 (DAC2, the
+        // die-level source for COMP2, is not populated on this part).
+        let dac_to_comp: &[(u8, u8, u8)] = &[(1, 1, 1)];
         let mut got = crate::fabric_data_c5::C5_DAC_TO_COMP.to_vec();
         got.sort_unstable();
         let mut want = dac_to_comp.to_vec();
@@ -652,9 +653,13 @@ mod c5_support {
         assert!(fab.comps_for_tim_break(2, 1).is_empty(), "TIM2 has no break");
         assert!(fab.comps_for_tim_break(1, 3).is_empty(), "no 3rd break input");
 
-        // DAC threshold sources: COMP1 <- dac1_ch1, COMP2 <- dac1_ch2.
+        // DAC threshold sources: COMP1 <- DAC1. COMP2 has none on C531 (its
+        // die-level DAC source DAC2 is not populated on this part).
         assert_eq!(fab.dac_threshold_sources_for_comp(1), vec![(1, 1)], "COMP1");
-        assert_eq!(fab.dac_threshold_sources_for_comp(2), vec![(1, 2)], "COMP2");
+        assert!(
+            fab.dac_threshold_sources_for_comp(2).is_empty(),
+            "COMP2 has no internal DAC on C531 (DAC2 absent)"
+        );
         assert!(fab.dac_threshold_sources_for_comp(3).is_empty(), "no COMP3");
 
         // G4 routes OCP through HRTIM EEV, not timer breaks — the timer-break
