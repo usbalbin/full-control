@@ -30,7 +30,14 @@ fn main() {
          // Source: stm32-metapac chip {} ({} family).\n\n",
         m.name, m.family,
     ));
-    out.push_str("use crate::mcu_raw::{RawMcuData, RawPeripheral, RawPin};\n\n");
+    // Only import RawTrigger when the chip actually has triggers, so
+    // trigger-less families (e.g. C5 today) don't emit an unused-import warning.
+    let has_triggers = m.peripherals.iter().any(|p| !p.triggers.is_empty());
+    if has_triggers {
+        out.push_str("use crate::mcu_raw::{RawMcuData, RawPeripheral, RawPin, RawTrigger};\n\n");
+    } else {
+        out.push_str("use crate::mcu_raw::{RawMcuData, RawPeripheral, RawPin};\n\n");
+    }
 
     out.push_str("pub static RAW: RawMcuData = RawMcuData {\n");
     out.push_str(&format!("    name: {:?},\n", m.name));
@@ -39,11 +46,16 @@ fn main() {
 
     let mut peripheral_count = 0;
     let mut pin_count = 0;
+    let mut trigger_count = 0;
     for p in m.peripherals {
         peripheral_count += 1;
+        let block = match &p.registers {
+            Some(r) => format!("Some({:?})", r.block),
+            None => "None".to_string(),
+        };
         out.push_str(&format!(
-            "        RawPeripheral {{ name: {:?}, address: 0x{:08x}, pins: &[\n",
-            p.name, p.address,
+            "        RawPeripheral {{ name: {:?}, address: 0x{:08x}, block: {}, pins: &[\n",
+            p.name, p.address, block,
         ));
         for pin in p.pins {
             pin_count += 1;
@@ -56,6 +68,14 @@ fn main() {
                 pin.pin, pin.signal, af,
             ));
         }
+        out.push_str("        ], triggers: &[\n");
+        for t in p.triggers {
+            trigger_count += 1;
+            out.push_str(&format!(
+                "            RawTrigger {{ signal: {:?}, source: {:?} }},\n",
+                t.signal, t.source,
+            ));
+        }
         out.push_str("        ] },\n");
     }
     out.push_str("    ],\n");
@@ -66,7 +86,7 @@ fn main() {
     }
     fs::write(&path, out).expect("failed to write output file");
     println!(
-        "wrote {} ({} peripherals, {} pin entries)",
-        path, peripheral_count, pin_count,
+        "wrote {} ({} peripherals, {} pin entries, {} triggers)",
+        path, peripheral_count, pin_count, trigger_count,
     );
 }
