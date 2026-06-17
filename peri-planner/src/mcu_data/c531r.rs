@@ -25,9 +25,11 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC4", signal: "IN2", af: None },
             RawPin { pin: "PC5", signal: "IN5", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "ADC12_COMMON", address: 0x42028300, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "COMP1", address: 0x4000400c, block: None, pins: &[
             RawPin { pin: "PA0", signal: "INP1", af: None },
@@ -41,9 +43,11 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC4", signal: "INM1", af: None },
             RawPin { pin: "PC5", signal: "OUT", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "COMP12", address: 0x40004000, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "COMP2", address: 0x40004010, block: None, pins: &[
             RawPin { pin: "PA12", signal: "OUT", af: None },
@@ -56,51 +60,66 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC1", signal: "INM1", af: None },
             RawPin { pin: "PC5", signal: "INM2", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "CORDIC", address: 0x40023800, block: Some("CORDIC"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "CRC", address: 0x40023000, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "CRS", address: 0x40006000, block: None, pins: &[
             RawPin { pin: "PB3(JTDO/TRACESWO)", signal: "SYNC", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "DAC1", address: 0x42028400, block: None, pins: &[
             RawPin { pin: "PA4", signal: "OUT1", af: None },
             RawPin { pin: "PA5", signal: "OUT2", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "DBGMCU", address: 0x44024000, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "EXTI", address: 0x44022000, block: Some("EXTI"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "FLASH", address: 0x40022000, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "GPIOA", address: 0x42020000, block: Some("GPIO"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "GPIOB", address: 0x42020400, block: Some("GPIO"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "GPIOC", address: 0x42020800, block: Some("GPIO"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "GPIOD", address: 0x42020c00, block: Some("GPIO"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "GPIOE", address: 0x42021000, block: Some("GPIO"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "GPIOH", address: 0x42021c00, block: Some("GPIO"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "HASH", address: 0x420c0400, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "I2C1", address: 0x40005400, block: None, pins: &[
             RawPin { pin: "PA11", signal: "SCL", af: None },
@@ -123,6 +142,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PH0-OSC_IN(PH0)", signal: "SDA", af: None },
             RawPin { pin: "PH1-OSC_OUT(PH1)", signal: "SCL", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "I3C1", address: 0x40005c00, block: None, pins: &[
             RawPin { pin: "PA8", signal: "SDA", af: None },
@@ -137,18 +157,23 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC10", signal: "SCL", af: None },
             RawPin { pin: "PC11", signal: "SDA", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "ICACHE", address: 0x40030400, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "IWDG", address: 0x40003000, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "LPDMA1", address: 0x40020000, block: Some("LPDMA"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "LPDMA2", address: 0x40021000, block: Some("LPDMA"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "LPTIM1", address: 0x44004400, block: None, pins: &[
             RawPin { pin: "PA1", signal: "IN1", af: None },
@@ -161,6 +186,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PE2", signal: "IN2", af: None },
             RawPin { pin: "PH2-BOOT0", signal: "IN2", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "LPUART1", address: 0x44002400, block: None, pins: &[
             RawPin { pin: "PA10", signal: "RX", af: None },
@@ -179,6 +205,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PB7", signal: "RX", af: None },
             RawPin { pin: "PC3", signal: "TX", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "OPAMP1", address: 0x40003400, block: None, pins: &[
             RawPin { pin: "PA1", signal: "VINP0", af: None },
@@ -188,6 +215,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PB1", signal: "VINM1", af: None },
             RawPin { pin: "PB15", signal: "VINP2", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "PWR", address: 0x44020800, block: None, pins: &[
             RawPin { pin: "PA0", signal: "WKUP1", af: None },
@@ -198,12 +226,15 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC2", signal: "CSLEEP", af: None },
             RawPin { pin: "PC3", signal: "CSTOP", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "RAMCFG_SRAM1", address: 0x40026000, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "RAMCFG_SRAM2", address: 0x40026040, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "RCC", address: 0x44020c00, block: Some("RCC"), pins: &[
             RawPin { pin: "PA8", signal: "MCO1", af: None },
@@ -217,9 +248,11 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PH1-OSC_OUT(PH1)", signal: "OSC_OUT", af: None },
             RawPin { pin: "PH2-BOOT0", signal: "MCO1", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "RNG", address: 0x420c0800, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "RTC", address: 0x44007800, block: None, pins: &[
             RawPin { pin: "PB15", signal: "REFIN", af: None },
@@ -227,6 +260,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC13", signal: "OUT1", af: None },
             RawPin { pin: "PC13", signal: "TS", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "SPI1", address: 0x40013000, block: None, pins: &[
             RawPin { pin: "PA0", signal: "RDY", af: None },
@@ -265,6 +299,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC4", signal: "I2S_MCK", af: None },
             RawPin { pin: "PC7", signal: "I2S_MCK", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "SPI2", address: 0x40003800, block: None, pins: &[
             RawPin { pin: "PA0", signal: "I2S_WS", af: None },
@@ -325,9 +360,11 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC3", signal: "MOSI", af: None },
             RawPin { pin: "PC6", signal: "I2S_MCK", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "SYSCFG", address: 0x44000400, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "TAMP", address: 0x44007c00, block: None, pins: &[
             RawPin { pin: "PA0", signal: "IN2", af: None },
@@ -336,6 +373,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC1", signal: "IN2", af: None },
             RawPin { pin: "PC13", signal: "IN1", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "TIM1", address: 0x40012c00, block: Some("TIM_ADV"), pins: &[
             RawPin { pin: "PA10", signal: "CH3", af: None },
@@ -357,6 +395,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PB8", signal: "CH1", af: None },
             RawPin { pin: "PC5", signal: "CH4N", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "TIM12", address: 0x40001800, block: Some("TIM_2CH"), pins: &[
             RawPin { pin: "PB14", signal: "CH1", af: None },
@@ -366,6 +405,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC6", signal: "CH1", af: None },
             RawPin { pin: "PC9", signal: "CH2", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "TIM15", address: 0x40014000, block: Some("TIM_2CH_CMP"), pins: &[
             RawPin { pin: "PA0", signal: "BKIN", af: None },
@@ -379,6 +419,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC12", signal: "CH1", af: None },
             RawPin { pin: "PD2", signal: "BKIN", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "TIM2", address: 0x40000000, block: Some("TIM_GP32"), pins: &[
             RawPin { pin: "PA0", signal: "CH1", af: None },
@@ -395,12 +436,15 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PB3(JTDO/TRACESWO)", signal: "CH2", af: None },
             RawPin { pin: "PC4", signal: "CH4", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "TIM6", address: 0x40001000, block: Some("TIM_BASIC"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "TIM7", address: 0x40001400, block: Some("TIM_BASIC"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "TIM8", address: 0x40013400, block: Some("TIM_ADV"), pins: &[
             RawPin { pin: "PA0", signal: "ETR", af: None },
@@ -433,6 +477,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC8", signal: "CH3", af: None },
             RawPin { pin: "PC9", signal: "CH4", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "UART4", address: 0x40004c00, block: None, pins: &[
             RawPin { pin: "PA0", signal: "TX", af: None },
@@ -448,6 +493,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC10", signal: "TX", af: None },
             RawPin { pin: "PC11", signal: "RX", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "UART5", address: 0x40005000, block: None, pins: &[
             RawPin { pin: "PB12", signal: "RX", af: None },
@@ -462,9 +508,11 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC9", signal: "CTS", af: None },
             RawPin { pin: "PD2", signal: "RX", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "UID", address: 0x08fff800, block: Some("UID"), pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "USART1", address: 0x40013800, block: None, pins: &[
             RawPin { pin: "PA10", signal: "RX", af: None },
@@ -490,6 +538,7 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PB7", signal: "RTS", af: None },
             RawPin { pin: "PB7", signal: "RX", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "USART2", address: 0x40004400, block: None, pins: &[
             RawPin { pin: "PA0", signal: "CTS", af: None },
@@ -513,12 +562,17 @@ pub static RAW: RawMcuData = RawMcuData {
             RawPin { pin: "PC12", signal: "CK", af: None },
             RawPin { pin: "PC4", signal: "RX", af: None },
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "USBRAM", address: 0x40016400, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
         RawPeripheral { name: "WWDG", address: 0x40002c00, block: None, pins: &[
         ], triggers: &[
+        ], dma: &[
         ] },
+    ],
+    dma_pools: &[
     ],
 };

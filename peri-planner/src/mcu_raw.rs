@@ -7,6 +7,15 @@ pub struct RawMcuData {
     pub name: &'static str,
     pub family: &'static str,
     pub peripherals: &'static [RawPeripheral],
+    /// Physical DMA channel pools (supply side), one per controller. Channel
+    /// counts are deduplicated; the constraint-selector's DMA capacity bound.
+    pub dma_pools: &'static [DmaPoolDef],
+}
+
+/// One DMA controller and its channel count, e.g. `("DMA1", 8)` / `("LPDMA2", 4)`.
+pub struct DmaPoolDef {
+    pub name: &'static str,
+    pub channels: u8,
 }
 
 pub struct RawPeripheral {
@@ -25,6 +34,21 @@ pub struct RawPeripheral {
     /// C5 analog/break fabric lives in `fabric_data_c5` until upstream fills
     /// these in). Empty slice when absent.
     pub triggers: &'static [RawTrigger],
+    /// DMA legs (one per peripheral signal that can use DMA), each normalized to
+    /// the **set of controller pools** it may draw a channel from. The extractor
+    /// collapses both DMA models into this shape: DMAMUX families (the signal
+    /// names only a mux) fan out to every controller behind that mux; named-
+    /// controller families (C5/H5 GPDMA/LPDMA) list the controllers directly. So
+    /// the engine never branches per family. Empty when the peripheral has no DMA.
+    pub dma: &'static [RawDmaLeg],
+}
+
+/// A peripheral DMA request: the signal (e.g. "RX", "TX", "CH1") paired with the
+/// controller pools it may use. One leg consumes one channel from any one pool.
+#[derive(Copy, Clone)]
+pub struct RawDmaLeg {
+    pub signal: &'static str,
+    pub pools: &'static [&'static str],
 }
 
 /// One inter-peripheral trigger edge: `signal` (the consuming mux input, e.g.

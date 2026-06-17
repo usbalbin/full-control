@@ -30,14 +30,33 @@ fn main() {
          // Source: stm32-metapac chip {} ({} family).\n\n",
         m.name, m.family,
     ));
-    // Only import RawTrigger when the chip actually has triggers, so
-    // trigger-less families (e.g. C5 today) don't emit an unused-import warning.
-    let has_triggers = m.peripherals.iter().any(|p| !p.triggers.is_empty());
-    if has_triggers {
-        out.push_str("use crate::mcu_raw::{RawMcuData, RawPeripheral, RawPin, RawTrigger};\n\n");
-    } else {
-        out.push_str("use crate::mcu_raw::{RawMcuData, RawPeripheral, RawPin};\n\n");
+    // ----- DMA supply: controller -> channel count, and dmamux -> {controllers}.
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut pool_channels: BTreeMap<&str, u32> = BTreeMap::new();
+    let mut mux_to_ctrls: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for ch in m.dma_channels {
+        *pool_channels.entry(ch.dma).or_default() += 1;
+        if let Some(mux) = ch.dmamux {
+            mux_to_ctrls.entry(mux).or_default().insert(ch.dma);
+        }
     }
+
+    // Import only the types this chip actually uses, so empty families don't
+    // emit unused-import warnings.
+    let has_triggers = m.peripherals.iter().any(|p| !p.triggers.is_empty());
+    let has_dma_legs = m.peripherals.iter().any(|p| !p.dma_channels.is_empty());
+    let has_pools = !pool_channels.is_empty();
+    let mut imports = vec!["RawMcuData", "RawPeripheral", "RawPin"];
+    if has_triggers {
+        imports.push("RawTrigger");
+    }
+    if has_dma_legs {
+        imports.push("RawDmaLeg");
+    }
+    if has_pools {
+        imports.push("DmaPoolDef");
+    }
+    out.push_str(&format!("use crate::mcu_raw::{{{}}};\n\n", imports.join(", ")));
 
     out.push_str("pub static RAW: RawMcuData = RawMcuData {\n");
     out.push_str(&format!("    name: {:?},\n", m.name));
@@ -47,6 +66,7 @@ fn main() {
     let mut peripheral_count = 0;
     let mut pin_count = 0;
     let mut trigger_count = 0;
+    let mut dma_leg_count = 0;
     for p in m.peripherals {
         peripheral_count += 1;
         let block = match &p.registers {
@@ -76,7 +96,46 @@ fn main() {
                 t.signal, t.source,
             ));
         }
+        // DMA legs: normalize demand into signal -> set of allowed controller
+        // pools (collapsing the DMAMUX / named / fixed models). Skip a signal
+        // whose pools don't resolve — it carries no capacity info.
+        out.push_str("        ], dma: &[\n");
+        let mut by_signal: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for d in p.dma_channels {
+            let pools = by_signal.entry(d.signal).or_default();
+            if let Some(ctrl) = d.dma {
+                pools.insert(ctrl); // named-controller model (C5/H5 GPDMA/LPDMA)
+            } else if let Some(mux) = d.dmamux {
+                if let Some(ctrls) = mux_to_ctrls.get(mux) {
+                    pools.extend(ctrls.iter().copied()); // DMAMUX fan-out (G4)
+                }
+            } else if let Some(chan) = d.channel {
+                if let Some(ctrl) = chan.split('_').next() {
+                    pools.insert(ctrl); // fixed-channel model: "DMA1_CH5" -> "DMA1"
+                }
+            }
+        }
+        for (signal, pools) in &by_signal {
+            if pools.is_empty() {
+                continue;
+            }
+            dma_leg_count += 1;
+            let list: Vec<String> = pools.iter().map(|c| format!("{:?}", c)).collect();
+            out.push_str(&format!(
+                "            RawDmaLeg {{ signal: {:?}, pools: &[{}] }},\n",
+                signal,
+                list.join(", "),
+            ));
+        }
         out.push_str("        ] },\n");
+    }
+    out.push_str("    ],\n");
+    out.push_str("    dma_pools: &[\n");
+    for (name, count) in &pool_channels {
+        out.push_str(&format!(
+            "        DmaPoolDef {{ name: {:?}, channels: {} }},\n",
+            name, count,
+        ));
     }
     out.push_str("    ],\n");
     out.push_str("};\n");
@@ -86,7 +145,7 @@ fn main() {
     }
     fs::write(&path, out).expect("failed to write output file");
     println!(
-        "wrote {} ({} peripherals, {} pin entries, {} triggers)",
-        path, peripheral_count, pin_count, trigger_count,
+        "wrote {} ({} peripherals, {} pin entries, {} triggers, {} dma legs, {} pools)",
+        path, peripheral_count, pin_count, trigger_count, dma_leg_count, pool_channels.len(),
     );
 }

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 
 use crate::g474::PeripheralKind;
-use crate::mcu_raw::RawMcuData;
+use crate::mcu_raw::{DmaPoolDef, RawDmaLeg, RawMcuData};
 use crate::pinout::ChipVariant;
 
 // ---------- Mcu / Package ----------
@@ -354,6 +354,34 @@ pub struct McuDescriptor {
     pub raw: &'static RawMcuData,
 }
 
+impl McuDescriptor {
+    /// Physical DMA channel pools (supply): one entry per controller with its
+    /// channel count. The constraint-selector's DMA capacity source. Empty for
+    /// families whose DMA metadata the compiled metapac lacks (C5 today — its
+    /// catalog count comes from stm32-data directly; the descriptor populates on
+    /// a metapac refresh).
+    pub fn dma_pools(&self) -> &'static [DmaPoolDef] {
+        self.raw.dma_pools
+    }
+
+    /// Total physical DMA channels across all controllers.
+    pub fn dma_channel_total(&self) -> u16 {
+        self.raw.dma_pools.iter().map(|p| p.channels as u16).sum()
+    }
+
+    /// The DMA legs (signal → allowed controller pools) of a peripheral
+    /// instance, by metapac name (e.g. "USART1"). Empty if the peripheral has no
+    /// DMA or isn't present. A leg consumes one channel from any one of its pools.
+    pub fn dma_routes(&self, peripheral: &str) -> &'static [RawDmaLeg] {
+        self.raw
+            .peripherals
+            .iter()
+            .find(|p| p.name == peripheral)
+            .map(|p| p.dma)
+            .unwrap_or(&[])
+    }
+}
+
 // ---------- Per-MCU hand-encoded annotations ----------
 
 const G474_FAST_ADC: &[u8] = &[1, 2, 3, 4, 5];
@@ -555,6 +583,50 @@ fn classify_timer(name: &str, block: Option<&str>) -> Option<TimerInstance> {
 #[cfg(test)]
 mod fabric_validation {
     use super::*;
+
+    /// DMA supply pools and per-peripheral routes normalize both DMA models into
+    /// "leg → allowed controller pools": on G474 (DMAMUX) a signal fans out to
+    /// every controller behind the mux; on named-controller families the
+    /// controllers are listed directly. Every leg's pools must exist in supply.
+    #[test]
+    fn dma_pools_and_routes_normalize_across_models() {
+        // G474 (DMAMUX): two 8-channel controllers; a peripheral signal fans out
+        // to BOTH via the mux.
+        let g4 = Package::G474R.descriptor();
+        assert_eq!(g4.dma_channel_total(), 16, "G474 = DMA1(8) + DMA2(8)");
+        let pools: Vec<(&str, u8)> = g4.dma_pools().iter().map(|p| (p.name, p.channels)).collect();
+        assert!(
+            pools.contains(&("DMA1", 8)) && pools.contains(&("DMA2", 8)),
+            "got {pools:?}"
+        );
+        let usart = g4.dma_routes("USART1");
+        assert!(!usart.is_empty(), "G474 USART1 should carry DMA legs");
+        assert!(
+            usart.iter().any(|l| l.pools.contains(&"DMA1") && l.pools.contains(&"DMA2")),
+            "a G474 USART1 leg should fan out to both controllers via DMAMUX, got {:?}",
+            usart.iter().map(|l| (l.signal, l.pools)).collect::<Vec<_>>(),
+        );
+
+        // Soundness / name-drift guard across ALL chips: every demand pool a leg
+        // references must exist in that chip's supply pools. (C5 has empty DMA in
+        // the compiled metapac, so its loop is vacuous — a known data-currency gap.)
+        for &pkg in Package::ALL {
+            let d = pkg.descriptor();
+            let supply: std::collections::HashSet<&str> =
+                d.dma_pools().iter().map(|p| p.name).collect();
+            for p in d.raw.peripherals {
+                for leg in p.dma {
+                    for &pool in leg.pools {
+                        assert!(
+                            supply.contains(pool),
+                            "{}: {} leg {:?} references pool {:?} absent from supply {:?}",
+                            d.name, p.name, leg.signal, pool, supply,
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     /// The catalog-part → descriptor bridge resolves flash/temp/packaging
     /// variants of a supported package letter to that package, and refuses
