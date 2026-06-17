@@ -145,12 +145,14 @@ pub fn show(
         let verified = results.iter().filter(|(_, v)| *v == Some(Verdict::Verified)).count();
         let bounds = results.iter().filter(|(_, v)| *v == Some(Verdict::BoundsOnly)).count();
         ui.label(format!(
-            "{} parts pass Tier-1 — {} allocation-verified, {} bounds-only (unverified), \
-             rest infeasible. DMA demand: {} channels.",
+            "{} parts pass Tier-1 (>= {} DMA channels, >= {} GPIO pins) — {} allocation-verified \
+             (instances+pins+DMA solved), {} bounds-only (counts pass, not fully verified), \
+             rest infeasible.",
             results.len(),
+            select::total_channel_demand(&active),
+            select::pin_demand(&active),
             verified,
             bounds,
-            select::total_channel_demand(&active),
         ));
     }
 

@@ -62,12 +62,26 @@ fn entry_from(v: &Value) -> Option<CatalogEntry> {
     }
 
     // Union peripheral names across all cores (dual-core parts list them
-    // per core); instance counting is over the deduplicated set.
+    // per core); instance counting is over the deduplicated set. Also collect
+    // the distinct AF-capable GPIO pins (names like "PA0") for the pin-capacity
+    // bound.
     let mut names = BTreeSet::new();
+    let mut gpio = BTreeSet::new();
     for core in v["cores"].as_array().into_iter().flatten() {
         for p in core["peripherals"].as_array().into_iter().flatten() {
             if let Some(n) = p["name"].as_str() {
                 names.insert(n.to_string());
+            }
+            for pc in p["pins"].as_array().into_iter().flatten() {
+                if let Some(pin) = pc["pin"].as_str() {
+                    let b = pin.as_bytes();
+                    // "P" + port letter + digits, e.g. "PA0".
+                    if b.len() >= 3 && b[0] == b'P' && b[1].is_ascii_uppercase()
+                        && b[2..].iter().all(u8::is_ascii_digit)
+                    {
+                        gpio.insert(pin.to_string());
+                    }
+                }
             }
         }
     }
@@ -115,6 +129,7 @@ fn entry_from(v: &Value) -> Option<CatalogEntry> {
         has_sdmmc: names.iter().any(|n| n.starts_with("SDMMC")),
         has_fmc: names.contains("FMC"),
         dma_pool_total: dma_channels.len() as u16,
+        gpio_pins: gpio.len() as u16,
     })
 }
 

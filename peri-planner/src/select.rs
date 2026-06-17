@@ -10,7 +10,7 @@
 //! (one candidate per (instance, rx-channel, tx-channel) choice) — fine for
 //! greedy first-fit; a leaner representation lands with backtracking.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{self, CatalogEntry, SearchQuery};
 use crate::constraint::{assign_backtracking, Candidate, Requirement, Res, Solution};
@@ -246,6 +246,32 @@ pub fn total_channel_demand(demands: &[Demand]) -> usize {
     channel_demand(demands)
 }
 
+/// Per-class instance count on a catalog entry — for the cheap, exact
+/// instance-capacity check.
+fn entry_class_count(e: &CatalogEntry, class: &str) -> u8 {
+    match class {
+        "USART" => e.usart,
+        "UART" => e.uart,
+        "LPUART" => e.lpuart,
+        "SPI" => e.spi,
+        "I2C" => e.i2c,
+        "FDCAN" => e.fdcan,
+        _ => 0,
+    }
+}
+
+/// Total distinct GPIO pins a demand set needs — each peripheral signal needs
+/// its own pin, so this is a Tier-1 pin-capacity necessary bound. A part with
+/// fewer AF-capable GPIO pins than this can't host the set, whatever the AF mux
+/// (precise mux contention is the Tier-2 check). Classes without modeled GPIO
+/// signals (FDCAN) contribute 0 — keeping it a sound lower bound.
+pub fn pin_demand(demands: &[Demand]) -> usize {
+    demands
+        .iter()
+        .map(|dem| dem.count as usize * required_signals(dem.class).len())
+        .sum()
+}
+
 /// Two-tier evaluation of the catalog against `demands`, narrowed by `base`.
 ///
 /// Tier-1: the base query AND a derived DMA-capacity necessary bound prune the
@@ -258,13 +284,27 @@ pub fn evaluate(base: &SearchQuery, demands: &[Demand]) -> Vec<(&'static Catalog
     let dma_demand = channel_demand(demands);
     let needs_dma = dma_demand > 0;
 
-    // Tier-1: fold the DMA-capacity necessary bound into the query.
+    // Aggregate per-class instance demand — a cheap, definitive count check that
+    // also keeps the backtracker from blowing up trying to prove instance
+    // exhaustion (it would permute pin combinations of the placeable instances).
+    let mut class_demand: BTreeMap<&str, u8> = BTreeMap::new();
+    for d in demands {
+        *class_demand.entry(d.class).or_default() += d.count;
+    }
+
+    // Tier-1: fold the DMA-capacity and pin-capacity necessary bounds into the
+    // query (both sound — never drop a part that could actually satisfy them).
     let mut q = base.clone();
     q.min_dma_channels = q.min_dma_channels.max(dma_demand as u16);
+    q.min_gpio_pins = q.min_gpio_pins.max(pin_demand(demands) as u16);
 
     catalog::search(&q)
         .into_iter()
         .map(|e| {
+            // Definitive instance-count check first (exact from the catalog).
+            if class_demand.iter().any(|(&cls, &n)| entry_class_count(e, cls) < n) {
+                return (e, Verdict::Infeasible);
+            }
             let verdict = match Package::for_chip_name(&e.name) {
                 None => Verdict::BoundsOnly, // no descriptor to verify against
                 Some(pkg) => {
@@ -375,6 +415,25 @@ mod tests {
             "C531 DMA must be BoundsOnly, got {:?}",
             c531.iter().map(|(e, v)| (&e.name, v)).collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn pin_capacity_bound_prunes_pin_starved_parts() {
+        // 4 SPI + 4 USART (no DMA) = 4*3 + 4*2 = 20 distinct pins. Small packages
+        // (< 20 AF-capable GPIO) are pruned at Tier-1 even if they list the
+        // peripherals — the "not enough pins to use them together" case.
+        let demands = [
+            Demand { class: "SPI", count: 4, dma: Dma::None },
+            Demand { class: "USART", count: 4, dma: Dma::None },
+        ];
+        assert_eq!(pin_demand(&demands), 20);
+        let results = evaluate(&SearchQuery::default(), &demands);
+        assert!(
+            results.iter().all(|(e, _)| e.gpio_pins >= 20),
+            "every survivor must have >= 20 GPIO pins",
+        );
+        // The bound is real: parts below it exist in the catalog and are excluded.
+        assert!(catalog::CATALOG.iter().any(|e| e.gpio_pins < 20));
     }
 
     #[test]

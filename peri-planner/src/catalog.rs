@@ -53,6 +53,12 @@ pub struct CatalogEntry {
     /// stream consumes one channel; the binding DMA constraint is pool size).
     #[serde(default)]
     pub dma_pool_total: u16,
+    /// Distinct AF-capable GPIO pins on the package. The Tier-1 pin-capacity
+    /// bound: a part can't host more simultaneous peripheral signals than it has
+    /// pins (a necessary condition — precise AF-mux contention is a Tier-2 check
+    /// on parts with a compiled descriptor).
+    #[serde(default)]
+    pub gpio_pins: u16,
 }
 
 impl CatalogEntry {
@@ -93,6 +99,8 @@ pub struct SearchQuery {
     pub min_octospi: u8,
     /// Minimum total physical DMA channels (capacity across all controllers).
     pub min_dma_channels: u16,
+    /// Minimum AF-capable GPIO pins (pin-capacity necessary bound).
+    pub min_gpio_pins: u16,
     /// Minimum advanced-control timers (TIM1/8/20 — complementary PWM + breaks).
     pub min_tim_adv: u8,
     pub require_usb: bool,
@@ -127,6 +135,7 @@ impl SearchQuery {
             && e.ucpd >= self.min_ucpd
             && e.octospi >= self.min_octospi
             && e.dma_pool_total >= self.min_dma_channels
+            && e.gpio_pins >= self.min_gpio_pins
             && e.tim_adv >= self.min_tim_adv
             && (!self.require_usb || e.has_usb)
             && (!self.require_hrtim || e.has_hrtim)
