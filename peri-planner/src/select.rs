@@ -152,6 +152,27 @@ fn pin_combos(d: &McuDescriptor, peri: &'static str, roles: &[&'static str]) -> 
     combos
 }
 
+/// One peripheral in a feasible allocation: the chosen instance, each signal's
+/// assigned pin, and how many DMA channels it consumes. The actionable answer a
+/// `Verified` part owes the user (what to wire).
+#[derive(Clone, Debug)]
+pub struct AssignedPeri {
+    pub peri: &'static str,
+    pub pins: Vec<(&'static str, PinId)>,
+    pub dma_channels: u8,
+}
+
+/// A full allocation witness for a feasible design.
+pub type Witness = Vec<AssignedPeri>;
+
+/// A candidate paired with the `(peri, role→pin)` it represents, so the witness
+/// can name what the kernel chose.
+struct CandMeta {
+    candidate: Candidate,
+    peri: &'static str,
+    pins: Vec<(&'static str, PinId)>,
+}
+
 /// Candidate allocations for one peripheral instance: one per pin placement,
 /// each claiming the instance token plus a pin for every `gpio` signal. Pins are
 /// instance-coupled (USART1.TX options differ from USART2.TX) — the non-symmetric
@@ -162,7 +183,7 @@ fn instance_candidates(
     uclass: &'static str,
     n: u8,
     gpio: &[&'static str],
-) -> Vec<Candidate> {
+) -> Vec<CandMeta> {
     let Some(peri) = peri_name(d, uclass, n) else {
         return Vec::new();
     };
@@ -170,10 +191,12 @@ fn instance_candidates(
     pin_combos(d, peri, gpio)
         .into_iter()
         .map(|pins| {
+            let role_pins: Vec<(&'static str, PinId)> =
+                gpio.iter().copied().zip(pins.iter().copied()).collect();
             let mut tokens = Vec::with_capacity(1 + pins.len());
             tokens.push(inst);
-            tokens.extend(pins.into_iter().map(Res::Pin));
-            Candidate::new(peri, tokens)
+            tokens.extend(pins.iter().map(|&p| Res::Pin(p)));
+            CandMeta { candidate: Candidate::new(peri, tokens), peri, pins: role_pins }
         })
         .collect()
 }
@@ -182,7 +205,7 @@ fn instance_candidates(
 /// of every underlying class (so a SERIAL demand can take a USART, UART or
 /// LPUART), each with its pin placements for the configured signals. The kernel
 /// picks distinct ones via `Inst` exclusivity.
-fn kind_candidates(d: &McuDescriptor, kind: &str, options: &[&str]) -> Vec<Candidate> {
+fn kind_candidates(d: &McuDescriptor, kind: &str, options: &[&str]) -> Vec<CandMeta> {
     let gpio = required_signals(kind, options);
     let mut out = Vec::new();
     for &uc in underlying_classes(kind) {
@@ -240,13 +263,62 @@ const CHANNEL_UNMET_BASE: u32 = u32::MAX - 1024;
 /// count (fungible -> counting, not CSP). Feasible iff every instance+pin
 /// requirement is satisfiable AND total channel demand fits reachable capacity.
 pub fn solve(d: &McuDescriptor, demands: &[Demand]) -> Solution {
+    run(d, demands).0
+}
+
+/// Like [`solve`], but also returns the allocation [`Witness`] (which instance,
+/// pins and DMA each requirement got) when the design is feasible — what the
+/// user needs to actually wire it.
+pub fn allocate(d: &McuDescriptor, demands: &[Demand]) -> (Solution, Witness) {
+    let (sol, metas) = run(d, demands);
+    let witness = if sol.is_feasible() && !sol.indeterminate {
+        sol.assigned
+            .iter()
+            .filter_map(|&(req_id, ci)| {
+                metas
+                    .get((req_id - 1) as usize)
+                    .and_then(|m| m.get(ci))
+                    .map(|cm| AssignedPeri {
+                        peri: cm.peri,
+                        pins: cm.pins.clone(),
+                        dma_channels: cm.dma,
+                    })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (sol, witness)
+}
+
+/// One requirement-candidate's metadata, kept parallel to the kernel candidates
+/// so a solved assignment can be turned back into a named witness.
+#[derive(Clone)]
+struct ReqMeta {
+    peri: &'static str,
+    pins: Vec<(&'static str, PinId)>,
+    dma: u8,
+}
+
+/// Build the requirements + per-candidate metadata, run the backtracking solve,
+/// and fold in the DMA-channel capacity check. The shared core of `solve` /
+/// `allocate`.
+fn run(d: &McuDescriptor, demands: &[Demand]) -> (Solution, Vec<Vec<ReqMeta>>) {
     let mut reqs: Vec<Requirement> = Vec::new();
+    let mut metas: Vec<Vec<ReqMeta>> = Vec::new();
     let mut id = 0u32;
     for dem in demands {
-        let cands = kind_candidates(d, dem.kind, &dem.options);
+        let dma = if dem.with_dma { dma_channels_per_instance(dem.kind) as u8 } else { 0 };
+        let cm = kind_candidates(d, dem.kind, &dem.options);
+        let candidates: Vec<Candidate> = cm.iter().map(|m| m.candidate.clone()).collect();
+        let meta: Vec<ReqMeta> = cm
+            .into_iter()
+            .map(|m| ReqMeta { peri: m.peri, pins: m.pins, dma })
+            .collect();
         for _ in 0..dem.count {
             id += 1;
-            reqs.push(Requirement { id, candidates: cands.clone() });
+            reqs.push(Requirement { id, candidates: candidates.clone() });
+            metas.push(meta.clone());
         }
     }
     let mut sol = assign_backtracking(&reqs);
@@ -260,7 +332,7 @@ pub fn solve(d: &McuDescriptor, demands: &[Demand]) -> Solution {
             sol.unmet.push(CHANNEL_UNMET_BASE + k as u32);
         }
     }
-    sol
+    (sol, metas)
 }
 
 // ---------- Two-tier catalog evaluation ----------
@@ -268,29 +340,29 @@ pub fn solve(d: &McuDescriptor, demands: &[Demand]) -> Solution {
 /// Caches the Part-finder evaluation so the (whole-lineup) Tier-2 solve runs only
 /// when the query or demands actually change — not every egui frame. Holds
 /// `Option<Verdict>` (None = plain search, no constraints active).
+/// One Part-finder result row: the part, its verdict (`None` = plain search,
+/// no constraints active), and the allocation witness for a `Verified` part.
+pub type Row = (&'static CatalogEntry, Option<Verdict>, Option<Witness>);
+
 #[derive(Default)]
 pub struct EvalCache {
     key: Option<(SearchQuery, Vec<DemandInput>)>,
-    results: Vec<(&'static CatalogEntry, Option<Verdict>)>,
+    results: Vec<Row>,
 }
 
 impl EvalCache {
     /// Results for `(query, demands)`, recomputing only on change. With no active
     /// demand it's a plain catalog search (no solving); otherwise it's the
-    /// two-tier `evaluate`.
-    pub fn results(
-        &mut self,
-        query: &SearchQuery,
-        demands: &[DemandInput],
-    ) -> &[(&'static CatalogEntry, Option<Verdict>)] {
+    /// two-tier `evaluate` (which also carries the witness for verified parts).
+    pub fn results(&mut self, query: &SearchQuery, demands: &[DemandInput]) -> &[Row] {
         let changed = self.key.as_ref().map(|(q, d)| q != query || d != demands).unwrap_or(true);
         if changed {
             let active: Vec<Demand> =
                 demands.iter().filter(|d| d.count > 0).map(DemandInput::to_demand).collect();
             self.results = if active.is_empty() {
-                catalog::search(query).into_iter().map(|e| (e, None)).collect()
+                catalog::search(query).into_iter().map(|e| (e, None, None)).collect()
             } else {
-                evaluate(query, &active).into_iter().map(|(e, v)| (e, Some(v))).collect()
+                evaluate(query, &active).into_iter().map(|(e, v, w)| (e, Some(v), w)).collect()
             };
             self.key = Some((query.clone(), demands.to_vec()));
         }
@@ -386,7 +458,10 @@ pub fn pin_demand(demands: &[Demand]) -> usize {
 /// backtracking solve. Parts whose descriptor can't verify — none compiled, the
 /// search budget-cut, or descriptor data missing that the catalog has — are
 /// honestly labeled `BoundsOnly` rather than rejected.
-pub fn evaluate(base: &SearchQuery, demands: &[Demand]) -> Vec<(&'static CatalogEntry, Verdict)> {
+pub fn evaluate(
+    base: &SearchQuery,
+    demands: &[Demand],
+) -> Vec<(&'static CatalogEntry, Verdict, Option<Witness>)> {
     let dma_demand = channel_demand(demands);
     let needs_dma = dma_demand > 0;
 
@@ -410,24 +485,24 @@ pub fn evaluate(base: &SearchQuery, demands: &[Demand]) -> Vec<(&'static Catalog
         .map(|e| {
             // Definitive instance-count check first (exact from the catalog).
             if kind_demand.iter().any(|(&k, &n)| entry_kind_count(e, k) < n) {
-                return (e, Verdict::Infeasible);
+                return (e, Verdict::Infeasible, None);
             }
             // Tier-2: solve against the part's descriptor from the whole-lineup
             // asset (covers every part, and carries C5 DMA that metapac omits).
-            let verdict = match crate::desc_asset::descriptor_for(&e.name) {
-                None => Verdict::BoundsOnly, // asset somehow lacks this prefix
+            match crate::desc_asset::descriptor_for(&e.name) {
+                None => (e, Verdict::BoundsOnly, None), // asset somehow lacks this prefix
                 Some(d) => {
-                    let sol = solve(d, demands);
+                    let (sol, witness) = allocate(d, demands);
                     if sol.indeterminate {
-                        Verdict::BoundsOnly
+                        (e, Verdict::BoundsOnly, None)
                     } else if sol.is_feasible() {
-                        Verdict::Verified
+                        // Carry the allocation so the UI can show what to wire.
+                        (e, Verdict::Verified, Some(witness))
                     } else {
-                        Verdict::Infeasible
+                        (e, Verdict::Infeasible, None)
                     }
                 }
-            };
-            (e, verdict)
+            }
         })
         .collect()
 }
@@ -498,11 +573,13 @@ mod tests {
         let demands = [Demand { kind: "SERIAL", count: 3, with_dma: true, options: vec![] }];
         let results = evaluate(&SearchQuery::default(), &demands);
         // G474RE has a lineup descriptor with DMA -> provably Verified.
-        let g4 = results.iter().find(|(e, _)| e.name == "STM32G474RE").expect("G474RE");
+        let g4 = results.iter().find(|(e, _, _)| e.name == "STM32G474RE").expect("G474RE");
         assert_eq!(g4.1, Verdict::Verified);
+        // A Verified part carries an allocation witness (what to wire).
+        assert!(g4.2.as_ref().is_some_and(|w| w.len() == 3), "Verified G474 carries a 3-peri witness");
         // The asset covers every part, so verdicts are real (Verified/Infeasible),
         // not "no descriptor" — and many parts are genuinely Verified.
-        assert!(results.iter().filter(|(_, v)| *v == Verdict::Verified).count() > 10);
+        assert!(results.iter().filter(|(_, v, _)| *v == Verdict::Verified).count() > 10);
     }
 
     #[test]
@@ -513,12 +590,13 @@ mod tests {
         // is the C5 DMA gap closing end-to-end.
         let demands = [Demand { kind: "SERIAL", count: 1, with_dma: true, options: vec![] }];
         let results = evaluate(&SearchQuery::default(), &demands);
-        let c531: Vec<_> = results.iter().filter(|(e, _)| e.name.starts_with("STM32C531R")).collect();
+        let c531: Vec<_> =
+            results.iter().filter(|(e, _, _)| e.name.starts_with("STM32C531R")).collect();
         assert!(!c531.is_empty(), "C531R should survive Tier-1");
         assert!(
-            c531.iter().all(|(_, v)| *v == Verdict::Verified),
+            c531.iter().all(|(_, v, _)| *v == Verdict::Verified),
             "C531 should now be Verified (asset has C5 DMA), got {:?}",
-            c531.iter().map(|(e, v)| (&e.name, v)).collect::<Vec<_>>(),
+            c531.iter().map(|(e, v, _)| (&e.name, v)).collect::<Vec<_>>(),
         );
     }
 
@@ -543,7 +621,7 @@ mod tests {
         assert_eq!(pin_demand(&demands), 20);
         let results = evaluate(&SearchQuery::default(), &demands);
         assert!(
-            results.iter().all(|(e, _)| e.gpio_pins >= 20),
+            results.iter().all(|(e, _, _)| e.gpio_pins >= 20),
             "every survivor must have >= 20 GPIO pins",
         );
         // The bound is real: parts below it exist in the catalog and are excluded.
@@ -560,8 +638,8 @@ mod tests {
             Demand { kind: "I2C", count: 3, with_dma: true, options: vec![] },
         ];
         let results = evaluate(&SearchQuery::default(), &demands);
-        assert!(results.iter().all(|(e, _)| e.dma_pool_total >= 18));
-        assert!(!results.iter().any(|(e, _)| e.name == "STM32G474RE"), "G474 (16ch) pruned");
+        assert!(results.iter().all(|(e, _, _)| e.dma_pool_total >= 18));
+        assert!(!results.iter().any(|(e, _, _)| e.name == "STM32G474RE"), "G474 (16ch) pruned");
     }
 
     #[test]
@@ -613,6 +691,44 @@ mod tests {
             &[Demand { kind: "UCPD", count: 1, with_dma: false, options: vec!["dead-battery"] }],
         );
         assert!(s.is_feasible(), "UCPD + dead-battery should place on G474; unmet={:?}", s.unmet);
+    }
+
+    #[test]
+    fn allocate_witness_names_instances_and_pins() {
+        // The actionable answer a Verified part owes: per demanded peripheral, the
+        // chosen instance, each signal's pin, and the DMA channels consumed.
+        // Asserted on a G474 (DMA via metapac) and a C531 (DMA via the asset).
+        let demands = [Demand { kind: "SERIAL", count: 2, with_dma: true, options: vec![] }];
+
+        let (sol, w) = allocate(Package::G474R.descriptor(), &demands);
+        assert!(sol.is_feasible() && !sol.indeterminate, "G474 should verify; unmet={:?}", sol.unmet);
+        assert_eq!(w.len(), 2, "two serial peripherals in the witness");
+        for ap in &w {
+            // A real async-serial instance, with TX and RX placed on real pins,
+            // each consuming one DMA channel (RX+TX = 2).
+            assert!(
+                ["USART", "UART", "LPUART"].iter().any(|c| ap.peri.starts_with(c)),
+                "named a serial instance, got {}",
+                ap.peri,
+            );
+            let roles: Vec<_> = ap.pins.iter().map(|(r, _)| *r).collect();
+            assert!(roles.contains(&"TX") && roles.contains(&"RX"), "TX+RX placed, got {roles:?}");
+            assert!(ap.pins.iter().all(|(_, p)| p.name().starts_with('P')), "pins named PXn");
+            assert_eq!(ap.dma_channels, 2, "RX+TX = 2 channels");
+        }
+        // Distinct instances and distinct pins across the two peripherals.
+        assert_ne!(w[0].peri, w[1].peri, "two distinct instances");
+        let all_pins: Vec<_> = w.iter().flat_map(|ap| ap.pins.iter().map(|(_, p)| *p)).collect();
+        let distinct: BTreeSet<_> = all_pins.iter().collect();
+        assert_eq!(all_pins.len(), distinct.len(), "no pin reused across peripherals");
+
+        // C531: DMA comes from the whole-lineup asset (metapac omits C5 DMA).
+        let c531 = crate::desc_asset::descriptor_for("STM32C531RC").expect("C531 in asset");
+        let (sol, w) = allocate(c531, &demands);
+        assert!(sol.is_feasible() && !sol.indeterminate, "C531 should verify; unmet={:?}", sol.unmet);
+        assert_eq!(w.len(), 2);
+        assert!(w.iter().all(|ap| ap.peri.starts_with("USART")), "C531 serial is USART-only");
+        assert!(w.iter().all(|ap| ap.dma_channels == 2), "RX+TX = 2 channels each");
     }
 
     #[test]

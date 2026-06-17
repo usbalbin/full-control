@@ -6,8 +6,34 @@
 
 use crate::catalog::{self, SearchQuery};
 use crate::mcu::Package;
-use crate::select::{self, Verdict};
+use crate::select::{self, Verdict, Witness};
 use eframe::egui;
+
+/// One human-readable line per allocated peripheral, e.g.
+/// `USART2: TX=PA2, RX=PA3 (+2ch DMA)` — the witness hover text.
+fn witness_text(w: &Witness) -> String {
+    w.iter()
+        .map(|ap| {
+            let pins = ap
+                .pins
+                .iter()
+                .map(|(role, pin)| format!("{role}={}", pin.name()))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let dma = if ap.dma_channels > 0 {
+                format!(" (+{}ch DMA)", ap.dma_channels)
+            } else {
+                String::new()
+            };
+            if pins.is_empty() {
+                format!("{}{dma}", ap.peri)
+            } else {
+                format!("{}: {pins}{dma}", ap.peri)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// Renders the part finder. `demands` are the per-class constraint rows whose
 /// allocation is verified against each bridge-reachable part (Tier-2). Returns
@@ -149,8 +175,8 @@ pub fn show(
             results.len()
         ));
     } else {
-        let verified = results.iter().filter(|(_, v)| *v == Some(Verdict::Verified)).count();
-        let bounds = results.iter().filter(|(_, v)| *v == Some(Verdict::BoundsOnly)).count();
+        let verified = results.iter().filter(|(_, v, _)| *v == Some(Verdict::Verified)).count();
+        let bounds = results.iter().filter(|(_, v, _)| *v == Some(Verdict::BoundsOnly)).count();
         ui.label(format!(
             "{} parts pass Tier-1 (>= {} DMA channels, >= {} GPIO pins) — {} allocation-verified \
              (instances+pins+DMA solved), {} bounds-only (counts pass, not fully verified), \
@@ -177,7 +203,7 @@ pub fn show(
                     ui.strong(h);
                 }
                 ui.end_row();
-                for (e, verdict) in results.iter().take(CAP) {
+                for (e, verdict, witness) in results.iter().take(CAP) {
                     // Parts that are compiled in are clickable -> jump to them.
                     match Package::for_chip_name(&e.name) {
                         Some(pkg) => {
@@ -217,7 +243,14 @@ pub fn show(
                             ui.label("");
                         }
                         Some(Verdict::Verified) => {
-                            ui.colored_label(egui::Color32::from_rgb(100, 200, 120), "✓ verified");
+                            // Hover shows the witness allocation: per peripheral the
+                            // chosen instance, each signal's pin, and DMA channels —
+                            // what the user needs to actually wire it.
+                            let badge = ui
+                                .colored_label(egui::Color32::from_rgb(100, 200, 120), "✓ verified");
+                            if let Some(w) = witness {
+                                badge.on_hover_text(witness_text(w));
+                            }
                         }
                         Some(Verdict::Infeasible) => {
                             ui.colored_label(egui::Color32::from_rgb(220, 100, 100), "✗");
