@@ -114,7 +114,7 @@ pub fn show(
             ui.label(egui::RichText::new("RX+TX DMA").weak());
             ui.end_row();
             for d in demands.iter_mut() {
-                ui.label(d.class);
+                ui.label(d.label());
                 ui.add(egui::DragValue::new(&mut d.count).range(0..=8).speed(0.1));
                 ui.checkbox(&mut d.with_dma, "");
                 ui.end_row();

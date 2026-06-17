@@ -77,7 +77,7 @@ impl Default for PeriPlannerApp {
             picked: None,
             af_filter: Default::default(),
             catalog_query: Default::default(),
-            catalog_demands: ["USART", "UART", "SPI", "I2C"]
+            catalog_demands: ["SERIAL", "SPI", "I2C", "ADC"]
                 .into_iter()
                 .map(crate::select::DemandInput::new)
                 .collect(),

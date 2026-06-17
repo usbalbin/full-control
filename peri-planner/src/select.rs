@@ -17,57 +17,71 @@ use crate::constraint::{assign_backtracking, Candidate, Requirement, Res, Soluti
 use crate::mcu::McuDescriptor;
 use crate::mcu_pinout::{pins_for, PinId, SignalId};
 
-/// What DMA a peripheral instance needs.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Dma {
-    None,
-    Rx,
-    Tx,
-    RxTx,
+/// A high-level demand: `count` peripherals of a logical `kind`, optionally each
+/// with DMA. Kinds: "SERIAL" (UART / USART / LPUART — USART is a superset of
+/// UART, so a UART demand is met by a USART), "SPI", "I2C", "ADC".
+#[derive(Clone, Debug, PartialEq)]
+pub struct Demand {
+    pub kind: &'static str,
+    pub count: u8,
+    pub with_dma: bool,
 }
 
-impl Dma {
-    /// The DMA signal names this need claims a channel for.
-    fn signals(self) -> &'static [&'static str] {
-        match self {
-            Dma::None => &[],
-            Dma::Rx => &["RX"],
-            Dma::Tx => &["TX"],
-            Dma::RxTx => &["RX", "TX"],
-        }
+/// The metapac peripheral classes a logical kind can be satisfied by.
+fn underlying_classes(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "SERIAL" => &["USART", "UART", "LPUART"],
+        "SPI" => &["SPI"],
+        "I2C" => &["I2C"],
+        "ADC" => &["ADC"],
+        _ => &[],
     }
 }
 
-/// A high-level demand: `count` instances of `class`, each needing `dma`.
-#[derive(Clone, Debug)]
-pub struct Demand {
-    /// metapac class prefix, e.g. "USART".
-    pub class: &'static str,
-    pub count: u8,
-    pub dma: Dma,
+/// GPIO signals a kind needs routed to pins. ADC inputs are analog (not
+/// AF-pin-contended in this model), so ADC claims no pins.
+fn required_signals(kind: &str) -> &'static [&'static str] {
+    match kind {
+        "SERIAL" => &["TX", "RX"],
+        "SPI" => &["SCK", "MOSI", "MISO"],
+        "I2C" => &["SCL", "SDA"],
+        _ => &[],
+    }
 }
 
-/// The instance numbers of `class` present on the chip.
-fn instances_of(d: &McuDescriptor, class: &str) -> Vec<u8> {
-    match class {
+/// DMA channels one instance of the kind consumes when DMA is requested:
+/// RX+TX = 2 for serial/SPI/I2C, a single stream = 1 for ADC.
+fn dma_channels_per_instance(kind: &str) -> usize {
+    match kind {
+        "SERIAL" | "SPI" | "I2C" => 2,
+        "ADC" => 1,
+        _ => 0,
+    }
+}
+
+/// Instance numbers of a metapac peripheral class present on the chip.
+fn class_instances(d: &McuDescriptor, uclass: &str) -> Vec<u8> {
+    match uclass {
         "USART" => d.comms.usart.clone(),
         "UART" => d.comms.uart.clone(),
         "LPUART" => d.comms.lpuart.clone(),
         "SPI" => d.comms.spi.clone(),
         "I2C" => d.comms.i2c.clone(),
         "FDCAN" => d.comms.fdcan.clone(),
+        "ADC" => d.adcs.iter().map(|a| a.number).collect(),
         _ => Vec::new(),
     }
 }
 
-/// The GPIO signals a class needs routed to pins (minimal functional config).
-/// Classes not listed claim no pins (instance-only allocation).
-fn required_signals(class: &str) -> &'static [&'static str] {
-    match class {
-        "USART" | "UART" | "LPUART" => &["TX", "RX"],
-        "SPI" => &["SCK", "MOSI", "MISO"],
-        "I2C" => &["SCL", "SDA"],
-        _ => &[],
+/// Catalog instance count for a kind — the cheap, exact Tier-1 bound. "SERIAL"
+/// counts all async-serial (USART + UART + LPUART).
+fn entry_kind_count(e: &CatalogEntry, kind: &str) -> u8 {
+    match kind {
+        "SERIAL" => e.total_uart(),
+        "SPI" => e.spi,
+        "I2C" => e.i2c,
+        "ADC" => e.adc,
+        _ => 0,
     }
 }
 
@@ -103,17 +117,22 @@ fn pin_combos(d: &McuDescriptor, peri: &'static str, roles: &[&'static str]) -> 
     combos
 }
 
-/// Candidate allocations for one instance: one per pin placement, each claiming
-/// the instance token plus a pin for every required GPIO signal. Pins are
+/// Candidate allocations for one peripheral instance: one per pin placement,
+/// each claiming the instance token plus a pin for every `gpio` signal. Pins are
 /// instance-coupled (USART1.TX options differ from USART2.TX) — the non-symmetric
 /// dimension where backtracking earns its keep — so they bundle here, while
-/// fungible DMA channels stay decoupled.
-fn instance_candidates(d: &McuDescriptor, class: &'static str, n: u8) -> Vec<Candidate> {
-    let Some(peri) = peri_name(d, class, n) else {
+/// fungible DMA channels stay a capacity count.
+fn instance_candidates(
+    d: &McuDescriptor,
+    uclass: &'static str,
+    n: u8,
+    gpio: &[&'static str],
+) -> Vec<Candidate> {
+    let Some(peri) = peri_name(d, uclass, n) else {
         return Vec::new();
     };
-    let inst = Res::Inst(class, n);
-    pin_combos(d, peri, required_signals(class))
+    let inst = Res::Inst(uclass, n);
+    pin_combos(d, peri, gpio)
         .into_iter()
         .map(|pins| {
             let mut tokens = Vec::with_capacity(1 + pins.len());
@@ -124,26 +143,33 @@ fn instance_candidates(d: &McuDescriptor, class: &'static str, n: u8) -> Vec<Can
         .collect()
 }
 
-/// The aggregate DMA-channel capacity reachable by `demands`: the channel count
-/// of the union of every controller pool any demanded (class, signal) leg can
-/// use. Channels are fungible, so DMA feasibility is a COUNT (demand <=
-/// capacity), NOT a CSP — putting symmetric channels in the backtracker makes
-/// infeasibility proofs blow up permuting equivalent channels. Exact for the
-/// in-scope DMAMUX / named families (every leg of a class reaches all
+/// All candidates for one requirement of `kind`: every instance of every
+/// underlying class (so a SERIAL demand can take a USART, UART or LPUART), each
+/// with its pin placements. The kernel picks distinct ones via `Inst` exclusivity.
+fn kind_candidates(d: &McuDescriptor, kind: &str) -> Vec<Candidate> {
+    let gpio = required_signals(kind);
+    let mut out = Vec::new();
+    for &uc in underlying_classes(kind) {
+        for n in class_instances(d, uc) {
+            out.extend(instance_candidates(d, uc, n, gpio));
+        }
+    }
+    out
+}
+
+/// Aggregate DMA-channel capacity reachable by `demands`: channels in the union
+/// of every controller pool any demanded instance's DMA leg can use. Channels
+/// are fungible, so DMA feasibility is a COUNT (demand <= capacity), NOT a CSP —
+/// symmetric channels in the backtracker make infeasibility proofs blow up.
+/// Exact for the in-scope DMAMUX / named families (a class's legs reach all
 /// controllers); disjoint-pool families would need per-pool matching (deferred).
 fn channel_capacity(d: &McuDescriptor, demands: &[Demand]) -> usize {
     let mut pools: BTreeSet<&'static str> = BTreeSet::new();
-    for dem in demands {
-        for &sig in dem.dma.signals() {
-            for n in instances_of(d, dem.class) {
-                let Some(peri) = peri_name(d, dem.class, n) else {
-                    continue;
-                };
-                if let Some(leg) = d
-                    .dma_routes(peri)
-                    .iter()
-                    .find(|l| l.signal.eq_ignore_ascii_case(sig))
-                {
+    for dem in demands.iter().filter(|d| d.with_dma) {
+        for &uc in underlying_classes(dem.kind) {
+            for n in class_instances(d, uc) {
+                let Some(peri) = peri_name(d, uc, n) else { continue };
+                for leg in d.dma_routes(peri) {
                     pools.extend(leg.pools.iter().copied());
                 }
             }
@@ -156,11 +182,12 @@ fn channel_capacity(d: &McuDescriptor, demands: &[Demand]) -> usize {
         .sum()
 }
 
-/// Total DMA channels demanded: one channel per instance per DMA signal.
+/// Total DMA channels demanded across the set (per-kind channels per instance).
 fn channel_demand(demands: &[Demand]) -> usize {
     demands
         .iter()
-        .map(|dem| dem.count as usize * dem.dma.signals().len())
+        .filter(|d| d.with_dma)
+        .map(|dem| dem.count as usize * dma_channels_per_instance(dem.kind))
         .sum()
 }
 
@@ -180,13 +207,10 @@ pub fn solve(d: &McuDescriptor, demands: &[Demand]) -> Solution {
     let mut reqs: Vec<Requirement> = Vec::new();
     let mut id = 0u32;
     for dem in demands {
-        let inst_cands: Vec<Candidate> = instances_of(d, dem.class)
-            .into_iter()
-            .flat_map(|n| instance_candidates(d, dem.class, n))
-            .collect();
+        let cands = kind_candidates(d, dem.kind);
         for _ in 0..dem.count {
             id += 1;
-            reqs.push(Requirement { id, candidates: inst_cands.clone() });
+            reqs.push(Requirement { id, candidates: cands.clone() });
         }
     }
     let mut sol = assign_backtracking(&reqs);
@@ -253,24 +277,27 @@ pub enum Verdict {
     BoundsOnly,
 }
 
-/// A per-class demand row for the UI: count + whether it needs RX/TX DMA.
+/// A per-kind demand row for the UI: count + whether each needs DMA.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DemandInput {
-    pub class: &'static str,
+    pub kind: &'static str,
     pub count: u8,
     pub with_dma: bool,
 }
 
 impl DemandInput {
-    pub fn new(class: &'static str) -> Self {
-        Self { class, count: 0, with_dma: false }
+    pub fn new(kind: &'static str) -> Self {
+        Self { kind, count: 0, with_dma: false }
+    }
+    /// Human label for the row.
+    pub fn label(&self) -> &'static str {
+        match self.kind {
+            "SERIAL" => "UART / USART",
+            other => other,
+        }
     }
     pub fn to_demand(&self) -> Demand {
-        Demand {
-            class: self.class,
-            count: self.count,
-            dma: if self.with_dma { Dma::RxTx } else { Dma::None },
-        }
+        Demand { kind: self.kind, count: self.count, with_dma: self.with_dma }
     }
 }
 
@@ -279,29 +306,15 @@ pub fn total_channel_demand(demands: &[Demand]) -> usize {
     channel_demand(demands)
 }
 
-/// Per-class instance count on a catalog entry — for the cheap, exact
-/// instance-capacity check.
-fn entry_class_count(e: &CatalogEntry, class: &str) -> u8 {
-    match class {
-        "USART" => e.usart,
-        "UART" => e.uart,
-        "LPUART" => e.lpuart,
-        "SPI" => e.spi,
-        "I2C" => e.i2c,
-        "FDCAN" => e.fdcan,
-        _ => 0,
-    }
-}
-
 /// Total distinct GPIO pins a demand set needs — each peripheral signal needs
 /// its own pin, so this is a Tier-1 pin-capacity necessary bound. A part with
 /// fewer AF-capable GPIO pins than this can't host the set, whatever the AF mux
-/// (precise mux contention is the Tier-2 check). Classes without modeled GPIO
-/// signals (FDCAN) contribute 0 — keeping it a sound lower bound.
+/// (precise mux contention is the Tier-2 check). Kinds without modeled GPIO
+/// signals (ADC) contribute 0 — keeping it a sound lower bound.
 pub fn pin_demand(demands: &[Demand]) -> usize {
     demands
         .iter()
-        .map(|dem| dem.count as usize * required_signals(dem.class).len())
+        .map(|dem| dem.count as usize * required_signals(dem.kind).len())
         .sum()
 }
 
@@ -317,12 +330,12 @@ pub fn evaluate(base: &SearchQuery, demands: &[Demand]) -> Vec<(&'static Catalog
     let dma_demand = channel_demand(demands);
     let needs_dma = dma_demand > 0;
 
-    // Aggregate per-class instance demand — a cheap, definitive count check that
+    // Aggregate per-kind instance demand — a cheap, definitive count check that
     // also keeps the backtracker from blowing up trying to prove instance
     // exhaustion (it would permute pin combinations of the placeable instances).
-    let mut class_demand: BTreeMap<&str, u8> = BTreeMap::new();
+    let mut kind_demand: BTreeMap<&str, u8> = BTreeMap::new();
     for d in demands {
-        *class_demand.entry(d.class).or_default() += d.count;
+        *kind_demand.entry(d.kind).or_default() += d.count;
     }
 
     // Tier-1: fold the DMA-capacity and pin-capacity necessary bounds into the
@@ -336,7 +349,7 @@ pub fn evaluate(base: &SearchQuery, demands: &[Demand]) -> Vec<(&'static Catalog
         .into_iter()
         .map(|e| {
             // Definitive instance-count check first (exact from the catalog).
-            if class_demand.iter().any(|(&cls, &n)| entry_class_count(e, cls) < n) {
+            if kind_demand.iter().any(|(&k, &n)| entry_kind_count(e, k) < n) {
                 return (e, Verdict::Infeasible);
             }
             // Tier-2: solve against the part's descriptor from the whole-lineup
@@ -369,7 +382,7 @@ mod tests {
         // 3 USARTs each with RX+TX DMA: G474 has 3 USART instances and 16 DMA
         // channels (6 needed), so all three get a non-conflicting allocation.
         let d = Package::G474R.descriptor();
-        let s = solve(d, &[Demand { class: "USART", count: 3, dma: Dma::RxTx }]);
+        let s = solve(d, &[Demand { kind: "SERIAL", count: 3, with_dma: true }]);
         assert!(s.is_feasible(), "expected feasible, unmet={:?}", s.unmet);
         assert!(!s.indeterminate);
         // 3 instance+pin requirements (channels are a capacity count, not in CSP).
@@ -385,8 +398,8 @@ mod tests {
         let s = solve(
             d,
             &[
-                Demand { class: "USART", count: 3, dma: Dma::RxTx },
-                Demand { class: "SPI", count: 2, dma: Dma::RxTx },
+                Demand { kind: "SERIAL", count: 3, with_dma: true },
+                Demand { kind: "SPI", count: 2, with_dma: true },
             ],
         );
         assert!(s.is_feasible() && !s.indeterminate, "unmet={:?}", s.unmet);
@@ -402,9 +415,9 @@ mod tests {
         let s = solve(
             d,
             &[
-                Demand { class: "USART", count: 3, dma: Dma::RxTx },
-                Demand { class: "SPI", count: 3, dma: Dma::RxTx },
-                Demand { class: "I2C", count: 3, dma: Dma::RxTx },
+                Demand { kind: "SERIAL", count: 3, with_dma: true },
+                Demand { kind: "SPI", count: 3, with_dma: true },
+                Demand { kind: "I2C", count: 3, with_dma: true },
             ],
         );
         assert!(!s.is_feasible(), "18 RxTx channels should exceed 16");
@@ -416,13 +429,13 @@ mod tests {
         // SPI needs SCK/MOSI/MISO pins placed; an instance-only demand must
         // resolve all three on distinct pins.
         let d = Package::G474R.descriptor();
-        let s = solve(d, &[Demand { class: "SPI", count: 2, dma: Dma::None }]);
+        let s = solve(d, &[Demand { kind: "SPI", count: 2, with_dma: false }]);
         assert!(s.is_feasible(), "unmet={:?}", s.unmet);
     }
 
     #[test]
     fn evaluate_verifies_across_the_lineup() {
-        let demands = [Demand { class: "USART", count: 3, dma: Dma::RxTx }];
+        let demands = [Demand { kind: "SERIAL", count: 3, with_dma: true }];
         let results = evaluate(&SearchQuery::default(), &demands);
         // G474RE has a lineup descriptor with DMA -> provably Verified.
         let g4 = results.iter().find(|(e, _)| e.name == "STM32G474RE").expect("G474RE");
@@ -438,7 +451,7 @@ mod tests {
         // (metapac omits it). So C531 — which Tier-1 already knew has 8 LPDMA
         // channels — now Tier-2-VERIFIES instead of falling to BoundsOnly. This
         // is the C5 DMA gap closing end-to-end.
-        let demands = [Demand { class: "USART", count: 1, dma: Dma::RxTx }];
+        let demands = [Demand { kind: "SERIAL", count: 1, with_dma: true }];
         let results = evaluate(&SearchQuery::default(), &demands);
         let c531: Vec<_> = results.iter().filter(|(e, _)| e.name.starts_with("STM32C531R")).collect();
         assert!(!c531.is_empty(), "C531R should survive Tier-1");
@@ -464,8 +477,8 @@ mod tests {
         // (< 20 AF-capable GPIO) are pruned at Tier-1 even if they list the
         // peripherals — the "not enough pins to use them together" case.
         let demands = [
-            Demand { class: "SPI", count: 4, dma: Dma::None },
-            Demand { class: "USART", count: 4, dma: Dma::None },
+            Demand { kind: "SPI", count: 4, with_dma: false },
+            Demand { kind: "SERIAL", count: 4, with_dma: false },
         ];
         assert_eq!(pin_demand(&demands), 20);
         let results = evaluate(&SearchQuery::default(), &demands);
@@ -482,9 +495,9 @@ mod tests {
         // 18 RX+TX channels: G474 (16) is pruned by the Tier-1 capacity bound;
         // every survivor has >= 18 channels.
         let demands = [
-            Demand { class: "USART", count: 3, dma: Dma::RxTx },
-            Demand { class: "SPI", count: 3, dma: Dma::RxTx },
-            Demand { class: "I2C", count: 3, dma: Dma::RxTx },
+            Demand { kind: "SERIAL", count: 3, with_dma: true },
+            Demand { kind: "SPI", count: 3, with_dma: true },
+            Demand { kind: "I2C", count: 3, with_dma: true },
         ];
         let results = evaluate(&SearchQuery::default(), &demands);
         assert!(results.iter().all(|(e, _)| e.dma_pool_total >= 18));
@@ -492,21 +505,30 @@ mod tests {
     }
 
     #[test]
-    fn usart_demand_exceeding_instances_is_infeasible() {
-        // G474 has only 3 USARTs — a 4th instance can't be allocated.
+    fn serial_demand_exceeding_instances_is_infeasible() {
+        // G474 has 6 async-serial instances (USART1-3 + UART4/5 + LPUART1) — a
+        // 7th can't be allocated.
         let d = Package::G474R.descriptor();
-        let s = solve(d, &[Demand { class: "USART", count: 4, dma: Dma::RxTx }]);
+        let s = solve(d, &[Demand { kind: "SERIAL", count: 7, with_dma: true }]);
         assert!(!s.is_feasible());
-        assert_eq!(s.unmet.len(), 1);
     }
 
     #[test]
-    fn instance_only_demand_works_without_dma() {
-        // C531 has >=2 USARTs; with no DMA required, the instance allocation is
-        // data-driven and succeeds regardless of the DMA-metadata gap.
+    fn uart_demand_met_by_usart_superset() {
+        // C531 has no UART instances, only USARTs — a SERIAL demand is still
+        // satisfiable because USART is a superset of UART.
         let d = Package::C531R.descriptor();
-        let s = solve(d, &[Demand { class: "USART", count: 2, dma: Dma::None }]);
-        assert!(s.is_feasible(), "unmet={:?}", s.unmet);
+        let s = solve(d, &[Demand { kind: "SERIAL", count: 2, with_dma: false }]);
+        assert!(s.is_feasible(), "USART should satisfy a serial demand; unmet={:?}", s.unmet);
+    }
+
+    #[test]
+    fn adc_with_dma_allocates() {
+        // ADC is demandable with a single-stream DMA channel. G474 has 5 ADCs +
+        // DMA capacity; 2 ADCs with DMA = 2 channels <= 16.
+        let d = Package::G474R.descriptor();
+        let s = solve(d, &[Demand { kind: "ADC", count: 2, with_dma: true }]);
+        assert!(s.is_feasible() && !s.indeterminate, "unmet={:?}", s.unmet);
     }
 
     #[test]
@@ -515,7 +537,7 @@ mod tests {
         // channel candidates -> infeasible. Documents the data-currency gap
         // (resolves on a metapac refresh); the catalog already knows C531 has 8.
         let d = Package::C531R.descriptor();
-        let s = solve(d, &[Demand { class: "USART", count: 1, dma: Dma::RxTx }]);
+        let s = solve(d, &[Demand { kind: "SERIAL", count: 1, with_dma: true }]);
         assert!(!s.is_feasible());
     }
 }
