@@ -206,7 +206,7 @@ impl PeriPlannerApp {
                 egui::ComboBox::from_id_salt("package")
                     .selected_text(self.package.display_label())
                     .show_ui(ui, |ui| {
-                        for &p in self.mcu.packages() {
+                        for p in self.mcu.packages() {
                             if ui.selectable_label(p == self.package, p.display_label()).clicked() {
                                 pending_package = Some(p);
                             }

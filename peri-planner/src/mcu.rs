@@ -36,19 +36,9 @@ impl Mcu {
         }
     }
 
-    pub fn packages(self) -> &'static [Package] {
-        match self {
-            Self::G474 => &[
-                Package::G474C, Package::G474M, Package::G474P,
-                Package::G474Q, Package::G474R, Package::G474V,
-            ],
-            Self::H523 => &[
-                Package::H523C, Package::H523H, Package::H523R,
-                Package::H523V, Package::H523Z,
-            ],
-            Self::C5A3 => &[Package::C5A3Z],
-            Self::C531 => &[Package::C531R],
-        }
+    /// Compiled packages for this MCU, from the part registry (data-driven).
+    pub fn packages(self) -> Vec<Package> {
+        Package::ALL.iter().copied().filter(|p| p.mcu() == self).collect()
     }
 
     pub fn default_package(self) -> Package {
@@ -70,17 +60,84 @@ impl Mcu {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum Package {
-    G474C, G474M, G474P, G474Q, G474R, G474V,
-    H523C, H523H, H523R, H523V, H523Z,
-    C5A3Z,
-    C531R,
+/// One compiled part — the per-part **registry** row. Add a part by adding its
+/// `mcu_data` module and one `Package` const + `ALL` entry; no new match arms
+/// anywhere. Name, prefix, line and package letter all derive from the extracted
+/// `raw.name`; only `package_label` and the behavior `mcu` tag live here because
+/// they aren't encoded in the chip name.
+pub struct PartInfo {
+    pub raw: &'static RawMcuData,
+    pub package_label: &'static str,
+    pub mcu: Mcu,
 }
 
-impl Default for Package { fn default() -> Self { Self::G474R } }
+impl PartInfo {
+    /// `"STM32<line><letter>"` prefix (first 10 chars of the name) — the
+    /// descriptor key every flash/temp/package variant of this letter shares.
+    pub fn chip_prefix(&self) -> &'static str {
+        self.raw.name.get(..10).unwrap_or(self.raw.name)
+    }
+}
+
+/// A compiled part: a lightweight handle into the [`PartInfo`] registry. The
+/// named consts (`Package::G474R`, …) are the interactive/planner parts; any
+/// part — including descriptor-only catalog lines — is just an `ALL` entry.
+/// Equality / hashing / serde are by canonical part name.
+#[derive(Copy, Clone)]
+pub struct Package {
+    info: &'static PartInfo,
+}
+
+impl PartialEq for Package {
+    fn eq(&self, o: &Self) -> bool {
+        self.info.raw.name == o.info.raw.name
+    }
+}
+impl Eq for Package {}
+impl std::hash::Hash for Package {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        self.info.raw.name.hash(h)
+    }
+}
+impl std::fmt::Debug for Package {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Package({})", self.info.raw.name)
+    }
+}
+impl Default for Package {
+    fn default() -> Self {
+        Self::G474R
+    }
+}
+impl serde::Serialize for Package {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.info.raw.name)
+    }
+}
+impl<'de> serde::Deserialize<'de> for Package {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(d)?;
+        Package::for_chip_name(&name)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown package {name}")))
+    }
+}
 
 impl Package {
+    pub const G474C: Package = Package { info: &PartInfo { raw: &crate::mcu_data::g474c::RAW, package_label: "LQFP48",   mcu: Mcu::G474 } };
+    pub const G474M: Package = Package { info: &PartInfo { raw: &crate::mcu_data::g474m::RAW, package_label: "WLCSP81",  mcu: Mcu::G474 } };
+    pub const G474P: Package = Package { info: &PartInfo { raw: &crate::mcu_data::g474p::RAW, package_label: "TFBGA100", mcu: Mcu::G474 } };
+    pub const G474Q: Package = Package { info: &PartInfo { raw: &crate::mcu_data::g474q::RAW, package_label: "UFBGA121", mcu: Mcu::G474 } };
+    pub const G474R: Package = Package { info: &PartInfo { raw: &crate::mcu_data::g474r::RAW, package_label: "LQFP64",   mcu: Mcu::G474 } };
+    pub const G474V: Package = Package { info: &PartInfo { raw: &crate::mcu_data::g474v::RAW, package_label: "LQFP100",  mcu: Mcu::G474 } };
+    pub const H523C: Package = Package { info: &PartInfo { raw: &crate::mcu_data::h523c::RAW, package_label: "LQFP48",   mcu: Mcu::H523 } };
+    pub const H523H: Package = Package { info: &PartInfo { raw: &crate::mcu_data::h523h::RAW, package_label: "UFBGA100", mcu: Mcu::H523 } };
+    pub const H523R: Package = Package { info: &PartInfo { raw: &crate::mcu_data::h523r::RAW, package_label: "LQFP64",   mcu: Mcu::H523 } };
+    pub const H523V: Package = Package { info: &PartInfo { raw: &crate::mcu_data::h523v::RAW, package_label: "LQFP100",  mcu: Mcu::H523 } };
+    pub const H523Z: Package = Package { info: &PartInfo { raw: &crate::mcu_data::h523z::RAW, package_label: "LQFP144",  mcu: Mcu::H523 } };
+    pub const C5A3Z: Package = Package { info: &PartInfo { raw: &crate::mcu_data::c5a3z::RAW, package_label: "LQFP144",  mcu: Mcu::C5A3 } };
+    pub const C531R: Package = Package { info: &PartInfo { raw: &crate::mcu_data::c531r::RAW, package_label: "LQFP64",   mcu: Mcu::C531 } };
+
+    /// The part registry. THE single place a part is listed.
     pub const ALL: &'static [Package] = &[
         Self::G474C, Self::G474M, Self::G474P, Self::G474Q, Self::G474R, Self::G474V,
         Self::H523C, Self::H523H, Self::H523R, Self::H523V, Self::H523Z,
@@ -89,95 +146,41 @@ impl Package {
     ];
 
     pub fn mcu(self) -> Mcu {
-        match self {
-            Self::G474C | Self::G474M | Self::G474P
-            | Self::G474Q | Self::G474R | Self::G474V => Mcu::G474,
-            Self::H523C | Self::H523H | Self::H523R
-            | Self::H523V | Self::H523Z => Mcu::H523,
-            Self::C5A3Z => Mcu::C5A3,
-            Self::C531R => Mcu::C531,
-        }
+        self.info.mcu
+    }
+
+    pub fn raw(self) -> &'static RawMcuData {
+        self.info.raw
+    }
+
+    /// Canonical part name, e.g. "STM32G474RE" / "STM32C531RCT6".
+    pub fn name(self) -> &'static str {
+        self.info.raw.name
     }
 
     /// Package style as used in datasheet titles (LQFP48/UFBGA100/...).
     pub fn package_label(self) -> &'static str {
-        match self {
-            Self::G474C => "LQFP48",
-            Self::G474M => "WLCSP81",
-            Self::G474P => "TFBGA100",
-            Self::G474Q => "UFBGA121",
-            Self::G474R => "LQFP64",
-            Self::G474V => "LQFP100",
-            Self::H523C => "LQFP48",
-            Self::H523H => "UFBGA100",
-            Self::H523R => "LQFP64",
-            Self::H523V => "LQFP100",
-            Self::H523Z => "LQFP144",
-            Self::C5A3Z => "LQFP144",
-            Self::C531R => "LQFP64",
-        }
+        self.info.package_label
     }
 
-    /// "STM32H523Z (LQFP144)" — single-line label for combo boxes.
-    pub fn display_label(self) -> String {
-        let (mcu, letter) = match self {
-            Self::G474C => ("G474", 'C'), Self::G474M => ("G474", 'M'),
-            Self::G474P => ("G474", 'P'), Self::G474Q => ("G474", 'Q'),
-            Self::G474R => ("G474", 'R'), Self::G474V => ("G474", 'V'),
-            Self::H523C => ("H523", 'C'), Self::H523H => ("H523", 'H'),
-            Self::H523R => ("H523", 'R'), Self::H523V => ("H523", 'V'),
-            Self::H523Z => ("H523", 'Z'),
-            Self::C5A3Z => ("C5A3", 'Z'),
-            Self::C531R => ("C531", 'R'),
-        };
-        format!("STM32{}{} ({})", mcu, letter, self.package_label())
-    }
-
-    pub fn raw(self) -> &'static RawMcuData {
-        match self {
-            Self::G474C => &crate::mcu_data::g474c::RAW,
-            Self::G474M => &crate::mcu_data::g474m::RAW,
-            Self::G474P => &crate::mcu_data::g474p::RAW,
-            Self::G474Q => &crate::mcu_data::g474q::RAW,
-            Self::G474R => &crate::mcu_data::g474r::RAW,
-            Self::G474V => &crate::mcu_data::g474v::RAW,
-            Self::H523C => &crate::mcu_data::h523c::RAW,
-            Self::H523H => &crate::mcu_data::h523h::RAW,
-            Self::H523R => &crate::mcu_data::h523r::RAW,
-            Self::H523V => &crate::mcu_data::h523v::RAW,
-            Self::H523Z => &crate::mcu_data::h523z::RAW,
-            Self::C5A3Z => &crate::mcu_data::c5a3z::RAW,
-            Self::C531R => &crate::mcu_data::c531r::RAW,
-        }
-    }
-
-    /// The `"STM32<line><package-letter>"` prefix that fixes this package's
-    /// pin/peripheral configuration, e.g. `"STM32G474R"`. Every flash, temp and
-    /// packaging variant of the same package letter shares it (and thus the same
-    /// pinout), so it is the sound key for mapping an arbitrary catalog part name
-    /// to a compiled descriptor.
+    /// `"STM32<line><package-letter>"` (e.g. "STM32G474R") — the descriptor key
+    /// shared by every flash/temp/package variant of this letter.
     pub fn chip_prefix(self) -> &'static str {
-        match self {
-            Self::G474C => "STM32G474C", Self::G474M => "STM32G474M",
-            Self::G474P => "STM32G474P", Self::G474Q => "STM32G474Q",
-            Self::G474R => "STM32G474R", Self::G474V => "STM32G474V",
-            Self::H523C => "STM32H523C", Self::H523H => "STM32H523H",
-            Self::H523R => "STM32H523R", Self::H523V => "STM32H523V",
-            Self::H523Z => "STM32H523Z",
-            Self::C5A3Z => "STM32C5A3Z",
-            Self::C531R => "STM32C531R",
-        }
+        self.info.chip_prefix()
+    }
+
+    /// "STM32G474R (LQFP64)" — single-line label for combo boxes.
+    pub fn display_label(self) -> String {
+        format!("{} ({})", self.chip_prefix(), self.info.package_label)
     }
 
     /// The compiled-in package whose descriptor represents `name` — the
-    /// catalog-part → descriptor **bridge**. Tries an exact match first, then
-    /// falls back to the `chip_prefix` (family + package letter), so every flash
-    /// / temperature / packaging variant of a supported package letter resolves
-    /// (e.g. `STM32G474RB`, `STM32G474RET6`, and `STM32C531RC` — whose catalog
-    /// name differs from the metapac RAW name `STM32C531RCT6` — all resolve).
-    /// Sound because pins and peripheral instances are fixed by the package
-    /// letter, not the flash code. Returns `None` for an unsupported package
-    /// letter or family (only the ~13 compiled packages have descriptors).
+    /// catalog-part → descriptor **bridge**. Exact match first, then the
+    /// `chip_prefix` (family + package letter), so every flash / temperature /
+    /// packaging variant of a supported package letter resolves (e.g.
+    /// `STM32G474RB`, `STM32G474RET6`, and `STM32C531RC` — whose catalog name
+    /// differs from the metapac RAW name `STM32C531RCT6`). Sound because pins and
+    /// peripheral instances are fixed by the package letter, not the flash code.
     pub fn for_chip_name(name: &str) -> Option<Package> {
         if let Some(p) = Self::ALL.iter().copied().find(|p| p.raw().name == name) {
             return Some(p);
@@ -187,24 +190,25 @@ impl Package {
 
     pub fn descriptor(self) -> &'static McuDescriptor {
         DESCRIPTORS
-            .get_or_init(|| {
-                Self::ALL.iter().map(|&p| (p, build_descriptor(p))).collect()
-            })
+            .get_or_init(|| Self::ALL.iter().map(|&p| (p, build_descriptor(p))).collect())
             .get(&self)
-            .expect("Package::ALL covers every variant")
+            .expect("Package::ALL covers every part")
     }
 
-    /// Bridge into legacy G474-specific `ChipVariant`. Returns `None` for
-    /// H523 packages (which don't have a `ChipVariant` representation —
-    /// `pinout.rs` is still G474-only and gets migrated next slice).
+    /// Bridge into the legacy G474-specific `ChipVariant`. `None` for non-G474
+    /// parts (the HRTIM planner is G474-only).
     pub fn to_g474_variant(self) -> Option<ChipVariant> {
-        Some(match self {
-            Self::G474C => ChipVariant::G474C,
-            Self::G474M => ChipVariant::G474M,
-            Self::G474P => ChipVariant::G474P,
-            Self::G474Q => ChipVariant::G474Q,
-            Self::G474R => ChipVariant::G474R,
-            Self::G474V => ChipVariant::G474V,
+        if self.info.mcu != Mcu::G474 {
+            return None;
+        }
+        // Package letter = 10th char of the name (after "STM32" + 4-char line).
+        Some(match self.info.raw.name.as_bytes().get(9).copied() {
+            Some(b'C') => ChipVariant::G474C,
+            Some(b'M') => ChipVariant::G474M,
+            Some(b'P') => ChipVariant::G474P,
+            Some(b'Q') => ChipVariant::G474Q,
+            Some(b'R') => ChipVariant::G474R,
+            Some(b'V') => ChipVariant::G474V,
             _ => return None,
         })
     }
