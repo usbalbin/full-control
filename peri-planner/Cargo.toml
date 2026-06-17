@@ -2,6 +2,9 @@
 name = "peri-planner"
 version = "0.1.0"
 edition = "2024"
+# The app is the default `cargo run` target (the other bins are offline
+# generators behind their own features).
+default-run = "peri-planner"
 
 # cdylib is needed so trunk can build a .wasm file; rlib allows the bin to use the lib.
 [lib]
