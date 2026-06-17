@@ -93,10 +93,17 @@ pub struct SearchQuery {
     pub min_octospi: u8,
     /// Minimum total physical DMA channels (capacity across all controllers).
     pub min_dma_channels: u16,
+    /// Minimum advanced-control timers (TIM1/8/20 — complementary PWM + breaks).
+    pub min_tim_adv: u8,
     pub require_usb: bool,
     pub require_hrtim: bool,
     pub require_sdmmc: bool,
     pub require_fmc: bool,
+    /// Require hardware over-current capability: a comparator AND an advanced
+    /// timer present — the necessary condition for a COMP → timer-break OCP path
+    /// (the actual routing is a Tier-2 fabric check). A loose, sound Tier-1
+    /// filter: any part lacking either definitely can't do hardware OCP.
+    pub require_ocp_capable: bool,
 }
 
 impl SearchQuery {
@@ -120,10 +127,12 @@ impl SearchQuery {
             && e.ucpd >= self.min_ucpd
             && e.octospi >= self.min_octospi
             && e.dma_pool_total >= self.min_dma_channels
+            && e.tim_adv >= self.min_tim_adv
             && (!self.require_usb || e.has_usb)
             && (!self.require_hrtim || e.has_hrtim)
             && (!self.require_sdmmc || e.has_sdmmc)
             && (!self.require_fmc || e.has_fmc)
+            && (!self.require_ocp_capable || (e.comp >= 1 && e.tim_adv >= 1))
     }
 }
 
@@ -190,6 +199,22 @@ mod tests {
             c5.iter().any(|e| e.dac >= 1 && e.comp >= 1 && e.tim_adv >= 1),
             "expected at least one C5 part with DAC + COMP + advanced timer"
         );
+    }
+
+    #[test]
+    fn ocp_capable_and_adv_timer_filters() {
+        // Hardware-OCP-capable = comparator AND advanced timer present (the
+        // necessary condition for a COMP -> timer-break path).
+        let ocp = search(&SearchQuery { require_ocp_capable: true, ..Default::default() });
+        assert!(!ocp.is_empty());
+        assert!(ocp.iter().all(|e| e.comp >= 1 && e.tim_adv >= 1));
+        // The analog-rich power families qualify; it genuinely narrows.
+        assert!(ocp.iter().any(|e| e.family == "STM32G4"));
+        assert!(ocp.len() < search(&SearchQuery::default()).len());
+
+        // min_tim_adv discriminates on advanced-timer count.
+        let adv = search(&SearchQuery { min_tim_adv: 2, ..Default::default() });
+        assert!(!adv.is_empty() && adv.iter().all(|e| e.tim_adv >= 2));
     }
 
     #[test]

@@ -51,6 +51,8 @@ pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) -> Option<Package> {
             num(ui, "Min OctoSPI", &mut q.min_octospi);
             num(ui, "Min DMA ch", &mut q.min_dma_channels);
             ui.end_row();
+            num(ui, "Min adv timer", &mut q.min_tim_adv);
+            ui.end_row();
         });
 
     ui.horizontal(|ui| {
@@ -58,6 +60,8 @@ pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) -> Option<Package> {
         ui.checkbox(&mut q.require_hrtim, "HRTIM");
         ui.checkbox(&mut q.require_sdmmc, "SDMMC");
         ui.checkbox(&mut q.require_fmc, "FMC");
+        ui.checkbox(&mut q.require_ocp_capable, "HW OCP")
+            .on_hover_text("Comparator + advanced timer (COMP → timer-break over-current capable)");
         ui.separator();
         ui.label("Family:");
         let current = q.family.clone().unwrap_or_else(|| "(any)".to_string());
