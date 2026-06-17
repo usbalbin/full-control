@@ -151,11 +151,38 @@ impl Package {
         }
     }
 
-    /// The compiled-in package whose extracted chip data has this exact name
-    /// (e.g. "STM32G474RE", "STM32C531RCT6"), if any. Lets a Part-finder result
-    /// jump to that part's inventory/AF view.
+    /// The `"STM32<line><package-letter>"` prefix that fixes this package's
+    /// pin/peripheral configuration, e.g. `"STM32G474R"`. Every flash, temp and
+    /// packaging variant of the same package letter shares it (and thus the same
+    /// pinout), so it is the sound key for mapping an arbitrary catalog part name
+    /// to a compiled descriptor.
+    pub fn chip_prefix(self) -> &'static str {
+        match self {
+            Self::G474C => "STM32G474C", Self::G474M => "STM32G474M",
+            Self::G474P => "STM32G474P", Self::G474Q => "STM32G474Q",
+            Self::G474R => "STM32G474R", Self::G474V => "STM32G474V",
+            Self::H523C => "STM32H523C", Self::H523H => "STM32H523H",
+            Self::H523R => "STM32H523R", Self::H523V => "STM32H523V",
+            Self::H523Z => "STM32H523Z",
+            Self::C5A3Z => "STM32C5A3Z",
+            Self::C531R => "STM32C531R",
+        }
+    }
+
+    /// The compiled-in package whose descriptor represents `name` — the
+    /// catalog-part → descriptor **bridge**. Tries an exact match first, then
+    /// falls back to the `chip_prefix` (family + package letter), so every flash
+    /// / temperature / packaging variant of a supported package letter resolves
+    /// (e.g. `STM32G474RB`, `STM32G474RET6`, and `STM32C531RC` — whose catalog
+    /// name differs from the metapac RAW name `STM32C531RCT6` — all resolve).
+    /// Sound because pins and peripheral instances are fixed by the package
+    /// letter, not the flash code. Returns `None` for an unsupported package
+    /// letter or family (only the ~13 compiled packages have descriptors).
     pub fn for_chip_name(name: &str) -> Option<Package> {
-        Self::ALL.iter().copied().find(|p| p.raw().name == name)
+        if let Some(p) = Self::ALL.iter().copied().find(|p| p.raw().name == name) {
+            return Some(p);
+        }
+        Self::ALL.iter().copied().find(|p| name.starts_with(p.chip_prefix()))
     }
 
     pub fn descriptor(self) -> &'static McuDescriptor {
@@ -528,6 +555,35 @@ fn classify_timer(name: &str, block: Option<&str>) -> Option<TimerInstance> {
 #[cfg(test)]
 mod fabric_validation {
     use super::*;
+
+    /// The catalog-part → descriptor bridge resolves flash/temp/packaging
+    /// variants of a supported package letter to that package, and refuses
+    /// unsupported letters/families. Exact full-name matching (the old behavior)
+    /// reached ~1 part per family; the prefix bridge reaches every variant.
+    #[test]
+    fn for_chip_name_bridges_package_variants() {
+        // Exact compiled name still resolves to its own package.
+        assert_eq!(Package::for_chip_name("STM32G474RE"), Some(Package::G474R));
+        // Flash / temp / packaging variants of a SUPPORTED package letter resolve
+        // to that package's (flash-invariant) descriptor.
+        assert_eq!(Package::for_chip_name("STM32G474RB"), Some(Package::G474R));
+        assert_eq!(Package::for_chip_name("STM32G474RET6"), Some(Package::G474R));
+        assert_eq!(Package::for_chip_name("STM32G474VC"), Some(Package::G474V));
+        // C531: catalog name "STM32C531RC" differs from metapac RAW name
+        // "STM32C531RCT6" — exact match resolved NEITHER; the bridge resolves both.
+        assert_eq!(Package::for_chip_name("STM32C531RC"), Some(Package::C531R));
+        assert_eq!(Package::for_chip_name("STM32C531RBT6"), Some(Package::C531R));
+        // Unsupported package letters / families must NOT falsely resolve.
+        assert_eq!(Package::for_chip_name("STM32C531CB"), None); // C package not compiled
+        assert_eq!(Package::for_chip_name("STM32C5A3RG"), None); // only Z compiled
+        assert_eq!(Package::for_chip_name("STM32F103RB"), None); // unsupported family
+        // The bridge resolves materially more of the catalog than exact match.
+        let resolved = crate::catalog::CATALOG
+            .iter()
+            .filter(|e| Package::for_chip_name(&e.name).is_some())
+            .count();
+        assert!(resolved >= 25, "bridge should resolve many catalog parts, got {resolved}");
+    }
 
     /// Every timer peripheral metapac reports — for every supported package —
     /// must classify from its register block. A `None` here means a block id

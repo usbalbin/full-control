@@ -106,9 +106,15 @@ pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) -> Option<Package> {
                     // Parts that are compiled in are clickable -> jump to them.
                     match Package::for_chip_name(&e.name) {
                         Some(pkg) => {
+                            // The descriptor is keyed on the package letter (pins
+                            // are flash-invariant), so a flash variant opens its
+                            // package's descriptor — name the target to be honest.
                             if ui
                                 .selectable_label(false, &e.name)
-                                .on_hover_text("Open this part (Inventory / Pin-AF)")
+                                .on_hover_text(format!(
+                                    "Open {} (Inventory / Pin-AF)",
+                                    pkg.display_label()
+                                ))
                                 .clicked()
                             {
                                 jump = Some(pkg);
