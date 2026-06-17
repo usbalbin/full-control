@@ -46,6 +46,13 @@ pub struct CatalogEntry {
     pub octospi: u8,
     pub has_sdmmc: bool,
     pub has_fmc: bool,
+    /// Total physical DMA channels across all controllers (DMA / GPDMA / BDMA /
+    /// MDMA / LPDMA), **deduplicated across cores** — dual-core parts list the
+    /// same controllers under each core, so a naive sum double-counts. This is
+    /// the Tier-1 capacity bound for "enough DMA streams" queries (a peripheral
+    /// stream consumes one channel; the binding DMA constraint is pool size).
+    #[serde(default)]
+    pub dma_pool_total: u16,
 }
 
 impl CatalogEntry {
@@ -84,6 +91,8 @@ pub struct SearchQuery {
     pub min_i3c: u8,
     pub min_ucpd: u8,
     pub min_octospi: u8,
+    /// Minimum total physical DMA channels (capacity across all controllers).
+    pub min_dma_channels: u16,
     pub require_usb: bool,
     pub require_hrtim: bool,
     pub require_sdmmc: bool,
@@ -110,6 +119,7 @@ impl SearchQuery {
             && e.i3c >= self.min_i3c
             && e.ucpd >= self.min_ucpd
             && e.octospi >= self.min_octospi
+            && e.dma_pool_total >= self.min_dma_channels
             && (!self.require_usb || e.has_usb)
             && (!self.require_hrtim || e.has_hrtim)
             && (!self.require_sdmmc || e.has_sdmmc)
@@ -180,6 +190,42 @@ mod tests {
             c5.iter().any(|e| e.dac >= 1 && e.comp >= 1 && e.tim_adv >= 1),
             "expected at least one C5 part with DAC + COMP + advanced timer"
         );
+    }
+
+    #[test]
+    fn dma_pool_total_deduped_and_filters() {
+        // Known supply counts (distinct controller channels).
+        let g4 = CATALOG
+            .iter()
+            .find(|e| e.name == "STM32G474RE")
+            .expect("STM32G474RE in catalog");
+        assert_eq!(g4.dma_pool_total, 16, "G474 = DMA1(8) + DMA2(8)");
+
+        // Dual-core dedup: H745 lists 40 channels under EACH core; the count
+        // must be the deduped ~40, never the naive 80 (the A2 bug).
+        if let Some(h745) = CATALOG.iter().find(|e| e.name.starts_with("STM32H745")) {
+            assert!(
+                h745.dma_pool_total <= 48,
+                "dual-core {} dma_pool_total={} — channels must be deduped across cores",
+                h745.name,
+                h745.dma_pool_total,
+            );
+            assert!(
+                h745.dma_pool_total >= 32,
+                "{} should still report its real channel count",
+                h745.name,
+            );
+        }
+
+        // Sanity: no part double-counts into an implausible channel count.
+        let max = CATALOG.iter().map(|e| e.dma_pool_total).max().unwrap_or(0);
+        assert!(max <= 64, "max dma_pool_total={max} looks like a dedup bug");
+
+        // Monotonic: a min_dma_channels bound only narrows, and every hit honors it.
+        let base = search(&SearchQuery::default()).len();
+        let bounded = search(&SearchQuery { min_dma_channels: 8, ..Default::default() });
+        assert!(bounded.len() <= base && !bounded.is_empty());
+        assert!(bounded.iter().all(|e| e.dma_pool_total >= 8));
     }
 
     #[test]

@@ -72,6 +72,19 @@ fn entry_from(v: &Value) -> Option<CatalogEntry> {
         }
     }
 
+    // Total physical DMA channels (supply side = core-level `dma_channels`),
+    // deduplicated across cores by channel name: dual-core parts list the same
+    // controllers under each core, so a naive sum double-counts (e.g. H745
+    // lists 40 channels per core → 80 naive, 40 real).
+    let mut dma_channels = BTreeSet::new();
+    for core in v["cores"].as_array().into_iter().flatten() {
+        for ch in core["dma_channels"].as_array().into_iter().flatten() {
+            if let Some(n) = ch["name"].as_str() {
+                dma_channels.insert(n.to_string());
+            }
+        }
+    }
+
     let tim_adv = ["TIM1", "TIM8", "TIM20"]
         .iter()
         .filter(|t| names.contains(**t))
@@ -101,6 +114,7 @@ fn entry_from(v: &Value) -> Option<CatalogEntry> {
         octospi: inst_count(&names, "OCTOSPI"),
         has_sdmmc: names.iter().any(|n| n.starts_with("SDMMC")),
         has_fmc: names.contains("FMC"),
+        dma_pool_total: dma_channels.len() as u16,
     })
 }
 

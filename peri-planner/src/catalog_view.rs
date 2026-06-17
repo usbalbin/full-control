@@ -49,6 +49,7 @@ pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) -> Option<Package> {
             num(ui, "Min UCPD", &mut q.min_ucpd);
             ui.end_row();
             num(ui, "Min OctoSPI", &mut q.min_octospi);
+            num(ui, "Min DMA ch", &mut q.min_dma_channels);
             ui.end_row();
         });
 
@@ -91,12 +92,12 @@ pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) -> Option<Package> {
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new("partfinder_results")
             .striped(true)
-            .num_columns(9)
+            .num_columns(10)
             .spacing([14.0, 2.0])
             .show(ui, |ui| {
                 for h in [
                     "Part", "Family", "Flash", "RAM", "UART", "CAN", "ADC/DAC/COMP",
-                    "TIM (adv)", "USB/HRTIM",
+                    "TIM (adv)", "USB/HRTIM", "DMA",
                 ] {
                     ui.strong(h);
                 }
@@ -129,6 +130,7 @@ pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) -> Option<Package> {
                         if e.has_usb { "Y" } else { "-" },
                         if e.has_hrtim { "Y" } else { "-" },
                     ));
+                    ui.label(e.dma_pool_total.to_string());
                     ui.end_row();
                 }
             });
