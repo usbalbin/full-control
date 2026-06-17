@@ -111,12 +111,24 @@ pub fn show(
         .show(ui, |ui| {
             ui.label(egui::RichText::new("Peripheral").weak());
             ui.label(egui::RichText::new("Count").weak());
-            ui.label(egui::RichText::new("RX+TX DMA").weak());
+            ui.label(egui::RichText::new("DMA").weak());
+            ui.label(egui::RichText::new("Options (extra pins)").weak());
             ui.end_row();
             for d in demands.iter_mut() {
                 ui.label(d.label());
                 ui.add(egui::DragValue::new(&mut d.count).range(0..=8).speed(0.1));
                 ui.checkbox(&mut d.with_dma, "");
+                // Optional signal groups (SPI chip-select, USB-PD dead-battery…):
+                // each adds its pins to the contention.
+                let opts = d.available_options();
+                ui.horizontal(|ui| {
+                    for &key in &opts {
+                        let mut on = d.has_option(key);
+                        if ui.checkbox(&mut on, key).changed() {
+                            d.set_option(key, on);
+                        }
+                    }
+                });
                 ui.end_row();
             }
         });

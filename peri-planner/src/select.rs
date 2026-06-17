@@ -25,6 +25,9 @@ pub struct Demand {
     pub kind: &'static str,
     pub count: u8,
     pub with_dma: bool,
+    /// Enabled optional signal groups (keys from `kind_options`), e.g.
+    /// "chip-select", "dead-battery" — add their pins to the contention.
+    pub options: Vec<&'static str>,
 }
 
 /// The metapac peripheral classes a logical kind can be satisfied by.
@@ -34,26 +37,56 @@ fn underlying_classes(kind: &str) -> &'static [&'static str] {
         "SPI" => &["SPI"],
         "I2C" => &["I2C"],
         "ADC" => &["ADC"],
+        "UCPD" => &["UCPD"],
         _ => &[],
     }
 }
 
-/// GPIO signals a kind needs routed to pins. ADC inputs are analog (not
-/// AF-pin-contended in this model), so ADC claims no pins.
-fn required_signals(kind: &str) -> &'static [&'static str] {
+/// The always-required GPIO signals for a kind (the minimal functional config).
+/// ADC inputs are analog (not AF-pin-contended), so ADC claims no pins.
+fn base_signals(kind: &str) -> &'static [&'static str] {
     match kind {
         "SERIAL" => &["TX", "RX"],
-        "SPI" => &["SCK", "MOSI", "MISO"],
+        "SPI" => &["SCK", "MOSI", "MISO"], // full-duplex
         "I2C" => &["SCL", "SDA"],
+        "UCPD" => &["CC1", "CC2"],
         _ => &[],
     }
+}
+
+/// Optional signal groups a kind can be configured with: `(option key, the extra
+/// pins it requires)`. Lets the user model real usage — SPI chip-select, serial
+/// flow control, USB-PD dead-battery — so pin contention reflects what's used.
+fn kind_options(kind: &str) -> &'static [(&'static str, &'static [&'static str])] {
+    match kind {
+        "SERIAL" => &[("flow control", &["CTS", "RTS"]), ("sync clock", &["CK"])],
+        "SPI" => &[("chip-select", &["NSS"])],
+        "I2C" => &[("SMBus alert", &["SMBA"])],
+        "UCPD" => &[
+            ("dead-battery", &["DBCC1", "DBCC2"]),
+            ("fast role swap", &["FRSTX1", "FRSTX2"]),
+        ],
+        _ => &[],
+    }
+}
+
+/// GPIO signals a kind needs given the enabled options: base + each enabled
+/// option's extra signals.
+fn required_signals(kind: &str, options: &[&str]) -> Vec<&'static str> {
+    let mut v: Vec<&'static str> = base_signals(kind).to_vec();
+    for (key, extra) in kind_options(kind) {
+        if options.contains(key) {
+            v.extend_from_slice(extra);
+        }
+    }
+    v
 }
 
 /// DMA channels one instance of the kind consumes when DMA is requested:
-/// RX+TX = 2 for serial/SPI/I2C, a single stream = 1 for ADC.
+/// RX+TX = 2 for serial/SPI/I2C/UCPD, a single stream = 1 for ADC.
 fn dma_channels_per_instance(kind: &str) -> usize {
     match kind {
-        "SERIAL" | "SPI" | "I2C" => 2,
+        "SERIAL" | "SPI" | "I2C" | "UCPD" => 2,
         "ADC" => 1,
         _ => 0,
     }
@@ -68,6 +101,7 @@ fn class_instances(d: &McuDescriptor, uclass: &str) -> Vec<u8> {
         "SPI" => d.comms.spi.clone(),
         "I2C" => d.comms.i2c.clone(),
         "FDCAN" => d.comms.fdcan.clone(),
+        "UCPD" => d.comms.ucpd.clone(),
         "ADC" => d.adcs.iter().map(|a| a.number).collect(),
         _ => Vec::new(),
     }
@@ -81,6 +115,7 @@ fn entry_kind_count(e: &CatalogEntry, kind: &str) -> u8 {
         "SPI" => e.spi,
         "I2C" => e.i2c,
         "ADC" => e.adc,
+        "UCPD" => e.ucpd,
         _ => 0,
     }
 }
@@ -143,15 +178,16 @@ fn instance_candidates(
         .collect()
 }
 
-/// All candidates for one requirement of `kind`: every instance of every
-/// underlying class (so a SERIAL demand can take a USART, UART or LPUART), each
-/// with its pin placements. The kernel picks distinct ones via `Inst` exclusivity.
-fn kind_candidates(d: &McuDescriptor, kind: &str) -> Vec<Candidate> {
-    let gpio = required_signals(kind);
+/// All candidates for one requirement of `kind` with `options`: every instance
+/// of every underlying class (so a SERIAL demand can take a USART, UART or
+/// LPUART), each with its pin placements for the configured signals. The kernel
+/// picks distinct ones via `Inst` exclusivity.
+fn kind_candidates(d: &McuDescriptor, kind: &str, options: &[&str]) -> Vec<Candidate> {
+    let gpio = required_signals(kind, options);
     let mut out = Vec::new();
     for &uc in underlying_classes(kind) {
         for n in class_instances(d, uc) {
-            out.extend(instance_candidates(d, uc, n, gpio));
+            out.extend(instance_candidates(d, uc, n, &gpio));
         }
     }
     out
@@ -207,7 +243,7 @@ pub fn solve(d: &McuDescriptor, demands: &[Demand]) -> Solution {
     let mut reqs: Vec<Requirement> = Vec::new();
     let mut id = 0u32;
     for dem in demands {
-        let cands = kind_candidates(d, dem.kind);
+        let cands = kind_candidates(d, dem.kind, &dem.options);
         for _ in 0..dem.count {
             id += 1;
             reqs.push(Requirement { id, candidates: cands.clone() });
@@ -277,27 +313,51 @@ pub enum Verdict {
     BoundsOnly,
 }
 
-/// A per-kind demand row for the UI: count + whether each needs DMA.
+/// A per-kind demand row for the UI: count, DMA, and enabled optional signal
+/// groups (e.g. SPI chip-select, USB-PD dead-battery).
 #[derive(Clone, Debug, PartialEq)]
 pub struct DemandInput {
     pub kind: &'static str,
     pub count: u8,
     pub with_dma: bool,
+    pub options: Vec<&'static str>,
 }
 
 impl DemandInput {
     pub fn new(kind: &'static str) -> Self {
-        Self { kind, count: 0, with_dma: false }
+        Self { kind, count: 0, with_dma: false, options: Vec::new() }
     }
     /// Human label for the row.
     pub fn label(&self) -> &'static str {
         match self.kind {
             "SERIAL" => "UART / USART",
+            "UCPD" => "USB-PD (UCPD)",
             other => other,
         }
     }
+    /// The optional signal-group keys this kind offers (for UI toggles).
+    pub fn available_options(&self) -> Vec<&'static str> {
+        kind_options(self.kind).iter().map(|(k, _)| *k).collect()
+    }
+    /// Toggle an optional signal group on/off.
+    pub fn set_option(&mut self, key: &'static str, on: bool) {
+        let has = self.options.contains(&key);
+        if on && !has {
+            self.options.push(key);
+        } else if !on && has {
+            self.options.retain(|k| *k != key);
+        }
+    }
+    pub fn has_option(&self, key: &str) -> bool {
+        self.options.iter().any(|k| *k == key)
+    }
     pub fn to_demand(&self) -> Demand {
-        Demand { kind: self.kind, count: self.count, with_dma: self.with_dma }
+        Demand {
+            kind: self.kind,
+            count: self.count,
+            with_dma: self.with_dma,
+            options: self.options.clone(),
+        }
     }
 }
 
@@ -314,7 +374,7 @@ pub fn total_channel_demand(demands: &[Demand]) -> usize {
 pub fn pin_demand(demands: &[Demand]) -> usize {
     demands
         .iter()
-        .map(|dem| dem.count as usize * required_signals(dem.kind).len())
+        .map(|dem| dem.count as usize * required_signals(dem.kind, &dem.options).len())
         .sum()
 }
 
@@ -382,7 +442,7 @@ mod tests {
         // 3 USARTs each with RX+TX DMA: G474 has 3 USART instances and 16 DMA
         // channels (6 needed), so all three get a non-conflicting allocation.
         let d = Package::G474R.descriptor();
-        let s = solve(d, &[Demand { kind: "SERIAL", count: 3, with_dma: true }]);
+        let s = solve(d, &[Demand { kind: "SERIAL", count: 3, with_dma: true, options: vec![] }]);
         assert!(s.is_feasible(), "expected feasible, unmet={:?}", s.unmet);
         assert!(!s.indeterminate);
         // 3 instance+pin requirements (channels are a capacity count, not in CSP).
@@ -398,8 +458,8 @@ mod tests {
         let s = solve(
             d,
             &[
-                Demand { kind: "SERIAL", count: 3, with_dma: true },
-                Demand { kind: "SPI", count: 2, with_dma: true },
+                Demand { kind: "SERIAL", count: 3, with_dma: true, options: vec![] },
+                Demand { kind: "SPI", count: 2, with_dma: true, options: vec![] },
             ],
         );
         assert!(s.is_feasible() && !s.indeterminate, "unmet={:?}", s.unmet);
@@ -415,9 +475,9 @@ mod tests {
         let s = solve(
             d,
             &[
-                Demand { kind: "SERIAL", count: 3, with_dma: true },
-                Demand { kind: "SPI", count: 3, with_dma: true },
-                Demand { kind: "I2C", count: 3, with_dma: true },
+                Demand { kind: "SERIAL", count: 3, with_dma: true, options: vec![] },
+                Demand { kind: "SPI", count: 3, with_dma: true, options: vec![] },
+                Demand { kind: "I2C", count: 3, with_dma: true, options: vec![] },
             ],
         );
         assert!(!s.is_feasible(), "18 RxTx channels should exceed 16");
@@ -429,13 +489,13 @@ mod tests {
         // SPI needs SCK/MOSI/MISO pins placed; an instance-only demand must
         // resolve all three on distinct pins.
         let d = Package::G474R.descriptor();
-        let s = solve(d, &[Demand { kind: "SPI", count: 2, with_dma: false }]);
+        let s = solve(d, &[Demand { kind: "SPI", count: 2, with_dma: false, options: vec![] }]);
         assert!(s.is_feasible(), "unmet={:?}", s.unmet);
     }
 
     #[test]
     fn evaluate_verifies_across_the_lineup() {
-        let demands = [Demand { kind: "SERIAL", count: 3, with_dma: true }];
+        let demands = [Demand { kind: "SERIAL", count: 3, with_dma: true, options: vec![] }];
         let results = evaluate(&SearchQuery::default(), &demands);
         // G474RE has a lineup descriptor with DMA -> provably Verified.
         let g4 = results.iter().find(|(e, _)| e.name == "STM32G474RE").expect("G474RE");
@@ -451,7 +511,7 @@ mod tests {
         // (metapac omits it). So C531 — which Tier-1 already knew has 8 LPDMA
         // channels — now Tier-2-VERIFIES instead of falling to BoundsOnly. This
         // is the C5 DMA gap closing end-to-end.
-        let demands = [Demand { kind: "SERIAL", count: 1, with_dma: true }];
+        let demands = [Demand { kind: "SERIAL", count: 1, with_dma: true, options: vec![] }];
         let results = evaluate(&SearchQuery::default(), &demands);
         let c531: Vec<_> = results.iter().filter(|(e, _)| e.name.starts_with("STM32C531R")).collect();
         assert!(!c531.is_empty(), "C531R should survive Tier-1");
@@ -477,8 +537,8 @@ mod tests {
         // (< 20 AF-capable GPIO) are pruned at Tier-1 even if they list the
         // peripherals — the "not enough pins to use them together" case.
         let demands = [
-            Demand { kind: "SPI", count: 4, with_dma: false },
-            Demand { kind: "SERIAL", count: 4, with_dma: false },
+            Demand { kind: "SPI", count: 4, with_dma: false, options: vec![] },
+            Demand { kind: "SERIAL", count: 4, with_dma: false, options: vec![] },
         ];
         assert_eq!(pin_demand(&demands), 20);
         let results = evaluate(&SearchQuery::default(), &demands);
@@ -495,9 +555,9 @@ mod tests {
         // 18 RX+TX channels: G474 (16) is pruned by the Tier-1 capacity bound;
         // every survivor has >= 18 channels.
         let demands = [
-            Demand { kind: "SERIAL", count: 3, with_dma: true },
-            Demand { kind: "SPI", count: 3, with_dma: true },
-            Demand { kind: "I2C", count: 3, with_dma: true },
+            Demand { kind: "SERIAL", count: 3, with_dma: true, options: vec![] },
+            Demand { kind: "SPI", count: 3, with_dma: true, options: vec![] },
+            Demand { kind: "I2C", count: 3, with_dma: true, options: vec![] },
         ];
         let results = evaluate(&SearchQuery::default(), &demands);
         assert!(results.iter().all(|(e, _)| e.dma_pool_total >= 18));
@@ -509,7 +569,7 @@ mod tests {
         // G474 has 6 async-serial instances (USART1-3 + UART4/5 + LPUART1) — a
         // 7th can't be allocated.
         let d = Package::G474R.descriptor();
-        let s = solve(d, &[Demand { kind: "SERIAL", count: 7, with_dma: true }]);
+        let s = solve(d, &[Demand { kind: "SERIAL", count: 7, with_dma: true, options: vec![] }]);
         assert!(!s.is_feasible());
     }
 
@@ -518,7 +578,7 @@ mod tests {
         // C531 has no UART instances, only USARTs — a SERIAL demand is still
         // satisfiable because USART is a superset of UART.
         let d = Package::C531R.descriptor();
-        let s = solve(d, &[Demand { kind: "SERIAL", count: 2, with_dma: false }]);
+        let s = solve(d, &[Demand { kind: "SERIAL", count: 2, with_dma: false, options: vec![] }]);
         assert!(s.is_feasible(), "USART should satisfy a serial demand; unmet={:?}", s.unmet);
     }
 
@@ -527,8 +587,32 @@ mod tests {
         // ADC is demandable with a single-stream DMA channel. G474 has 5 ADCs +
         // DMA capacity; 2 ADCs with DMA = 2 channels <= 16.
         let d = Package::G474R.descriptor();
-        let s = solve(d, &[Demand { kind: "ADC", count: 2, with_dma: true }]);
+        let s = solve(d, &[Demand { kind: "ADC", count: 2, with_dma: true, options: vec![] }]);
         assert!(s.is_feasible() && !s.indeterminate, "unmet={:?}", s.unmet);
+    }
+
+    #[test]
+    fn options_add_required_pins() {
+        // SPI full-duplex = 3 pins (SCK/MOSI/MISO); + chip-select = 4 (NSS).
+        let base = [Demand { kind: "SPI", count: 1, with_dma: false, options: vec![] }];
+        let cs = [Demand { kind: "SPI", count: 1, with_dma: false, options: vec!["chip-select"] }];
+        assert_eq!(pin_demand(&base), 3);
+        assert_eq!(pin_demand(&cs), 4);
+        // USB-PD: CC1/CC2 = 2 pins; + dead-battery adds DBCC1/DBCC2 = 4.
+        let pd = [Demand { kind: "UCPD", count: 1, with_dma: false, options: vec!["dead-battery"] }];
+        assert_eq!(pin_demand(&pd), 4);
+    }
+
+    #[test]
+    fn ucpd_dead_battery_places_dbcc_pins() {
+        // A USB-PD demand with dead-battery must place CC1/CC2 AND DBCC1/DBCC2.
+        // Use the lineup asset descriptor (it carries the DBCC pins).
+        let d = crate::desc_asset::descriptor_for("STM32G474RE").expect("G474 in asset");
+        let s = solve(
+            d,
+            &[Demand { kind: "UCPD", count: 1, with_dma: false, options: vec!["dead-battery"] }],
+        );
+        assert!(s.is_feasible(), "UCPD + dead-battery should place on G474; unmet={:?}", s.unmet);
     }
 
     #[test]
@@ -537,7 +621,7 @@ mod tests {
         // channel candidates -> infeasible. Documents the data-currency gap
         // (resolves on a metapac refresh); the catalog already knows C531 has 8.
         let d = Package::C531R.descriptor();
-        let s = solve(d, &[Demand { kind: "SERIAL", count: 1, with_dma: true }]);
+        let s = solve(d, &[Demand { kind: "SERIAL", count: 1, with_dma: true, options: vec![] }]);
         assert!(!s.is_feasible());
     }
 }
