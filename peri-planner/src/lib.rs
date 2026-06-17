@@ -21,6 +21,7 @@ pub mod package_view;
 pub mod picker;
 pub mod pinout;
 pub mod requirements;
+pub mod select;
 pub mod solver;
 pub mod timers_view;
 pub mod waveform_view;
