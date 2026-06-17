@@ -12,8 +12,9 @@
 
 use std::collections::BTreeSet;
 
+use crate::catalog::{self, CatalogEntry, SearchQuery};
 use crate::constraint::{assign_backtracking, Candidate, Requirement, Res, Solution};
-use crate::mcu::McuDescriptor;
+use crate::mcu::{McuDescriptor, Package};
 use crate::mcu_pinout::{pins_for, PinId, SignalId};
 
 /// What DMA a peripheral instance needs.
@@ -202,10 +203,96 @@ pub fn solve(d: &McuDescriptor, demands: &[Demand]) -> Solution {
     sol
 }
 
+// ---------- Two-tier catalog evaluation ----------
+
+/// A two-tier verdict for a catalog part against a demand set.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Tier-2 backtracking solve on a real descriptor found a feasible
+    /// allocation — the part provably satisfies the demands.
+    Verified,
+    /// Tier-2 proved no allocation exists — the part cannot satisfy them.
+    Infeasible,
+    /// Tier-1 passed but Tier-2 could not verify: no compiled descriptor for the
+    /// part, the search was budget-cut, OR the descriptor is missing data the
+    /// part actually has (e.g. C5 DMA absent from metapac while the catalog has
+    /// it). NOT a pass and NOT a rejection — "plausible, unverified".
+    BoundsOnly,
+}
+
+/// A per-class demand row for the UI: count + whether it needs RX/TX DMA.
+#[derive(Clone, Debug)]
+pub struct DemandInput {
+    pub class: &'static str,
+    pub count: u8,
+    pub with_dma: bool,
+}
+
+impl DemandInput {
+    pub fn new(class: &'static str) -> Self {
+        Self { class, count: 0, with_dma: false }
+    }
+    pub fn to_demand(&self) -> Demand {
+        Demand {
+            class: self.class,
+            count: self.count,
+            dma: if self.with_dma { Dma::RxTx } else { Dma::None },
+        }
+    }
+}
+
+/// Total DMA channels a demand set needs — the Tier-1 capacity lower bound.
+pub fn total_channel_demand(demands: &[Demand]) -> usize {
+    channel_demand(demands)
+}
+
+/// Two-tier evaluation of the catalog against `demands`, narrowed by `base`.
+///
+/// Tier-1: the base query AND a derived DMA-capacity necessary bound prune the
+/// ~1600 parts with cheap integer compares (sound — never drops a feasible
+/// part). Tier-2: for each survivor with a bridge-reachable descriptor, run the
+/// backtracking solve. Parts whose descriptor can't verify — none compiled, the
+/// search budget-cut, or descriptor data missing that the catalog has — are
+/// honestly labeled `BoundsOnly` rather than rejected.
+pub fn evaluate(base: &SearchQuery, demands: &[Demand]) -> Vec<(&'static CatalogEntry, Verdict)> {
+    let dma_demand = channel_demand(demands);
+    let needs_dma = dma_demand > 0;
+
+    // Tier-1: fold the DMA-capacity necessary bound into the query.
+    let mut q = base.clone();
+    q.min_dma_channels = q.min_dma_channels.max(dma_demand as u16);
+
+    catalog::search(&q)
+        .into_iter()
+        .map(|e| {
+            let verdict = match Package::for_chip_name(&e.name) {
+                None => Verdict::BoundsOnly, // no descriptor to verify against
+                Some(pkg) => {
+                    let d = pkg.descriptor();
+                    if needs_dma && d.dma_channel_total() == 0 && e.dma_pool_total > 0 {
+                        // Descriptor lacks DMA data the catalog knows the part has
+                        // (metapac C5 gap) — can't verify, must not reject.
+                        Verdict::BoundsOnly
+                    } else {
+                        let sol = solve(d, demands);
+                        if sol.indeterminate {
+                            Verdict::BoundsOnly
+                        } else if sol.is_feasible() {
+                            Verdict::Verified
+                        } else {
+                            Verdict::Infeasible
+                        }
+                    }
+                }
+            };
+            (e, verdict)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcu::Package;
 
     #[test]
     fn usart_rxtx_allocates_on_g474() {
@@ -261,6 +348,47 @@ mod tests {
         let d = Package::G474R.descriptor();
         let s = solve(d, &[Demand { class: "SPI", count: 2, dma: Dma::None }]);
         assert!(s.is_feasible(), "unmet={:?}", s.unmet);
+    }
+
+    #[test]
+    fn evaluate_labels_verified_and_bounds_only() {
+        let demands = [Demand { class: "USART", count: 3, dma: Dma::RxTx }];
+        let results = evaluate(&SearchQuery::default(), &demands);
+        // G474RE is bridge-reachable with full DMA data -> provably Verified.
+        let g4 = results.iter().find(|(e, _)| e.name == "STM32G474RE").expect("G474RE");
+        assert_eq!(g4.1, Verdict::Verified);
+        // Some surviving part has no compiled descriptor -> BoundsOnly, not dropped.
+        assert!(results.iter().any(|(_, v)| *v == Verdict::BoundsOnly));
+    }
+
+    #[test]
+    fn evaluate_c531_dma_is_bounds_only_not_infeasible() {
+        // C531 is bridge-reachable and Tier-1 says it has 8 DMA channels, but its
+        // descriptor's DMA is empty (metapac C5 gap). The honest verdict is
+        // BoundsOnly — NOT a false Infeasible that would drop a capable part.
+        let demands = [Demand { class: "USART", count: 1, dma: Dma::RxTx }];
+        let results = evaluate(&SearchQuery::default(), &demands);
+        let c531: Vec<_> = results.iter().filter(|(e, _)| e.name.starts_with("STM32C531R")).collect();
+        assert!(!c531.is_empty(), "C531R should survive Tier-1 (8 DMA channels)");
+        assert!(
+            c531.iter().all(|(_, v)| *v == Verdict::BoundsOnly),
+            "C531 DMA must be BoundsOnly, got {:?}",
+            c531.iter().map(|(e, v)| (&e.name, v)).collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn evaluate_dma_capacity_bound_prunes_at_tier1() {
+        // 18 RX+TX channels: G474 (16) is pruned by the Tier-1 capacity bound;
+        // every survivor has >= 18 channels.
+        let demands = [
+            Demand { class: "USART", count: 3, dma: Dma::RxTx },
+            Demand { class: "SPI", count: 3, dma: Dma::RxTx },
+            Demand { class: "I2C", count: 3, dma: Dma::RxTx },
+        ];
+        let results = evaluate(&SearchQuery::default(), &demands);
+        assert!(results.iter().all(|(e, _)| e.dma_pool_total >= 18));
+        assert!(!results.iter().any(|(e, _)| e.name == "STM32G474RE"), "G474 (16ch) pruned");
     }
 
     #[test]

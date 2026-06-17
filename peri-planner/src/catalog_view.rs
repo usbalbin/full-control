@@ -6,11 +6,18 @@
 
 use crate::catalog::{self, SearchQuery};
 use crate::mcu::Package;
+use crate::select::{self, Verdict};
 use eframe::egui;
 
-/// Renders the part finder. Returns the package to jump to if the user clicked
-/// a result that maps to a compiled-in part.
-pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) -> Option<Package> {
+/// Renders the part finder. `demands` are the per-class constraint rows whose
+/// allocation is verified against each bridge-reachable part (Tier-2). Returns
+/// the package to jump to if the user clicked a result that maps to a
+/// compiled-in part.
+pub fn show(
+    ui: &mut egui::Ui,
+    q: &mut SearchQuery,
+    demands: &mut [select::DemandInput],
+) -> Option<Package> {
     let mut jump = None;
     ui.heading("Part finder");
     ui.label(format!(
@@ -82,31 +89,86 @@ pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) -> Option<Package> {
             });
         if ui.button("Reset").clicked() {
             *q = SearchQuery::default();
+            for d in demands.iter_mut() {
+                d.count = 0;
+                d.with_dma = false;
+            }
         }
     });
 
+    // Constraints to verify: per-class instance count + RX/TX DMA. When any are
+    // set, each bridge-reachable result is solved (Tier-2) for a real allocation
+    // and tagged verified / infeasible / bounds-only.
     ui.separator();
-    let results = catalog::search(q);
-    ui.label(format!(
-        "{} matching parts — fully-supported parts are clickable (open in Inventory / Pin-AF).",
-        results.len()
-    ));
+    ui.label(
+        egui::RichText::new("Verify allocation (Tier-2): instances + pins + DMA channels")
+            .strong(),
+    );
+    egui::Grid::new("partfinder_demands")
+        .num_columns(4)
+        .spacing([14.0, 4.0])
+        .show(ui, |ui| {
+            ui.label(egui::RichText::new("Peripheral").weak());
+            ui.label(egui::RichText::new("Count").weak());
+            ui.label(egui::RichText::new("RX+TX DMA").weak());
+            ui.end_row();
+            for d in demands.iter_mut() {
+                ui.label(d.class);
+                ui.add(egui::DragValue::new(&mut d.count).range(0..=8).speed(0.1));
+                ui.checkbox(&mut d.with_dma, "");
+                ui.end_row();
+            }
+        });
+
+    let active: Vec<select::Demand> = demands
+        .iter()
+        .filter(|d| d.count > 0)
+        .map(|d| d.to_demand())
+        .collect();
+
+    ui.separator();
+    // Either a plain search, or the two-tier evaluation with per-part verdicts.
+    let results: Vec<(&'static catalog::CatalogEntry, Option<Verdict>)> = if active.is_empty() {
+        catalog::search(q).into_iter().map(|e| (e, None)).collect()
+    } else {
+        select::evaluate(q, &active)
+            .into_iter()
+            .map(|(e, v)| (e, Some(v)))
+            .collect()
+    };
+    if active.is_empty() {
+        ui.label(format!(
+            "{} matching parts — fully-supported parts are clickable (open in Inventory / Pin-AF).",
+            results.len()
+        ));
+    } else {
+        let verified = results.iter().filter(|(_, v)| *v == Some(Verdict::Verified)).count();
+        let bounds = results.iter().filter(|(_, v)| *v == Some(Verdict::BoundsOnly)).count();
+        ui.label(format!(
+            "{} parts pass Tier-1 — {} allocation-verified, {} bounds-only (unverified), \
+             rest infeasible. DMA demand: {} channels.",
+            results.len(),
+            verified,
+            bounds,
+            select::total_channel_demand(&active),
+        ));
+    }
 
     const CAP: usize = 400;
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new("partfinder_results")
             .striped(true)
-            .num_columns(10)
+            .num_columns(11)
             .spacing([14.0, 2.0])
             .show(ui, |ui| {
                 for h in [
                     "Part", "Family", "Flash", "RAM", "UART", "CAN", "ADC/DAC/COMP",
-                    "TIM (adv)", "USB/HRTIM", "DMA",
+                    "TIM (adv)", "USB/HRTIM", "DMA", "Verify",
                 ] {
                     ui.strong(h);
                 }
                 ui.end_row();
-                for e in results.iter().take(CAP) {
+                for (e, verdict) in results.iter().take(CAP) {
                     // Parts that are compiled in are clickable -> jump to them.
                     match Package::for_chip_name(&e.name) {
                         Some(pkg) => {
@@ -141,6 +203,25 @@ pub fn show(ui: &mut egui::Ui, q: &mut SearchQuery) -> Option<Package> {
                         if e.has_hrtim { "Y" } else { "-" },
                     ));
                     ui.label(e.dma_pool_total.to_string());
+                    match verdict {
+                        None => {
+                            ui.label("");
+                        }
+                        Some(Verdict::Verified) => {
+                            ui.colored_label(egui::Color32::from_rgb(100, 200, 120), "✓ verified");
+                        }
+                        Some(Verdict::Infeasible) => {
+                            ui.colored_label(egui::Color32::from_rgb(220, 100, 100), "✗");
+                        }
+                        Some(Verdict::BoundsOnly) => {
+                            ui.colored_label(egui::Color32::from_rgb(210, 180, 80), "? bounds-only")
+                                .on_hover_text(
+                                    "Passes the count bounds but no full-allocation proof \
+                                     (no compiled descriptor, or descriptor missing data the \
+                                     part has, e.g. C5 DMA).",
+                                );
+                        }
+                    }
                     ui.end_row();
                 }
             });

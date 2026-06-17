@@ -53,6 +53,8 @@ pub struct PeriPlannerApp {
     af_filter: crate::af_view::AfFilter,
     /// Part-finder query state (whole-lineup catalog search). Ephemeral.
     catalog_query: crate::catalog::SearchQuery,
+    /// Part-finder constraint rows (verified per-part via Tier-2 solve). Ephemeral.
+    catalog_demands: Vec<crate::select::DemandInput>,
     /// A part clicked in the Part finder, applied at the start of the next
     /// frame (deferred to avoid switching chips mid-render). Ephemeral.
     pending_select: Option<Package>,
@@ -73,6 +75,10 @@ impl Default for PeriPlannerApp {
             picked: None,
             af_filter: Default::default(),
             catalog_query: Default::default(),
+            catalog_demands: ["USART", "UART", "SPI", "I2C"]
+                .into_iter()
+                .map(crate::select::DemandInput::new)
+                .collect(),
             pending_select: None,
         }
     }
@@ -351,6 +357,7 @@ impl eframe::App for PeriPlannerApp {
             let h523 = &mut self.h523_design;
             let c531 = &self.c531_design;
             let catalog_query = &mut self.catalog_query;
+            let catalog_demands = &mut self.catalog_demands;
             let mut jump = None;
             let mut conv_action: Option<ConverterAction> = None;
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -359,7 +366,7 @@ impl eframe::App for PeriPlannerApp {
                         crate::af_view::show(ui, descriptor.raw, af_filter, Some(h523));
                     }
                     ViewMode::Catalog => {
-                        jump = crate::catalog_view::show(ui, catalog_query);
+                        jump = crate::catalog_view::show(ui, catalog_query, catalog_demands);
                     }
                     ViewMode::Converter if package.mcu() == Mcu::C531 => {
                         conv_action = crate::c531_view::show(ui, c531, package);
@@ -1079,7 +1086,8 @@ impl eframe::App for PeriPlannerApp {
                     crate::inventory_view::show(ui, self.package.descriptor());
                 }
                 ViewMode::Catalog => {
-                    self.pending_select = crate::catalog_view::show(ui, &mut self.catalog_query);
+                    self.pending_select =
+                        crate::catalog_view::show(ui, &mut self.catalog_query, &mut self.catalog_demands);
                 }
                 ViewMode::AfTable => {
                     // G474 path doesn't expose the lock UI yet — pin
