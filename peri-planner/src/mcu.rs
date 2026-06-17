@@ -474,6 +474,15 @@ fn build_descriptor(pkg: Package) -> McuDescriptor {
     d
 }
 
+/// An inventory + DMA descriptor for an arbitrary part's raw data — no analog
+/// fabric. Used by the constraint selector to verify (Tier-2) the whole lineup
+/// from the runtime descriptor asset, where parts have no compiled `Package`.
+/// The `mcu`/`package` fields are placeholders (the selector reads neither —
+/// only `comms`/`timers`/`adcs` instances, `raw` for pins, and `dma_pools`).
+pub fn build_asset_descriptor(raw: &'static RawMcuData) -> McuDescriptor {
+    build_inventory(Mcu::G474, Package::G474R, raw)
+}
+
 fn build_inventory(mcu: Mcu, package: Package, raw: &'static RawMcuData) -> McuDescriptor {
     let mut d = McuDescriptor {
         mcu, package,

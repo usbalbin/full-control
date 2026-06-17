@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{self, CatalogEntry, SearchQuery};
 use crate::constraint::{assign_backtracking, Candidate, Requirement, Res, Solution};
-use crate::mcu::{McuDescriptor, Package};
+use crate::mcu::McuDescriptor;
 use crate::mcu_pinout::{pins_for, PinId, SignalId};
 
 /// What DMA a peripheral instance needs.
@@ -298,6 +298,7 @@ pub fn evaluate(base: &SearchQuery, demands: &[Demand]) -> Vec<(&'static Catalog
     q.min_dma_channels = q.min_dma_channels.max(dma_demand as u16);
     q.min_gpio_pins = q.min_gpio_pins.max(pin_demand(demands) as u16);
 
+    let _ = needs_dma; // (kept for readability of the bound above)
     catalog::search(&q)
         .into_iter()
         .map(|e| {
@@ -305,23 +306,18 @@ pub fn evaluate(base: &SearchQuery, demands: &[Demand]) -> Vec<(&'static Catalog
             if class_demand.iter().any(|(&cls, &n)| entry_class_count(e, cls) < n) {
                 return (e, Verdict::Infeasible);
             }
-            let verdict = match Package::for_chip_name(&e.name) {
-                None => Verdict::BoundsOnly, // no descriptor to verify against
-                Some(pkg) => {
-                    let d = pkg.descriptor();
-                    if needs_dma && d.dma_channel_total() == 0 && e.dma_pool_total > 0 {
-                        // Descriptor lacks DMA data the catalog knows the part has
-                        // (metapac C5 gap) — can't verify, must not reject.
+            // Tier-2: solve against the part's descriptor from the whole-lineup
+            // asset (covers every part, and carries C5 DMA that metapac omits).
+            let verdict = match crate::desc_asset::descriptor_for(&e.name) {
+                None => Verdict::BoundsOnly, // asset somehow lacks this prefix
+                Some(d) => {
+                    let sol = solve(d, demands);
+                    if sol.indeterminate {
                         Verdict::BoundsOnly
+                    } else if sol.is_feasible() {
+                        Verdict::Verified
                     } else {
-                        let sol = solve(d, demands);
-                        if sol.indeterminate {
-                            Verdict::BoundsOnly
-                        } else if sol.is_feasible() {
-                            Verdict::Verified
-                        } else {
-                            Verdict::Infeasible
-                        }
+                        Verdict::Infeasible
                     }
                 }
             };
@@ -333,6 +329,7 @@ pub fn evaluate(base: &SearchQuery, demands: &[Demand]) -> Vec<(&'static Catalog
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcu::Package;
 
     #[test]
     fn usart_rxtx_allocates_on_g474() {
@@ -391,30 +388,41 @@ mod tests {
     }
 
     #[test]
-    fn evaluate_labels_verified_and_bounds_only() {
+    fn evaluate_verifies_across_the_lineup() {
         let demands = [Demand { class: "USART", count: 3, dma: Dma::RxTx }];
         let results = evaluate(&SearchQuery::default(), &demands);
-        // G474RE is bridge-reachable with full DMA data -> provably Verified.
+        // G474RE has a lineup descriptor with DMA -> provably Verified.
         let g4 = results.iter().find(|(e, _)| e.name == "STM32G474RE").expect("G474RE");
         assert_eq!(g4.1, Verdict::Verified);
-        // Some surviving part has no compiled descriptor -> BoundsOnly, not dropped.
-        assert!(results.iter().any(|(_, v)| *v == Verdict::BoundsOnly));
+        // The asset covers every part, so verdicts are real (Verified/Infeasible),
+        // not "no descriptor" — and many parts are genuinely Verified.
+        assert!(results.iter().filter(|(_, v)| *v == Verdict::Verified).count() > 10);
     }
 
     #[test]
-    fn evaluate_c531_dma_is_bounds_only_not_infeasible() {
-        // C531 is bridge-reachable and Tier-1 says it has 8 DMA channels, but its
-        // descriptor's DMA is empty (metapac C5 gap). The honest verdict is
-        // BoundsOnly — NOT a false Infeasible that would drop a capable part.
+    fn evaluate_c531_dma_now_verified_via_asset() {
+        // The whole-lineup asset is generated from chip JSON, which HAS C5 DMA
+        // (metapac omits it). So C531 — which Tier-1 already knew has 8 LPDMA
+        // channels — now Tier-2-VERIFIES instead of falling to BoundsOnly. This
+        // is the C5 DMA gap closing end-to-end.
         let demands = [Demand { class: "USART", count: 1, dma: Dma::RxTx }];
         let results = evaluate(&SearchQuery::default(), &demands);
         let c531: Vec<_> = results.iter().filter(|(e, _)| e.name.starts_with("STM32C531R")).collect();
-        assert!(!c531.is_empty(), "C531R should survive Tier-1 (8 DMA channels)");
+        assert!(!c531.is_empty(), "C531R should survive Tier-1");
         assert!(
-            c531.iter().all(|(_, v)| *v == Verdict::BoundsOnly),
-            "C531 DMA must be BoundsOnly, got {:?}",
+            c531.iter().all(|(_, v)| *v == Verdict::Verified),
+            "C531 should now be Verified (asset has C5 DMA), got {:?}",
             c531.iter().map(|(e, v)| (&e.name, v)).collect::<Vec<_>>(),
         );
+    }
+
+    #[test]
+    fn lineup_descriptor_asset_loads() {
+        // Sanity: the embedded gzipped asset inflates + parses, covering the
+        // whole lineup (~870 package-letter descriptors).
+        assert!(crate::desc_asset::descriptor_count() > 500);
+        let d = crate::desc_asset::descriptor_for("STM32C531RC").expect("C531 in asset");
+        assert!(d.dma_channel_total() >= 8, "C531 asset descriptor carries LPDMA channels");
     }
 
     #[test]

@@ -185,12 +185,15 @@ fn backtrack(
     }
     let req = &reqs[order[pos]];
     for (idx, cand) in req.candidates.iter().enumerate() {
-        if !cand.fits(used) {
-            continue;
-        }
+        // Count every candidate EXAMINED (not just placed) toward the budget, so
+        // the bound caps the real work — the `fits` scans that dominate when a
+        // level has many candidates — and the cutoff stays sub-second.
         *nodes += 1;
         if *nodes > budget {
             return Search::BudgetExhausted;
+        }
+        if !cand.fits(used) {
+            continue;
         }
         for &t in &cand.tokens {
             used.insert(t);
