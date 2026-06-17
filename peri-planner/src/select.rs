@@ -116,6 +116,10 @@ fn entry_kind_count(e: &CatalogEntry, kind: &str) -> u8 {
         "I2C" => e.i2c,
         "ADC" => e.adc,
         "UCPD" => e.ucpd,
+        // Each OCP route needs a distinct comparator — a sound, cheap necessary
+        // bound. The break-timer side (and the COMP→break edge) is the Tier-2
+        // check, since the catalog has no break-capable-timer count column.
+        "OCP" => e.comp,
         _ => 0,
     }
 }
@@ -152,25 +156,28 @@ fn pin_combos(d: &McuDescriptor, peri: &'static str, roles: &[&'static str]) -> 
     combos
 }
 
-/// One peripheral in a feasible allocation: the chosen instance, each signal's
-/// assigned pin, and how many DMA channels it consumes. The actionable answer a
+/// One allocated element in a feasible design — the actionable answer a
 /// `Verified` part owes the user (what to wire).
 #[derive(Clone, Debug)]
-pub struct AssignedPeri {
-    pub peri: &'static str,
-    pub pins: Vec<(&'static str, PinId)>,
-    pub dma_channels: u8,
+pub enum AssignedPeri {
+    /// A comms / ADC peripheral: the chosen instance, each signal's assigned
+    /// pin, and how many DMA channels it consumes.
+    Instance { peri: &'static str, pins: Vec<(&'static str, PinId)>, dma_channels: u8 },
+    /// A hardware over-current route: a comparator output trips a timer break
+    /// input. Internal silicon routing — claims no pins and no DMA. `break_input`
+    /// names the specific BRK (1) / BRK2 (2) input when a fabric edge pins it
+    /// down, else `None` (the universal break-mux assumption; see `ocp_candidates`).
+    Ocp { comp: &'static str, timer: &'static str, break_input: Option<u8> },
 }
 
 /// A full allocation witness for a feasible design.
 pub type Witness = Vec<AssignedPeri>;
 
-/// A candidate paired with the `(peri, role→pin)` it represents, so the witness
-/// can name what the kernel chose.
+/// A kernel candidate paired with the witness element it yields if the kernel
+/// picks it, so a solved assignment can be turned back into a named witness.
 struct CandMeta {
     candidate: Candidate,
-    peri: &'static str,
-    pins: Vec<(&'static str, PinId)>,
+    assigned: AssignedPeri,
 }
 
 /// Candidate allocations for one peripheral instance: one per pin placement,
@@ -183,6 +190,7 @@ fn instance_candidates(
     uclass: &'static str,
     n: u8,
     gpio: &[&'static str],
+    dma: u8,
 ) -> Vec<CandMeta> {
     let Some(peri) = peri_name(d, uclass, n) else {
         return Vec::new();
@@ -196,21 +204,69 @@ fn instance_candidates(
             let mut tokens = Vec::with_capacity(1 + pins.len());
             tokens.push(inst);
             tokens.extend(pins.iter().map(|&p| Res::Pin(p)));
-            CandMeta { candidate: Candidate::new(peri, tokens), peri, pins: role_pins }
+            CandMeta {
+                candidate: Candidate::new(peri, tokens),
+                assigned: AssignedPeri::Instance { peri, pins: role_pins, dma_channels: dma },
+            }
         })
         .collect()
 }
 
-/// All candidates for one requirement of `kind` with `options`: every instance
-/// of every underlying class (so a SERIAL demand can take a USART, UART or
-/// LPUART), each with its pin placements for the configured signals. The kernel
-/// picks distinct ones via `Inst` exclusivity.
-fn kind_candidates(d: &McuDescriptor, kind: &str, options: &[&str]) -> Vec<CandMeta> {
+/// Candidates for one hardware-OCP route: each pairs a comparator with a
+/// break-capable timer (advanced or complementary-GP — the timers with a BRK
+/// input), claiming both `Inst` tokens so the kernel hands every OCP channel a
+/// distinct comparator AND a distinct timer (i.e. N *independent* protected
+/// converters need N comps and N break-timers). No pins, no DMA — the trip is
+/// internal silicon. When the descriptor carries the COMP→break fabric we use
+/// its real edges; otherwise we fall back to the universal property that every
+/// advanced-timer break mux can select the on-chip comparators (the same
+/// assumption the Tier-1 `require_ocp_capable` bound already encodes).
+fn ocp_candidates(d: &McuDescriptor) -> Vec<CandMeta> {
+    let comps: Vec<u8> = d.comps.iter().map(|c| c.number).collect();
+    let break_timers: Vec<u8> =
+        d.timers.iter().filter(|t| t.has_complementary).map(|t| t.number).collect();
+
+    let mk = |comp: u8, tim: u8, brk: Option<u8>| {
+        let tokens = vec![Res::Inst("COMP", comp), Res::Inst("TIM", tim)];
+        let cname = peri_name(d, "COMP", comp).unwrap_or("COMP");
+        let tname = peri_name(d, "TIM", tim).unwrap_or("TIM");
+        CandMeta {
+            candidate: Candidate::new(tname, tokens),
+            assigned: AssignedPeri::Ocp { comp: cname, timer: tname, break_input: brk },
+        }
+    };
+
+    match d.fabric {
+        // Real fabric edges (e.g. C531 from RM0522): only existing instances.
+        Some(f) if !f.comp_to_tim_break.is_empty() => f
+            .comp_to_tim_break
+            .iter()
+            .filter(|&&(c, t, _)| comps.contains(&c) && break_timers.contains(&t))
+            .map(|&(c, t, b)| mk(c, t, Some(b)))
+            .collect(),
+        // No fabric on this descriptor (the whole-lineup asset path): full mux.
+        _ => comps
+            .iter()
+            .flat_map(|&c| break_timers.iter().map(move |&t| (c, t)))
+            .map(|(c, t)| mk(c, t, None))
+            .collect(),
+    }
+}
+
+/// All candidates for one requirement of `kind` with `options`. For a peripheral
+/// kind: every instance of every underlying class (so a SERIAL demand can take a
+/// USART, UART or LPUART), each with its pin placements for the configured
+/// signals. For "OCP": every comparator→break-timer pairing. The kernel picks
+/// distinct ones via `Inst` exclusivity.
+fn kind_candidates(d: &McuDescriptor, kind: &str, options: &[&str], dma: u8) -> Vec<CandMeta> {
+    if kind == "OCP" {
+        return ocp_candidates(d);
+    }
     let gpio = required_signals(kind, options);
     let mut out = Vec::new();
     for &uc in underlying_classes(kind) {
         for n in class_instances(d, uc) {
-            out.extend(instance_candidates(d, uc, n, &gpio));
+            out.extend(instance_candidates(d, uc, n, &gpio, dma));
         }
     }
     out
@@ -275,14 +331,7 @@ pub fn allocate(d: &McuDescriptor, demands: &[Demand]) -> (Solution, Witness) {
         sol.assigned
             .iter()
             .filter_map(|&(req_id, ci)| {
-                metas
-                    .get((req_id - 1) as usize)
-                    .and_then(|m| m.get(ci))
-                    .map(|cm| AssignedPeri {
-                        peri: cm.peri,
-                        pins: cm.pins.clone(),
-                        dma_channels: cm.dma,
-                    })
+                metas.get((req_id - 1) as usize).and_then(|m| m.get(ci)).cloned()
             })
             .collect()
     } else {
@@ -291,30 +340,20 @@ pub fn allocate(d: &McuDescriptor, demands: &[Demand]) -> (Solution, Witness) {
     (sol, witness)
 }
 
-/// One requirement-candidate's metadata, kept parallel to the kernel candidates
-/// so a solved assignment can be turned back into a named witness.
-#[derive(Clone)]
-struct ReqMeta {
-    peri: &'static str,
-    pins: Vec<(&'static str, PinId)>,
-    dma: u8,
-}
-
-/// Build the requirements + per-candidate metadata, run the backtracking solve,
-/// and fold in the DMA-channel capacity check. The shared core of `solve` /
-/// `allocate`.
-fn run(d: &McuDescriptor, demands: &[Demand]) -> (Solution, Vec<Vec<ReqMeta>>) {
+/// Build the requirements + per-candidate witness metadata, run the backtracking
+/// solve, and fold in the DMA-channel capacity check. The shared core of `solve`
+/// / `allocate`. `metas[req-1][candidate]` is the witness element that candidate
+/// yields, kept parallel to the kernel candidates so a solved assignment maps
+/// straight back to a named witness.
+fn run(d: &McuDescriptor, demands: &[Demand]) -> (Solution, Vec<Vec<AssignedPeri>>) {
     let mut reqs: Vec<Requirement> = Vec::new();
-    let mut metas: Vec<Vec<ReqMeta>> = Vec::new();
+    let mut metas: Vec<Vec<AssignedPeri>> = Vec::new();
     let mut id = 0u32;
     for dem in demands {
         let dma = if dem.with_dma { dma_channels_per_instance(dem.kind) as u8 } else { 0 };
-        let cm = kind_candidates(d, dem.kind, &dem.options);
+        let cm = kind_candidates(d, dem.kind, &dem.options, dma);
         let candidates: Vec<Candidate> = cm.iter().map(|m| m.candidate.clone()).collect();
-        let meta: Vec<ReqMeta> = cm
-            .into_iter()
-            .map(|m| ReqMeta { peri: m.peri, pins: m.pins, dma })
-            .collect();
+        let meta: Vec<AssignedPeri> = cm.into_iter().map(|m| m.assigned).collect();
         for _ in 0..dem.count {
             id += 1;
             reqs.push(Requirement { id, candidates: candidates.clone() });
@@ -404,6 +443,7 @@ impl DemandInput {
         match self.kind {
             "SERIAL" => "UART / USART",
             "UCPD" => "USB-PD (UCPD)",
+            "OCP" => "HW OCP (COMP→timer)",
             other => other,
         }
     }
@@ -422,6 +462,11 @@ impl DemandInput {
     }
     pub fn has_option(&self, key: &str) -> bool {
         self.options.iter().any(|k| *k == key)
+    }
+    /// Whether this kind can use DMA — OCP is an internal silicon trip (no DMA),
+    /// so the UI hides its DMA toggle.
+    pub fn supports_dma(&self) -> bool {
+        dma_channels_per_instance(self.kind) > 0
     }
     pub fn to_demand(&self) -> Demand {
         Demand {
@@ -703,22 +748,27 @@ mod tests {
         let (sol, w) = allocate(Package::G474R.descriptor(), &demands);
         assert!(sol.is_feasible() && !sol.indeterminate, "G474 should verify; unmet={:?}", sol.unmet);
         assert_eq!(w.len(), 2, "two serial peripherals in the witness");
+        let mut peris = Vec::new();
+        let mut all_pins = Vec::new();
         for ap in &w {
+            let AssignedPeri::Instance { peri, pins, dma_channels } = ap else {
+                panic!("serial demand yields Instance witnesses, got {ap:?}");
+            };
             // A real async-serial instance, with TX and RX placed on real pins,
             // each consuming one DMA channel (RX+TX = 2).
             assert!(
-                ["USART", "UART", "LPUART"].iter().any(|c| ap.peri.starts_with(c)),
-                "named a serial instance, got {}",
-                ap.peri,
+                ["USART", "UART", "LPUART"].iter().any(|c| peri.starts_with(c)),
+                "named a serial instance, got {peri}",
             );
-            let roles: Vec<_> = ap.pins.iter().map(|(r, _)| *r).collect();
+            let roles: Vec<_> = pins.iter().map(|(r, _)| *r).collect();
             assert!(roles.contains(&"TX") && roles.contains(&"RX"), "TX+RX placed, got {roles:?}");
-            assert!(ap.pins.iter().all(|(_, p)| p.name().starts_with('P')), "pins named PXn");
-            assert_eq!(ap.dma_channels, 2, "RX+TX = 2 channels");
+            assert!(pins.iter().all(|(_, p)| p.name().starts_with('P')), "pins named PXn");
+            assert_eq!(*dma_channels, 2, "RX+TX = 2 channels");
+            peris.push(*peri);
+            all_pins.extend(pins.iter().map(|(_, p)| *p));
         }
         // Distinct instances and distinct pins across the two peripherals.
-        assert_ne!(w[0].peri, w[1].peri, "two distinct instances");
-        let all_pins: Vec<_> = w.iter().flat_map(|ap| ap.pins.iter().map(|(_, p)| *p)).collect();
+        assert_ne!(peris[0], peris[1], "two distinct instances");
         let distinct: BTreeSet<_> = all_pins.iter().collect();
         assert_eq!(all_pins.len(), distinct.len(), "no pin reused across peripherals");
 
@@ -727,8 +777,64 @@ mod tests {
         let (sol, w) = allocate(c531, &demands);
         assert!(sol.is_feasible() && !sol.indeterminate, "C531 should verify; unmet={:?}", sol.unmet);
         assert_eq!(w.len(), 2);
-        assert!(w.iter().all(|ap| ap.peri.starts_with("USART")), "C531 serial is USART-only");
-        assert!(w.iter().all(|ap| ap.dma_channels == 2), "RX+TX = 2 channels each");
+        for ap in &w {
+            let AssignedPeri::Instance { peri, dma_channels, .. } = ap else { panic!("instance") };
+            assert!(peri.starts_with("USART"), "C531 serial is USART-only, got {peri}");
+            assert_eq!(*dma_channels, 2, "RX+TX = 2 channels each");
+        }
+    }
+
+    #[test]
+    fn ocp_routes_allocate_distinct_comp_and_timer() {
+        // Hardware OCP: each route consumes a distinct comparator AND a distinct
+        // break-capable timer. C531 (compiled fabric) routes its comparators into
+        // TIM1/TIM8 break inputs per RM0522 — two independent OCP loops fit.
+        let d = Package::C531R.descriptor();
+        let (sol, w) = allocate(d, &[Demand { kind: "OCP", count: 2, with_dma: false, options: vec![] }]);
+        assert!(sol.is_feasible() && !sol.indeterminate, "2 OCP routes on C531; unmet={:?}", sol.unmet);
+        assert_eq!(w.len(), 2);
+        let mut comps = Vec::new();
+        let mut timers = Vec::new();
+        for ap in &w {
+            let AssignedPeri::Ocp { comp, timer, break_input } = ap else {
+                panic!("OCP demand yields Ocp witnesses, got {ap:?}");
+            };
+            assert!(comp.starts_with("COMP"), "named a comparator, got {comp}");
+            assert!(timer.starts_with("TIM"), "named a break timer, got {timer}");
+            // C531 has fabric, so the specific BRK / BRK2 input is pinned down.
+            assert!(matches!(break_input, Some(1 | 2)), "fabric pins the break input, got {break_input:?}");
+            comps.push(*comp);
+            timers.push(*timer);
+        }
+        assert_ne!(comps[0], comps[1], "two independent loops use distinct comparators");
+        assert_ne!(timers[0], timers[1], "two independent loops use distinct timers");
+    }
+
+    #[test]
+    fn ocp_routes_exceed_fabric_is_infeasible() {
+        // C531's RM0522 fabric routes only COMP1/COMP2 into TIM1/TIM8 break
+        // inputs — two distinct comparators and two distinct timers. A third
+        // *independent* OCP loop can't get a distinct routed pair — infeasible.
+        let d = Package::C531R.descriptor();
+        let s = solve(d, &[Demand { kind: "OCP", count: 3, with_dma: false, options: vec![] }]);
+        assert!(!s.is_feasible(), "3 independent OCP loops exceed C531's 2 routed comp→timer pairs");
+    }
+
+    #[test]
+    fn ocp_verified_lineup_wide_via_asset_fallback() {
+        // The whole-lineup asset has no fabric, so OCP uses the universal
+        // break-mux fallback (any comparator → any break-timer). A single OCP
+        // route still VERIFIES on G474 (the UI's asset path), with the break
+        // input left unspecified (no fabric edge to pin it down).
+        let d = crate::desc_asset::descriptor_for("STM32G474RE").expect("G474 in asset");
+        let (sol, w) = allocate(d, &[Demand { kind: "OCP", count: 1, with_dma: false, options: vec![] }]);
+        assert!(sol.is_feasible() && !sol.indeterminate, "1 OCP route on G474 asset; unmet={:?}", sol.unmet);
+        assert_eq!(w.len(), 1);
+        assert!(
+            matches!(&w[0], AssignedPeri::Ocp { break_input: None, .. }),
+            "asset path has no fabric edge, so break input is unspecified, got {:?}",
+            w[0],
+        );
     }
 
     #[test]

@@ -6,30 +6,37 @@
 
 use crate::catalog::{self, SearchQuery};
 use crate::mcu::Package;
-use crate::select::{self, Verdict, Witness};
+use crate::select::{self, AssignedPeri, Verdict, Witness};
 use eframe::egui;
 
-/// One human-readable line per allocated peripheral, e.g.
-/// `USART2: TX=PA2, RX=PA3 (+2ch DMA)` — the witness hover text.
+/// One human-readable line per allocated element, e.g.
+/// `USART2: TX=PA2, RX=PA3 (+2ch DMA)` or `OCP: COMP1 → TIM1 BRK` — the
+/// witness hover text.
 fn witness_text(w: &Witness) -> String {
     w.iter()
-        .map(|ap| {
-            let pins = ap
-                .pins
-                .iter()
-                .map(|(role, pin)| format!("{role}={}", pin.name()))
-                .collect::<Vec<_>>()
-                .join(", ");
-            let dma = if ap.dma_channels > 0 {
-                format!(" (+{}ch DMA)", ap.dma_channels)
-            } else {
-                String::new()
-            };
-            if pins.is_empty() {
-                format!("{}{dma}", ap.peri)
-            } else {
-                format!("{}: {pins}{dma}", ap.peri)
+        .map(|ap| match ap {
+            AssignedPeri::Instance { peri, pins, dma_channels } => {
+                let pins = pins
+                    .iter()
+                    .map(|(role, pin)| format!("{role}={}", pin.name()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let dma = if *dma_channels > 0 {
+                    format!(" (+{dma_channels}ch DMA)")
+                } else {
+                    String::new()
+                };
+                if pins.is_empty() {
+                    format!("{peri}{dma}")
+                } else {
+                    format!("{peri}: {pins}{dma}")
+                }
             }
+            AssignedPeri::Ocp { comp, timer, break_input } => match break_input {
+                Some(2) => format!("OCP: {comp} → {timer} BRK2"),
+                Some(_) => format!("OCP: {comp} → {timer} BRK"),
+                None => format!("OCP: {comp} → {timer} break"),
+            },
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -143,7 +150,13 @@ pub fn show(
             for d in demands.iter_mut() {
                 ui.label(d.label());
                 ui.add(egui::DragValue::new(&mut d.count).range(0..=8).speed(0.1));
-                ui.checkbox(&mut d.with_dma, "");
+                // OCP is an internal trip with no DMA — hide its (no-op) toggle.
+                if d.supports_dma() {
+                    ui.checkbox(&mut d.with_dma, "");
+                } else {
+                    d.with_dma = false;
+                    ui.label("—").on_hover_text("internal routing, no DMA");
+                }
                 // Optional signal groups (SPI chip-select, USB-PD dead-battery…):
                 // each adds its pins to the contention.
                 let opts = d.available_options();
