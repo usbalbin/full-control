@@ -2337,6 +2337,7 @@ dependencies = [
  "eframe",
  "egui",
  "egui_plot",
+ "flate2",
  "serde",
  "serde_json",
  "stm32-metapac",

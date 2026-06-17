@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod catalog_view;
 pub mod comms_view;
 pub mod constraint;
+pub mod desc_asset;
 pub mod fabric_data;
 pub mod fabric_data_c5;
 pub mod fabric_view;

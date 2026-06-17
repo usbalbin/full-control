@@ -37,6 +37,15 @@ name = "gen_fabric"
 path = "tools/gen_fabric.rs"
 required-features = ["gen-fabric"]
 
+# Whole-lineup descriptor generator: per-package-letter pin/AF + DMA from
+# stm32-data chip JSON into `assets/descriptors.json`, parsed at runtime so the
+# selector can verify (Tier-2) the whole lineup without compiling ~870 statics.
+#   cargo run --bin gen_descriptors --features gen-descriptors -- <stm32-data>/build/data/chips
+[[bin]]
+name = "gen_descriptors"
+path = "tools/gen_descriptors.rs"
+required-features = ["gen-descriptors"]
+
 [dependencies]
 # egui + eframe + egui_plot must use the same major.minor version.
 eframe    = { version = "0.33", features = ["glow", "persistence"] }
@@ -45,6 +54,9 @@ egui_plot = "0.34"
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Pure-Rust (miniz_oxide) backend so it builds for wasm too. Used to inflate the
+# embedded gzipped descriptor asset at runtime (and deflate it in the generator).
+flate2     = { version = "1", default-features = false, features = ["rust_backend"] }
 
 # Optional, only pulled in when an `extract-*` feature is enabled. The
 # regular `cargo build` does not depend on this — it's used solely by the
@@ -58,6 +70,7 @@ extract       = ["dep:stm32-metapac"]
 # Generator gates (no extra deps; keep the bins out of normal builds).
 gen-catalog   = []
 gen-fabric    = []
+gen-descriptors = []
 # One feature per package letter. The flash-size suffix doesn't affect
 # pinout — `<letter>e` (max flash) is what we extract. Letter mapping:
 # G474: C=LQFP48, M=WLCSP81, P=TFBGA100, Q=UFBGA121, R=LQFP64, V=LQFP100
