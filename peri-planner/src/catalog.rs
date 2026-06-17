@@ -79,7 +79,7 @@ pub static CATALOG: LazyLock<Vec<CatalogEntry>> = LazyLock::new(|| {
 /// A parametric query over the catalog. Every numeric field is a *minimum*;
 /// `0` / `false` / `None` fields are ignored. Fully generic — no MCU-specific
 /// logic, so it works for every family present in the data.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SearchQuery {
     /// Restrict to a family, e.g. `"STM32G4"` (case-insensitive). `None` = any.
     pub family: Option<String>,

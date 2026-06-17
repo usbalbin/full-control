@@ -205,6 +205,39 @@ pub fn solve(d: &McuDescriptor, demands: &[Demand]) -> Solution {
 
 // ---------- Two-tier catalog evaluation ----------
 
+/// Caches the Part-finder evaluation so the (whole-lineup) Tier-2 solve runs only
+/// when the query or demands actually change — not every egui frame. Holds
+/// `Option<Verdict>` (None = plain search, no constraints active).
+#[derive(Default)]
+pub struct EvalCache {
+    key: Option<(SearchQuery, Vec<DemandInput>)>,
+    results: Vec<(&'static CatalogEntry, Option<Verdict>)>,
+}
+
+impl EvalCache {
+    /// Results for `(query, demands)`, recomputing only on change. With no active
+    /// demand it's a plain catalog search (no solving); otherwise it's the
+    /// two-tier `evaluate`.
+    pub fn results(
+        &mut self,
+        query: &SearchQuery,
+        demands: &[DemandInput],
+    ) -> &[(&'static CatalogEntry, Option<Verdict>)] {
+        let changed = self.key.as_ref().map(|(q, d)| q != query || d != demands).unwrap_or(true);
+        if changed {
+            let active: Vec<Demand> =
+                demands.iter().filter(|d| d.count > 0).map(DemandInput::to_demand).collect();
+            self.results = if active.is_empty() {
+                catalog::search(query).into_iter().map(|e| (e, None)).collect()
+            } else {
+                evaluate(query, &active).into_iter().map(|(e, v)| (e, Some(v))).collect()
+            };
+            self.key = Some((query.clone(), demands.to_vec()));
+        }
+        &self.results
+    }
+}
+
 /// A two-tier verdict for a catalog part against a demand set.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -221,7 +254,7 @@ pub enum Verdict {
 }
 
 /// A per-class demand row for the UI: count + whether it needs RX/TX DMA.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DemandInput {
     pub class: &'static str,
     pub count: u8,

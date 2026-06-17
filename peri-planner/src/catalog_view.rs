@@ -17,6 +17,7 @@ pub fn show(
     ui: &mut egui::Ui,
     q: &mut SearchQuery,
     demands: &mut [select::DemandInput],
+    cache: &mut select::EvalCache,
 ) -> Option<Package> {
     let mut jump = None;
     ui.heading("Part finder");
@@ -127,15 +128,9 @@ pub fn show(
         .collect();
 
     ui.separator();
-    // Either a plain search, or the two-tier evaluation with per-part verdicts.
-    let results: Vec<(&'static catalog::CatalogEntry, Option<Verdict>)> = if active.is_empty() {
-        catalog::search(q).into_iter().map(|e| (e, None)).collect()
-    } else {
-        select::evaluate(q, &active)
-            .into_iter()
-            .map(|(e, v)| (e, Some(v)))
-            .collect()
-    };
+    // Cached: the whole-lineup Tier-2 solve runs only when the query/demands
+    // change, not every frame.
+    let results = cache.results(q, demands);
     if active.is_empty() {
         ui.label(format!(
             "{} matching parts — fully-supported parts are clickable (open in Inventory / Pin-AF).",
