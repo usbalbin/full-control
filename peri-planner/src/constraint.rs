@@ -86,6 +86,12 @@ pub struct Solution {
     pub assigned: Vec<(u32, usize)>,
     /// Requirement ids with no conflict-free candidate.
     pub unmet: Vec<u32>,
+    /// Set when the backtracking search hit its (problem-size-derived) node
+    /// budget before proving feasibility EITHER way. The result is then a
+    /// best-effort partial, NOT a proof of infeasibility — soundness: an
+    /// `indeterminate` result must never be reported as "this MCU can't do it".
+    /// Always false for `assign_greedy`.
+    pub indeterminate: bool,
 }
 
 impl Solution {
@@ -116,6 +122,99 @@ pub fn assign_greedy(reqs: &[Requirement]) -> Solution {
         }
     }
     sol
+}
+
+/// Bounded most-constrained-first backtracking. Finds a complete, conflict-free
+/// assignment if one exists — so it NEVER falsely reports infeasible, the
+/// soundness property the selector needs (greedy can wrongly drop a capable
+/// part; see `greedy_can_miss_a_consistent_assignment`).
+///
+/// Requirements are tried fail-first (fewest candidates first). The search is
+/// bounded by a node budget derived from problem size — NOT wall-clock time (a
+/// timeout firing on a deep-but-satisfiable instance would reintroduce the
+/// unsound false-negative). For realistic selector queries (single-digit
+/// requirements) the search visits far fewer nodes than the budget; if it is
+/// ever exhausted the result is marked `indeterminate` (best-effort partial),
+/// never claimed infeasible.
+pub fn assign_backtracking(reqs: &[Requirement]) -> Solution {
+    // Fail-first variable ordering: requirements with the fewest candidates
+    // first, so dead ends are hit early.
+    let mut order: Vec<usize> = (0..reqs.len()).collect();
+    order.sort_by_key(|&i| reqs[i].candidates.len());
+
+    let budget = node_budget(reqs);
+    let mut used = ResBag::new();
+    let mut chosen: Vec<(u32, usize)> = Vec::with_capacity(reqs.len());
+    let mut nodes = 0usize;
+
+    match backtrack(reqs, &order, 0, &mut used, &mut chosen, budget, &mut nodes) {
+        Search::Complete => {
+            chosen.sort_by_key(|&(id, _)| id);
+            Solution { assigned: chosen, unmet: Vec::new(), indeterminate: false }
+        }
+        // Proven infeasible: greedy gives a best-effort partial + unmet diagnostic
+        // (its verdict agrees — if greedy found a complete assignment, so would
+        // backtracking, so this branch implies greedy is also incomplete).
+        Search::Infeasible => assign_greedy(reqs),
+        Search::BudgetExhausted => {
+            let mut g = assign_greedy(reqs);
+            g.indeterminate = true;
+            g
+        }
+    }
+}
+
+enum Search {
+    Complete,
+    Infeasible,
+    BudgetExhausted,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn backtrack(
+    reqs: &[Requirement],
+    order: &[usize],
+    pos: usize,
+    used: &mut ResBag,
+    chosen: &mut Vec<(u32, usize)>,
+    budget: usize,
+    nodes: &mut usize,
+) -> Search {
+    if pos == order.len() {
+        return Search::Complete;
+    }
+    let req = &reqs[order[pos]];
+    for (idx, cand) in req.candidates.iter().enumerate() {
+        if !cand.fits(used) {
+            continue;
+        }
+        *nodes += 1;
+        if *nodes > budget {
+            return Search::BudgetExhausted;
+        }
+        for &t in &cand.tokens {
+            used.insert(t);
+        }
+        chosen.push((req.id, idx));
+        match backtrack(reqs, order, pos + 1, used, chosen, budget, nodes) {
+            Search::Complete => return Search::Complete,
+            Search::BudgetExhausted => return Search::BudgetExhausted,
+            Search::Infeasible => {}
+        }
+        chosen.pop();
+        for &t in &cand.tokens {
+            used.remove(&t);
+        }
+    }
+    Search::Infeasible
+}
+
+/// A deterministic node cap derived from problem size (never wall-clock). Far
+/// above what any realistic selector query reaches; only guards a pathological
+/// blow-up, where exhaustion yields `indeterminate` rather than a false verdict.
+fn node_budget(reqs: &[Requirement]) -> usize {
+    let cands: usize = reqs.iter().map(|r| r.candidates.len().max(1)).sum();
+    1_000_000 + cands.saturating_mul(reqs.len()).saturating_mul(64)
 }
 
 #[cfg(test)]
@@ -194,5 +293,42 @@ mod tests {
         ];
         let s = assign_greedy(&reqs);
         assert_eq!(s.unmet, vec![2], "greedy first-fit leaves B unmet (known limitation)");
+    }
+
+    #[test]
+    fn backtracking_solves_what_greedy_misses() {
+        // Same instance as above: greedy leaves B unmet, backtracking finds the
+        // consistent assignment (A->p2, B->p1) — the soundness fix for the
+        // selector (no false-negative).
+        let p1 = PinId { port: 'A', num: 1 };
+        let p2 = PinId { port: 'A', num: 2 };
+        let reqs = vec![
+            req(
+                1,
+                vec![
+                    Candidate::new("p1", vec![Res::Pin(p1)]),
+                    Candidate::new("p2", vec![Res::Pin(p2)]),
+                ],
+            ),
+            req(2, vec![Candidate::new("p1", vec![Res::Pin(p1)])]),
+        ];
+        assert_eq!(assign_greedy(&reqs).unmet, vec![2]); // greedy still fails
+        let s = assign_backtracking(&reqs);
+        assert!(s.is_feasible(), "backtracking should find the consistent assignment");
+        assert_eq!(s.assigned.len(), 2);
+        assert!(!s.indeterminate);
+    }
+
+    #[test]
+    fn backtracking_reports_true_infeasible_not_indeterminate() {
+        // Two requirements compete for the one USART1 — genuinely infeasible,
+        // and proven so (not budget-cut).
+        let reqs = vec![
+            req(1, vec![Candidate::new("u1", vec![Res::Inst("USART", 1)])]),
+            req(2, vec![Candidate::new("u1", vec![Res::Inst("USART", 1)])]),
+        ];
+        let s = assign_backtracking(&reqs);
+        assert!(!s.is_feasible());
+        assert!(!s.indeterminate, "a proven-infeasible set is definitive, not indeterminate");
     }
 }
