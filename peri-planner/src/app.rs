@@ -238,6 +238,24 @@ impl PeriPlannerApp {
         self.view = ViewMode::Catalog;
     }
 
+    /// Seed the active design from the Part-finder demands (forward "declare
+    /// once" link). Idempotent: fills up to each demanded count given what the
+    /// design already has. Per-family — each model holds what it cleanly can
+    /// (see docs/declare-once-seed-mappings.md).
+    fn seed_from_demands(&mut self) {
+        let demands: Vec<crate::select::DemandInput> =
+            self.catalog_demands.iter().filter(|d| d.count > 0).cloned().collect();
+        let have = self.design_demand_counts();
+        match self.mcu {
+            Mcu::G474 => self.mutate(|d| seed_g474_into(d, &demands, &have)),
+            Mcu::C531 => seed_c531_into(&mut self.c531_design, &demands, &have),
+            Mcu::H523 | Mcu::C5A3 => {
+                let raw = self.package.descriptor().raw;
+                seed_h523_into(&mut self.h523_design, raw, &demands, &have);
+            }
+        }
+    }
+
     fn render_top_bar(&mut self, ctx: &egui::Context, can_undo: bool, can_redo: bool) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -351,6 +369,17 @@ impl PeriPlannerApp {
                     ui.label(active.join("   "));
                 }
                 ui.separator();
+                if !active.is_empty()
+                    && ui
+                        .button("Seed design ▸")
+                        .on_hover_text(
+                            "Add the demanded peripherals to the current design (idempotent — \
+                             fills up to each demanded count)",
+                        )
+                        .clicked()
+                {
+                    self.seed_from_demands();
+                }
                 if ui
                     .button("⟳ Demands from design")
                     .on_hover_text(
@@ -1315,6 +1344,167 @@ impl eframe::App for PeriPlannerApp {
     }
 }
 
+// ---------- Forward seed: Demand -> per-family model ----------
+
+/// True if `dem` has the option group `key` enabled.
+fn dem_has(dem: &crate::select::DemandInput, key: &'static str) -> bool {
+    dem.options.contains(&key)
+}
+
+/// Seed a G474 `Design` from demands: comms instances (sequential), a fault per
+/// OCP, and one ADC sequencer + N conversions. COMP_PWM is NOT seeded here —
+/// G474 complementary PWM is HRTIM, which the planner already seeds by default.
+fn seed_g474_into(
+    d: &mut Design,
+    demands: &[crate::select::DemandInput],
+    have: &std::collections::BTreeMap<&'static str, u8>,
+) {
+    use crate::g474::{I2cId, SpiId, UcpdId, UsartId};
+    use crate::requirements::RequirementSpec as R;
+    for dem in demands {
+        let cur = have.get(dem.kind).copied().unwrap_or(0);
+        let add = dem.count.saturating_sub(cur);
+        match dem.kind {
+            "SERIAL" => {
+                for j in 0..add {
+                    if let Some(&instance) = UsartId::ALL.get((cur + j) as usize) {
+                        d.add(R::UseUsart {
+                            instance,
+                            flow_control: dem_has(dem, "flow control"),
+                            synchronous: dem_has(dem, "sync clock"),
+                        });
+                    }
+                }
+            }
+            "SPI" => {
+                for j in 0..add {
+                    if let Some(&instance) = SpiId::ALL.get((cur + j) as usize) {
+                        d.add(R::UseSpi {
+                            instance,
+                            needs_miso: true,
+                            needs_nss: dem_has(dem, "chip-select"),
+                        });
+                    }
+                }
+            }
+            "I2C" => {
+                for j in 0..add {
+                    if let Some(&instance) = I2cId::ALL.get((cur + j) as usize) {
+                        d.add(R::UseI2c { instance, needs_smba: dem_has(dem, "SMBus alert") });
+                    }
+                }
+            }
+            "UCPD" => {
+                for j in 0..add {
+                    if let Some(&instance) = UcpdId::ALL.get((cur + j) as usize) {
+                        d.add(R::UseUcpd { instance });
+                    }
+                }
+            }
+            "OCP" => {
+                for _ in 0..add {
+                    d.add(R::ShortCircuitFault);
+                }
+            }
+            "ADC" if add > 0 => {
+                let seq = *R::add_palette()
+                    .iter()
+                    .find(|s| matches!(s, R::AdcSequencer { .. }))
+                    .expect("add_palette has an AdcSequencer");
+                let seq_id = d.add(seq);
+                let tmpl = *R::add_palette()
+                    .iter()
+                    .find(|s| matches!(s, R::AdcConversion { .. }))
+                    .expect("add_palette has an AdcConversion");
+                for _ in 0..add {
+                    let mut conv = tmpl;
+                    if let R::AdcConversion { group, .. } = &mut conv {
+                        *group = seq_id;
+                    }
+                    d.add(conv);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Seed a C531 converter plan: complementary-PWM legs on the advanced timers.
+/// OCP / ADC-sense routes use the converter view's fabric-aware pickers; comms
+/// have no C531 model (see C1 in the seed-mapping spec).
+fn seed_c531_into(
+    design: &mut crate::c531_design::C531Design,
+    demands: &[crate::select::DemandInput],
+    have: &std::collections::BTreeMap<&'static str, u8>,
+) {
+    use crate::c531_design::ConverterLeg;
+    use crate::g474::TimId;
+    if let Some(dem) = demands.iter().find(|d| d.kind == "COMP_PWM") {
+        let cur = have.get("COMP_PWM").copied().unwrap_or(0);
+        let advanced = [TimId::Tim1, TimId::Tim8];
+        for j in cur..dem.count {
+            if let Some(&tim) = advanced.get(j as usize) {
+                let mut leg = ConverterLeg::pwm(tim);
+                leg.complementary = true;
+                leg.dead_time = true;
+                design.add_leg(leg);
+            }
+        }
+    }
+}
+
+/// Seed H523 / C5A3 pin-locks: greedily place each demanded comms peripheral's
+/// signals on the first free pin of the active package. ADC is analog (no AF
+/// pin); OCP / COMP_PWM have no H523 model — both skipped.
+fn seed_h523_into(
+    design: &mut crate::h523_design::H523Design,
+    raw: &'static crate::mcu_raw::RawMcuData,
+    demands: &[crate::select::DemandInput],
+    have: &std::collections::BTreeMap<&'static str, u8>,
+) {
+    use crate::mcu_pinout::{pins_for, PinId, SignalId};
+    use std::collections::BTreeSet;
+    let mut taken: BTreeSet<PinId> = design.taken_pins().keys().copied().collect();
+    for dem in demands {
+        let classes = crate::select::underlying_classes(dem.kind);
+        if classes.is_empty() {
+            continue; // ADC (analog) / OCP / COMP_PWM — no comms pins to lock
+        }
+        let mut instances: Vec<&'static str> = raw
+            .peripherals
+            .iter()
+            .map(|p| p.name)
+            .filter(|n| {
+                classes.iter().any(|c| {
+                    n.strip_prefix(*c)
+                        .is_some_and(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+                })
+            })
+            .collect();
+        instances.sort();
+        instances.dedup();
+        let signals = crate::select::required_signals(dem.kind, &dem.options);
+        if signals.is_empty() {
+            continue;
+        }
+        let cur = have.get(dem.kind).copied().unwrap_or(0);
+        for j in cur..dem.count {
+            let Some(&inst) = instances.get(j as usize) else { break };
+            for &role in &signals {
+                if design.locked_pin(inst, role).is_some() {
+                    continue;
+                }
+                if let Some(p) =
+                    pins_for(raw, SignalId { peripheral: inst, role }).into_iter().find(|p| !taken.contains(p))
+                {
+                    design.lock(inst, role, p);
+                    taken.insert(p);
+                }
+            }
+        }
+    }
+}
+
 /// Render ADC-conversion candidates grouped by ADC unit with fast/slow
 /// sub-sections, since users typically care about "which ADC" and
 /// "fast vs slow" more than the specific channel number.
@@ -1494,4 +1684,67 @@ fn cr_usage_for(timer: HrtimId, dem: bool) -> TimerSlotUsage {
         ));
     }
     TimerSlotUsage { timer, claims }
+}
+
+#[cfg(test)]
+mod seed_tests {
+    use super::*;
+    use crate::requirements::RequirementSpec as R;
+    use crate::select::DemandInput;
+    use std::collections::BTreeMap;
+
+    fn dem(kind: &'static str, count: u8) -> DemandInput {
+        DemandInput { kind, count, with_dma: false, options: vec![] }
+    }
+
+    #[test]
+    fn g474_seed_adds_comms_idempotently() {
+        let mut d = Design::default(); // starts with 4 HRTIM sub-timers
+        seed_g474_into(&mut d, &[dem("SERIAL", 2), dem("SPI", 1)], &BTreeMap::new());
+        let usarts = d.requirements.iter().filter(|s| matches!(s, R::UseUsart { .. })).count();
+        let spis = d.requirements.iter().filter(|s| matches!(s, R::UseSpi { .. })).count();
+        assert_eq!((usarts, spis), (2, 1));
+        // Idempotent: with `have` reflecting the current counts, nothing is added.
+        let have: BTreeMap<&'static str, u8> = [("SERIAL", 2u8), ("SPI", 1)].into_iter().collect();
+        seed_g474_into(&mut d, &[dem("SERIAL", 2), dem("SPI", 1)], &have);
+        assert_eq!(d.requirements.iter().filter(|s| matches!(s, R::UseUsart { .. })).count(), 2);
+    }
+
+    #[test]
+    fn g474_seed_adc_adds_one_sequencer_and_n_conversions() {
+        // The default design already carries an ADC sequencer + conversions, so
+        // assert the DELTA with `have` reflecting the current count (as
+        // design_demand_counts would compute it).
+        let mut d = Design::default();
+        let before_seq = d.requirements.iter().filter(|s| matches!(s, R::AdcSequencer { .. })).count();
+        let before_conv =
+            d.requirements.iter().filter(|s| matches!(s, R::AdcConversion { .. })).count();
+        let have: BTreeMap<&'static str, u8> = [("ADC", before_conv as u8)].into_iter().collect();
+        seed_g474_into(&mut d, &[dem("ADC", before_conv as u8 + 2)], &have);
+        let seqs = d.requirements.iter().filter(|s| matches!(s, R::AdcSequencer { .. })).count();
+        let convs = d.requirements.iter().filter(|s| matches!(s, R::AdcConversion { .. })).count();
+        assert_eq!(seqs - before_seq, 1, "one new sequencer");
+        assert_eq!(convs - before_conv, 2, "two new conversions");
+    }
+
+    #[test]
+    fn c531_seed_adds_complementary_legs() {
+        let mut c = crate::c531_design::C531Design::new();
+        seed_c531_into(&mut c, &[dem("COMP_PWM", 2)], &BTreeMap::new());
+        assert_eq!(c.legs.len(), 2);
+        assert!(c.legs.iter().all(|l| l.complementary && l.dead_time));
+    }
+
+    #[test]
+    fn h523_seed_greedily_places_serial_on_real_pins() {
+        let mut h = crate::h523_design::H523Design::new();
+        let raw = crate::mcu::Package::H523R.descriptor().raw;
+        seed_h523_into(&mut h, raw, &[dem("SERIAL", 1)], &BTreeMap::new());
+        // One serial instance with TX + RX on distinct real pins.
+        assert_eq!(h.pin_locks.len(), 2);
+        assert!(h.pin_locks.iter().any(|l| l.role == "TX"));
+        assert!(h.pin_locks.iter().any(|l| l.role == "RX"));
+        let pins: std::collections::BTreeSet<_> = h.pin_locks.iter().map(|l| l.pin()).collect();
+        assert_eq!(pins.len(), 2, "TX and RX must land on distinct pins");
+    }
 }

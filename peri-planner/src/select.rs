@@ -90,7 +90,7 @@ fn kind_options(kind: &str) -> &'static [(&'static str, &'static [&'static str])
 
 /// GPIO signals a kind needs given the enabled options: base + each enabled
 /// option's extra signals.
-fn required_signals(kind: &str, options: &[&str]) -> Vec<&'static str> {
+pub(crate) fn required_signals(kind: &str, options: &[&str]) -> Vec<&'static str> {
     let mut v: Vec<&'static str> = base_signals(kind).to_vec();
     for (key, extra) in kind_options(kind) {
         if options.contains(key) {
