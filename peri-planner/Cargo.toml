@@ -49,6 +49,15 @@ name = "gen_descriptors"
 path = "tools/gen_descriptors.rs"
 required-features = ["gen-descriptors"]
 
+# Whole-lineup PHYSICAL pinout generator: per-footprint `position -> signal(s)`
+# (incl. power rails) from stm32-data chip JSON into `assets/pinouts.json.gz`,
+# the data layer for the drop-in / pin-compatibility finder.
+#   cargo run --bin gen_pinouts --features gen-pinouts -- <stm32-data>/build/data/chips
+[[bin]]
+name = "gen_pinouts"
+path = "tools/gen_pinouts.rs"
+required-features = ["gen-pinouts"]
+
 [dependencies]
 # egui + eframe + egui_plot must use the same major.minor version.
 eframe    = { version = "0.33", features = ["glow", "persistence"] }
@@ -74,6 +83,7 @@ extract       = ["dep:stm32-metapac"]
 gen-catalog   = []
 gen-fabric    = []
 gen-descriptors = []
+gen-pinouts   = []
 # One feature per package letter. The flash-size suffix doesn't affect
 # pinout — `<letter>e` (max flash) is what we extract. Letter mapping:
 # G474: C=LQFP48, M=WLCSP81, P=TFBGA100, Q=UFBGA121, R=LQFP64, V=LQFP100
