@@ -145,6 +145,15 @@ fn entry_from(v: &Value) -> Option<CatalogEntry> {
         .filter(|t| names.contains(**t))
         .count() as u8;
 
+    // Datasheet package styles this part ships in (a part can offer several
+    // footprints of one letter, e.g. LQFP100 + TFBGA100).
+    let mut packages = BTreeSet::new();
+    for p in v["packages"].as_array().into_iter().flatten() {
+        if let Some(s) = p["package"].as_str() {
+            packages.insert(s.to_string());
+        }
+    }
+
     Some(CatalogEntry {
         name,
         family,
@@ -172,6 +181,7 @@ fn entry_from(v: &Value) -> Option<CatalogEntry> {
         has_fmc: names.contains("FMC"),
         dma_pool_total: dma_channels.len() as u16,
         gpio_pins: gpio.len() as u16,
+        packages: packages.into_iter().collect(),
     })
 }
 

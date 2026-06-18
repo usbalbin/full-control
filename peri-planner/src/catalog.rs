@@ -67,6 +67,11 @@ pub struct CatalogEntry {
     /// on parts with a compiled descriptor).
     #[serde(default)]
     pub gpio_pins: u16,
+    /// Datasheet package styles this exact part ships in, e.g. `["LQFP64"]` or
+    /// `["LQFP64","UFBGA64"]` (40% of parts offer several). From stm32-data
+    /// `packages[].package`, distinct + sorted.
+    #[serde(default)]
+    pub packages: Vec<String>,
 }
 
 impl CatalogEntry {
@@ -75,6 +80,20 @@ impl CatalogEntry {
         self.usart
             .saturating_add(self.uart)
             .saturating_add(self.lpuart)
+    }
+
+    /// Distinct land-pattern classes `(kind, pin-count)` this part offers, e.g.
+    /// `("LQFP", 64)` — marketing suffixes (`_GP`/`_N`) collapse via
+    /// [`crate::phys_pinout::package_class`]. The package-filter granularity.
+    pub fn package_classes(&self) -> Vec<(String, u16)> {
+        let mut v: Vec<(String, u16)> = self
+            .packages
+            .iter()
+            .filter_map(|p| crate::phys_pinout::package_class(p).map(|(k, n)| (k.to_string(), n)))
+            .collect();
+        v.sort();
+        v.dedup();
+        v
     }
 }
 
@@ -122,6 +141,9 @@ pub struct SearchQuery {
     /// (the actual routing is a Tier-2 fabric check). A loose, sound Tier-1
     /// filter: any part lacking either definitely can't do hardware OCP.
     pub require_ocp_capable: bool,
+    /// Require an offered footprint of this land-pattern class `(kind, pin-count)`,
+    /// e.g. `("LQFP", 64)`. `None` = any package.
+    pub package_class: Option<(String, u16)>,
 }
 
 impl SearchQuery {
@@ -153,7 +175,21 @@ impl SearchQuery {
             && (!self.require_sdmmc || e.has_sdmmc)
             && (!self.require_fmc || e.has_fmc)
             && (!self.require_ocp_capable || (e.comp >= 1 && e.tim_adv >= 1))
+            && self
+                .package_class
+                .as_ref()
+                .is_none_or(|want| e.package_classes().iter().any(|c| c == want))
     }
+}
+
+/// Distinct package land-pattern classes present across the catalog, sorted —
+/// the option set for a package filter (e.g. `("LQFP", 64)`).
+pub fn package_class_options() -> Vec<(String, u16)> {
+    let mut v: Vec<(String, u16)> =
+        CATALOG.iter().flat_map(|e| e.package_classes()).collect();
+    v.sort();
+    v.dedup();
+    v
 }
 
 /// Run a query, returning matching entries sorted by part name.
@@ -300,5 +336,36 @@ mod tests {
         })
         .len();
         assert!(tighter <= base && tighter > 0);
+    }
+
+    #[test]
+    fn parts_carry_package_styles() {
+        // Every part should list at least one datasheet package style.
+        let missing = CATALOG.iter().filter(|e| e.packages.is_empty()).count();
+        assert!(missing == 0, "{missing} parts have no package data — regenerate catalog");
+        // A known part: G474RE is LQFP64.
+        let g4 = CATALOG.iter().find(|e| e.name == "STM32G474RE").unwrap();
+        assert_eq!(g4.package_classes(), vec![("LQFP".to_string(), 64)]);
+        // Multi-footprint parts exist (a letter can span QFP + BGA).
+        assert!(
+            CATALOG.iter().any(|e| e.package_classes().len() > 1),
+            "expected at least one multi-footprint part"
+        );
+    }
+
+    #[test]
+    fn package_class_filter_narrows_to_offered_footprint() {
+        let opts = package_class_options();
+        assert!(!opts.is_empty());
+        let want = ("LQFP".to_string(), 64);
+        assert!(opts.contains(&want));
+
+        let base = search(&SearchQuery::default()).len();
+        let hits = search(&SearchQuery { package_class: Some(want.clone()), ..Default::default() });
+        assert!(!hits.is_empty() && hits.len() < base);
+        // Every hit genuinely offers an LQFP64-class footprint.
+        assert!(hits.iter().all(|e| e.package_classes().contains(&want)));
+        // G474RE qualifies; a part with no LQFP64 offering is excluded.
+        assert!(hits.iter().any(|e| e.name == "STM32G474RE"));
     }
 }

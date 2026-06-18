@@ -125,6 +125,26 @@ pub fn show(
                     }
                 }
             });
+        ui.label("Package:");
+        let pkg_text = q
+            .package_class
+            .as_ref()
+            .map(|(k, n)| format!("{k}{n}"))
+            .unwrap_or_else(|| "(any)".to_string());
+        egui::ComboBox::from_id_salt("partfinder_package")
+            .selected_text(pkg_text)
+            .show_ui(ui, |ui| {
+                if ui.selectable_label(q.package_class.is_none(), "(any)").clicked() {
+                    q.package_class = None;
+                }
+                for (k, n) in catalog::package_class_options() {
+                    let opt = (k, n);
+                    let sel = q.package_class.as_ref() == Some(&opt);
+                    if ui.selectable_label(sel, format!("{}{}", opt.0, opt.1)).clicked() {
+                        q.package_class = Some(opt);
+                    }
+                }
+            });
         if ui.button("Reset").clicked() {
             *q = SearchQuery::default();
             for d in demands.iter_mut() {
@@ -210,12 +230,12 @@ pub fn show(
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new("partfinder_results")
             .striped(true)
-            .num_columns(12)
+            .num_columns(13)
             .spacing([14.0, 2.0])
             .show(ui, |ui| {
                 for h in [
-                    "Part", "Family", "Flash", "RAM", "UART", "CAN", "ADC/DAC/COMP",
-                    "TIM (adv)", "±PWM", "USB/HRTIM", "DMA", "Verify",
+                    "Part", "Family", "Package", "Flash", "RAM", "UART", "CAN",
+                    "ADC/DAC/COMP", "TIM (adv)", "±PWM", "USB/HRTIM", "DMA", "Verify",
                 ] {
                     ui.strong(h);
                 }
@@ -243,6 +263,17 @@ pub fn show(
                         }
                     }
                     ui.label(&e.family);
+                    // Package(s): compact — first + "+N", full list on hover.
+                    let pkg_cell = match e.packages.len() {
+                        0 => "—".to_string(),
+                        1 | 2 => e.packages.join(" / "),
+                        n => format!("{} +{}", e.packages[0], n - 1),
+                    };
+                    ui.label(pkg_cell).on_hover_text(if e.packages.is_empty() {
+                        "no package data".to_string()
+                    } else {
+                        e.packages.join(", ")
+                    });
                     ui.label(format!("{} k", e.flash_kb));
                     ui.label(format!("{} k", e.ram_kb));
                     ui.label(e.total_uart().to_string());
