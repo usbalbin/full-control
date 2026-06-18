@@ -58,9 +58,16 @@ pub struct PeriPlannerApp {
     catalog_demands: Vec<crate::select::DemandInput>,
     /// Memoized Part-finder evaluation (recomputed only when query/demands change).
     catalog_eval_cache: crate::select::EvalCache,
-    /// A part clicked in the Part finder, applied at the start of the next
-    /// frame (deferred to avoid switching chips mid-render). Ephemeral.
-    pending_select: Option<Package>,
+    /// Name of a part clicked in the Part / Drop-in finder, opened at the start
+    /// of the next frame (deferred to avoid switching chips mid-render). A
+    /// compiled part opens its planner; any other opens a read-only browser.
+    /// Ephemeral.
+    pending_open: Option<String>,
+    /// A non-compiled catalog part opened read-only from a finder, rendered from
+    /// the lineup descriptor asset (Inventory / Pin-AF only — no planner/fabric).
+    /// When `Some`, the app shows a read-only browser instead of the planner.
+    /// Ephemeral (a `&'static` into the lazily-built asset; not persisted).
+    asset_part: Option<&'static crate::mcu::McuDescriptor>,
     /// Drop-in finder query (strictness + power-mode + family filter). Ephemeral.
     dropin_query: crate::dropin::DropinQuery,
     /// Memoized lineup-wide drop-in scan; reruns only on source/query change.
@@ -89,7 +96,8 @@ impl Default for PeriPlannerApp {
                 .map(crate::select::DemandInput::new)
                 .collect(),
             catalog_eval_cache: Default::default(),
-            pending_select: None,
+            pending_open: None,
+            asset_part: None,
             dropin_query: Default::default(),
             dropin_cache: Default::default(),
             dropin_focus: None,
@@ -265,6 +273,53 @@ impl PeriPlannerApp {
         });
     }
 
+    /// Read-only browser for a non-compiled catalog part opened from a finder.
+    /// Renders Inventory / Pin-AF from the lineup descriptor asset — no planner,
+    /// no fabric (asset descriptors carry neither). The Part finder stays
+    /// available so the user can keep browsing; clicking another part re-targets
+    /// the browser (or, for a compiled part, lands in its planner next frame).
+    fn render_asset_browser(
+        &mut self,
+        ctx: &egui::Context,
+        desc: &'static crate::mcu::McuDescriptor,
+    ) {
+        egui::TopBottomPanel::top("asset_browser_top").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong(format!("Browsing {}", desc.name));
+                ui.label(
+                    egui::RichText::new("read-only · package-letter pinout (flash-invariant)")
+                        .small()
+                        .weak(),
+                );
+                if ui.button("✕ Close").clicked() {
+                    self.asset_part = None;
+                }
+                ui.separator();
+                ui.label("View:");
+                ui.selectable_value(&mut self.view, ViewMode::Inventory, "Inventory");
+                ui.selectable_value(&mut self.view, ViewMode::AfTable, "Pin / AF");
+                ui.selectable_value(&mut self.view, ViewMode::Catalog, "Part finder");
+            });
+        });
+
+        let view = self.view;
+        let af_filter = &mut self.af_filter;
+        let catalog_query = &mut self.catalog_query;
+        let catalog_demands = &mut self.catalog_demands;
+        let catalog_cache = &mut self.catalog_eval_cache;
+        let mut open: Option<String> = None;
+        egui::CentralPanel::default().show(ctx, |ui| match view {
+            ViewMode::AfTable => {
+                crate::af_view::show(ui, desc.raw, af_filter, None);
+            }
+            ViewMode::Catalog => {
+                open = crate::catalog_view::show(ui, catalog_query, catalog_demands, catalog_cache);
+            }
+            _ => crate::inventory_view::show(ui, desc),
+        });
+        self.pending_open = open;
+    }
+
     fn handle_package_action(&mut self, action: Option<crate::package_view::Action>) {
         use crate::package_view::Action;
         use crate::picker;
@@ -340,16 +395,31 @@ impl eframe::App for PeriPlannerApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Apply a part clicked in the Part finder last frame (deferred so we
-        // never switch the active chip mid-render).
-        if let Some(pkg) = self.pending_select.take() {
-            self.mcu = pkg.mcu();
-            self.package = pkg;
-            if let Some(v) = pkg.to_g474_variant() {
-                self.variant = v;
+        // Open a part clicked in a finder last frame (deferred so we never switch
+        // the active chip mid-render). A compiled part becomes the active planner
+        // chip; any other opens the read-only descriptor browser.
+        if let Some(name) = self.pending_open.take() {
+            if let Some(pkg) = Package::for_chip_name(&name) {
+                self.mcu = pkg.mcu();
+                self.package = pkg;
+                if let Some(v) = pkg.to_g474_variant() {
+                    self.variant = v;
+                }
+                self.asset_part = None;
+                self.view = ViewMode::Inventory;
+            } else if let Some(d) = crate::desc_asset::descriptor_for(&name) {
+                self.asset_part = Some(d);
+                self.view = ViewMode::Inventory;
             }
-            self.view = ViewMode::Inventory;
         }
+
+        // Read-only browse mode for a non-compiled part: a self-contained panel,
+        // bypassing both the G474 planner and the per-family thin path.
+        if let Some(desc) = self.asset_part {
+            self.render_asset_browser(ctx, desc);
+            return;
+        }
+
         let ctrl = ctx.input(|i| i.modifiers.command);
         let shift = ctx.input(|i| i.modifiers.shift);
         if ctrl && ctx.input(|i| i.key_pressed(egui::Key::Z)) {
@@ -405,7 +475,7 @@ impl eframe::App for PeriPlannerApp {
                     _ => crate::inventory_view::show(ui, descriptor),
                 }
             });
-            self.pending_select = jump;
+            self.pending_open = jump;
             self.apply_converter_action(conv_action);
             return;
         }
@@ -1117,7 +1187,7 @@ impl eframe::App for PeriPlannerApp {
                     crate::inventory_view::show(ui, self.package.descriptor());
                 }
                 ViewMode::Catalog => {
-                    self.pending_select = crate::catalog_view::show(
+                    self.pending_open = crate::catalog_view::show(
                         ui,
                         &mut self.catalog_query,
                         &mut self.catalog_demands,
@@ -1125,7 +1195,7 @@ impl eframe::App for PeriPlannerApp {
                     );
                 }
                 ViewMode::Dropin => {
-                    self.pending_select = crate::dropin_view::show(
+                    self.pending_open = crate::dropin_view::show(
                         ui,
                         self.package,
                         crate::dropin::DesignSource::G474(&self.design),

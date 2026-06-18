@@ -78,8 +78,8 @@ pub fn show(
     q: &mut DropinQuery,
     cache: &mut DropinCache,
     focus: &mut Option<String>,
-) -> Option<Package> {
-    let mut jump = None;
+) -> Option<String> {
+    let mut open: Option<String> = None;
     ui.heading("Drop-in finder");
     ui.label(
         "Pin-compatible replacements for the current part: same footprint, same \
@@ -186,20 +186,14 @@ pub fn show(
                 ui.end_row();
 
                 for c in results.iter().filter(|c| c.compatible).take(CAP) {
-                    // Part name — clickable if it bridges to a compiled/openable part.
-                    match Package::for_chip_name(&c.name) {
-                        Some(pkg) => {
-                            if ui
-                                .selectable_label(false, &c.name)
-                                .on_hover_text(format!("Open {}", pkg.display_label()))
-                                .clicked()
-                            {
-                                jump = Some(pkg);
-                            }
-                        }
-                        None => {
-                            ui.label(&c.name);
-                        }
+                    // Every candidate is openable (compiled planner or read-only
+                    // lineup-descriptor browser).
+                    if ui
+                        .selectable_label(false, &c.name)
+                        .on_hover_text("Open in Inventory / Pin-AF")
+                        .clicked()
+                    {
+                        open = Some(c.name.clone());
                     }
                     ui.label(&c.family);
                     ui.label(&c.footprint);
@@ -267,5 +261,5 @@ pub fn show(
         }
     });
 
-    jump
+    open
 }

@@ -5,7 +5,6 @@
 //! `catalog::search`.
 
 use crate::catalog::{self, SearchQuery};
-use crate::mcu::Package;
 use crate::select::{self, AssignedPeri, Verdict, Witness};
 use eframe::egui;
 
@@ -47,15 +46,15 @@ fn witness_text(w: &Witness) -> String {
 
 /// Renders the part finder. `demands` are the per-class constraint rows whose
 /// allocation is verified against each bridge-reachable part (Tier-2). Returns
-/// the package to jump to if the user clicked a result that maps to a
-/// compiled-in part.
+/// the NAME of a part the user clicked to open (resolved by the app to a
+/// compiled planner or a read-only lineup-descriptor browser).
 pub fn show(
     ui: &mut egui::Ui,
     q: &mut SearchQuery,
     demands: &mut [select::DemandInput],
     cache: &mut select::EvalCache,
-) -> Option<Package> {
-    let mut jump = None;
+) -> Option<String> {
+    let mut open: Option<String> = None;
     ui.heading("Part finder");
     ui.label(format!(
         "Parametric search across {} STM32 parts in {} families. All numeric \
@@ -241,26 +240,17 @@ pub fn show(
                 }
                 ui.end_row();
                 for (e, verdict, witness) in results.iter().take(CAP) {
-                    // Parts that are compiled in are clickable -> jump to them.
-                    match Package::for_chip_name(&e.name) {
-                        Some(pkg) => {
-                            // The descriptor is keyed on the package letter (pins
-                            // are flash-invariant), so a flash variant opens its
-                            // package's descriptor — name the target to be honest.
-                            if ui
-                                .selectable_label(false, &e.name)
-                                .on_hover_text(format!(
-                                    "Open {} (Inventory / Pin-AF)",
-                                    pkg.display_label()
-                                ))
-                                .clicked()
-                            {
-                                jump = Some(pkg);
-                            }
-                        }
-                        None => {
-                            ui.label(&e.name);
-                        }
+                    // Every part is clickable now: a compiled part opens its full
+                    // planner, any other opens a read-only lineup-descriptor
+                    // browser (Inventory / Pin-AF). The pinout is package-letter-
+                    // keyed (flash-invariant), so a flash variant shows its
+                    // package's representative.
+                    if ui
+                        .selectable_label(false, &e.name)
+                        .on_hover_text("Open in Inventory / Pin-AF")
+                        .clicked()
+                    {
+                        open = Some(e.name.clone());
                     }
                     ui.label(&e.family);
                     // Package(s): compact — first + "+N", full list on hover.
@@ -325,5 +315,5 @@ pub fn show(
         }
     });
 
-    jump
+    open
 }
