@@ -58,6 +58,8 @@ pub struct PeriPlannerApp {
     catalog_demands: Vec<crate::select::DemandInput>,
     /// Memoized Part-finder evaluation (recomputed only when query/demands change).
     catalog_eval_cache: crate::select::EvalCache,
+    /// Part-finder results sort (column + direction). Ephemeral.
+    catalog_sort: crate::catalog_view::CatalogSort,
     /// Name of a part clicked in the Part / Drop-in finder, opened at the start
     /// of the next frame (deferred to avoid switching chips mid-render). A
     /// compiled part opens its planner; any other opens a read-only browser.
@@ -96,6 +98,7 @@ impl Default for PeriPlannerApp {
                 .map(crate::select::DemandInput::new)
                 .collect(),
             catalog_eval_cache: Default::default(),
+            catalog_sort: Default::default(),
             pending_open: None,
             asset_part: None,
             dropin_query: Default::default(),
@@ -307,13 +310,16 @@ impl PeriPlannerApp {
         let catalog_query = &mut self.catalog_query;
         let catalog_demands = &mut self.catalog_demands;
         let catalog_cache = &mut self.catalog_eval_cache;
+        let catalog_sort = &mut self.catalog_sort;
         let mut open: Option<String> = None;
         egui::CentralPanel::default().show(ctx, |ui| match view {
             ViewMode::AfTable => {
                 crate::af_view::show(ui, desc.raw, af_filter, None);
             }
             ViewMode::Catalog => {
-                open = crate::catalog_view::show(ui, catalog_query, catalog_demands, catalog_cache);
+                open = crate::catalog_view::show(
+                    ui, catalog_query, catalog_demands, catalog_cache, catalog_sort,
+                );
             }
             _ => crate::inventory_view::show(ui, desc),
         });
@@ -443,6 +449,7 @@ impl eframe::App for PeriPlannerApp {
             let catalog_query = &mut self.catalog_query;
             let catalog_demands = &mut self.catalog_demands;
             let catalog_cache = &mut self.catalog_eval_cache;
+            let catalog_sort = &mut self.catalog_sort;
             let mcu = self.mcu;
             let dropin_query = &mut self.dropin_query;
             let dropin_cache = &mut self.dropin_cache;
@@ -455,7 +462,9 @@ impl eframe::App for PeriPlannerApp {
                         crate::af_view::show(ui, descriptor.raw, af_filter, Some(h523));
                     }
                     ViewMode::Catalog => {
-                        jump = crate::catalog_view::show(ui, catalog_query, catalog_demands, catalog_cache);
+                        jump = crate::catalog_view::show(
+                            ui, catalog_query, catalog_demands, catalog_cache, catalog_sort,
+                        );
                     }
                     ViewMode::Dropin => {
                         // C531 carries a converter-leg model (no locked pins);
@@ -1192,6 +1201,7 @@ impl eframe::App for PeriPlannerApp {
                         &mut self.catalog_query,
                         &mut self.catalog_demands,
                         &mut self.catalog_eval_cache,
+                        &mut self.catalog_sort,
                     );
                 }
                 ViewMode::Dropin => {

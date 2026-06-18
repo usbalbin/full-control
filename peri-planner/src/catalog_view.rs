@@ -4,9 +4,76 @@
 //! `tools/gen_catalog.rs`; this view is just a form + results table over
 //! `catalog::search`.
 
-use crate::catalog::{self, SearchQuery};
+use crate::catalog::{self, CatalogEntry, SearchQuery};
 use crate::select::{self, AssignedPeri, Verdict, Witness};
 use eframe::egui;
+
+/// A sortable Part-finder results column.
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum SortCol {
+    Name,
+    Family,
+    Package,
+    Flash,
+    Ram,
+    Uart,
+    Can,
+    Adc,
+    TimAdv,
+    CompPwm,
+    Dma,
+    Verify,
+}
+
+/// The active results sort (column + direction). Lives in app state so it
+/// persists across frames; applied to a collected view of the cached results, so
+/// changing the sort never re-runs the lineup solve.
+#[derive(Copy, Clone)]
+pub struct CatalogSort {
+    pub col: SortCol,
+    pub asc: bool,
+}
+
+impl Default for CatalogSort {
+    fn default() -> Self {
+        Self { col: SortCol::Name, asc: true }
+    }
+}
+
+/// Verified-first ordering for the Verify column.
+fn verdict_rank(v: Option<Verdict>) -> u8 {
+    match v {
+        Some(Verdict::Verified) => 3,
+        Some(Verdict::BoundsOnly) => 2,
+        Some(Verdict::Infeasible) => 1,
+        None => 0,
+    }
+}
+
+/// Compare two result rows on `col`, tie-broken by part name for stability.
+fn cmp_col(
+    ea: &CatalogEntry,
+    va: Option<Verdict>,
+    eb: &CatalogEntry,
+    vb: Option<Verdict>,
+    col: SortCol,
+) -> std::cmp::Ordering {
+    let primary = match col {
+        SortCol::Name => ea.name.cmp(&eb.name),
+        SortCol::Family => ea.family.cmp(&eb.family),
+        SortCol::Package => ea.packages.first().cmp(&eb.packages.first()),
+        SortCol::Flash => ea.flash_kb.cmp(&eb.flash_kb),
+        SortCol::Ram => ea.ram_kb.cmp(&eb.ram_kb),
+        SortCol::Uart => ea.total_uart().cmp(&eb.total_uart()),
+        SortCol::Can => ea.fdcan.cmp(&eb.fdcan),
+        SortCol::Adc => ea.adc.cmp(&eb.adc),
+        SortCol::TimAdv => ea.tim_adv.cmp(&eb.tim_adv),
+        SortCol::CompPwm => ea.comp_pwm_ch.cmp(&eb.comp_pwm_ch),
+        SortCol::Dma => ea.dma_pool_total.cmp(&eb.dma_pool_total),
+        SortCol::Verify => verdict_rank(va).cmp(&verdict_rank(vb)),
+    };
+    primary.then_with(|| ea.name.cmp(&eb.name))
+}
 
 /// One human-readable line per allocated element, e.g.
 /// `USART2: TX=PA2, RX=PA3 (+2ch DMA)` or `OCP: COMP1 → TIM1 BRK` — the
@@ -53,6 +120,7 @@ pub fn show(
     q: &mut SearchQuery,
     demands: &mut [select::DemandInput],
     cache: &mut select::EvalCache,
+    sort: &mut CatalogSort,
 ) -> Option<String> {
     let mut open: Option<String> = None;
     ui.heading("Part finder");
@@ -234,14 +302,58 @@ pub fn show(
             .num_columns(13)
             .spacing([14.0, 2.0])
             .show(ui, |ui| {
-                for h in [
-                    "Part", "Family", "Package", "Flash", "RAM", "UART", "CAN",
-                    "ADC/DAC/COMP", "TIM (adv)", "±PWM", "USB/HRT/ETH", "DMA", "Verify",
-                ] {
-                    ui.strong(h);
+                // Clickable headers: click to sort by that column, click again to
+                // flip direction. (USB/HRT/ETH is a combined flag cell — not sorted.)
+                const HEADERS: &[(&str, Option<SortCol>)] = &[
+                    ("Part", Some(SortCol::Name)),
+                    ("Family", Some(SortCol::Family)),
+                    ("Package", Some(SortCol::Package)),
+                    ("Flash", Some(SortCol::Flash)),
+                    ("RAM", Some(SortCol::Ram)),
+                    ("UART", Some(SortCol::Uart)),
+                    ("CAN", Some(SortCol::Can)),
+                    ("ADC/DAC/COMP", Some(SortCol::Adc)),
+                    ("TIM (adv)", Some(SortCol::TimAdv)),
+                    ("±PWM", Some(SortCol::CompPwm)),
+                    ("USB/HRT/ETH", None),
+                    ("DMA", Some(SortCol::Dma)),
+                    ("Verify", Some(SortCol::Verify)),
+                ];
+                for (label, col) in HEADERS {
+                    match col {
+                        Some(c) => {
+                            let arrow = if sort.col == *c {
+                                if sort.asc { " ▲" } else { " ▼" }
+                            } else {
+                                ""
+                            };
+                            let btn = egui::Button::new(
+                                egui::RichText::new(format!("{label}{arrow}")).strong(),
+                            )
+                            .frame(false);
+                            if ui.add(btn).on_hover_text("sort").clicked() {
+                                if sort.col == *c {
+                                    sort.asc = !sort.asc;
+                                } else {
+                                    *sort = CatalogSort { col: *c, asc: true };
+                                }
+                            }
+                        }
+                        None => {
+                            ui.strong(*label);
+                        }
+                    }
                 }
                 ui.end_row();
-                for (e, verdict, witness) in results.iter().take(CAP) {
+
+                // Sort a collected view of the cached results (never mutates the
+                // cache, so re-sorting doesn't re-run the lineup solve).
+                let mut rows: Vec<&select::Row> = results.iter().collect();
+                rows.sort_by(|a, b| {
+                    let ord = cmp_col(a.0, a.1, b.0, b.1, sort.col);
+                    if sort.asc { ord } else { ord.reverse() }
+                });
+                for (e, verdict, witness) in rows.into_iter().take(CAP) {
                     // Every part is clickable now: a compiled part opens its full
                     // planner, any other opens a read-only lineup-descriptor
                     // browser (Inventory / Pin-AF). The pinout is package-letter-
@@ -319,4 +431,33 @@ pub fn show(
     });
 
     open
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cmp::Ordering;
+
+    #[test]
+    fn cmp_col_uses_the_right_field_and_tie_breaks_by_name() {
+        let a = &catalog::CATALOG[0];
+        let b = &catalog::CATALOG[1];
+        // Numeric columns compare the matching field, then tie-break by name.
+        assert_eq!(
+            cmp_col(a, None, b, None, SortCol::Flash),
+            a.flash_kb.cmp(&b.flash_kb).then(a.name.cmp(&b.name))
+        );
+        assert_eq!(
+            cmp_col(a, None, b, None, SortCol::Dma),
+            a.dma_pool_total.cmp(&b.dma_pool_total).then(a.name.cmp(&b.name))
+        );
+        // Verify column ranks Verified above Infeasible.
+        assert_eq!(
+            cmp_col(a, Some(Verdict::Verified), b, Some(Verdict::Infeasible), SortCol::Verify),
+            Ordering::Greater
+        );
+        // Equal field -> name tie-break (catalog is name-sorted, so a < b).
+        assert_eq!(cmp_col(a, None, a, None, SortCol::Flash), Ordering::Equal);
+        assert_eq!(cmp_col(a, None, b, None, SortCol::Name), Ordering::Less);
+    }
 }
