@@ -301,6 +301,12 @@ pub fn all_records() -> &'static [PinoutRecord] {
     &asset().records
 }
 
+/// The part-name -> footprint index (one row per chip-package). The drop-in
+/// finder enumerates candidates from here.
+pub fn index() -> &'static [PartFootprint] {
+    &asset().index
+}
+
 /// The footprint(s) the part `name` ships in. Exact name match (the index keys
 /// on the full chip name, like the catalog); empty if the part is absent.
 pub fn footprints_for(name: &str) -> &'static [&'static PinoutRecord] {

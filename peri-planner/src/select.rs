@@ -31,7 +31,7 @@ pub struct Demand {
 }
 
 /// The metapac peripheral classes a logical kind can be satisfied by.
-fn underlying_classes(kind: &str) -> &'static [&'static str] {
+pub(crate) fn underlying_classes(kind: &str) -> &'static [&'static str] {
     match kind {
         "SERIAL" => &["USART", "UART", "LPUART"],
         "SPI" => &["SPI"],
@@ -40,6 +40,24 @@ fn underlying_classes(kind: &str) -> &'static [&'static str] {
         "UCPD" => &["UCPD"],
         _ => &[],
     }
+}
+
+/// The logical KIND a metapac peripheral *instance name* belongs to — the
+/// inverse of [`underlying_classes`]. `"USART2"` / `"UART4"` / `"LPUART1"` ->
+/// `"SERIAL"`, `"SPI1"` -> `"SPI"`, etc. `None` for a class not modeled as a
+/// kind (timers, comparators, CAN…). The drop-in finder uses this so a USART and
+/// a UART count as interchangeable "class+role" capabilities on the same pin
+/// (consistency with `underlying_classes` is pinned by a test in `dropin`).
+pub fn kind_of(peripheral: &str) -> Option<&'static str> {
+    let class = peripheral.trim_end_matches(|c: char| c.is_ascii_digit());
+    Some(match class {
+        "USART" | "UART" | "LPUART" => "SERIAL",
+        "SPI" => "SPI",
+        "I2C" => "I2C",
+        "ADC" => "ADC",
+        "UCPD" => "UCPD",
+        _ => return None,
+    })
 }
 
 /// The always-required GPIO signals for a kind (the minimal functional config).
