@@ -104,6 +104,8 @@ pub fn show(
         ui.checkbox(&mut q.require_hrtim, "HRTIM");
         ui.checkbox(&mut q.require_sdmmc, "SDMMC");
         ui.checkbox(&mut q.require_fmc, "FMC");
+        ui.checkbox(&mut q.require_eth, "ETH")
+            .on_hover_text("Ethernet MAC present");
         ui.checkbox(&mut q.require_ocp_capable, "HW OCP")
             .on_hover_text("Comparator + advanced timer (COMP → timer-break over-current capable)");
         ui.separator();
@@ -234,7 +236,7 @@ pub fn show(
             .show(ui, |ui| {
                 for h in [
                     "Part", "Family", "Package", "Flash", "RAM", "UART", "CAN",
-                    "ADC/DAC/COMP", "TIM (adv)", "±PWM", "USB/HRTIM", "DMA", "Verify",
+                    "ADC/DAC/COMP", "TIM (adv)", "±PWM", "USB/HRT/ETH", "DMA", "Verify",
                 ] {
                     ui.strong(h);
                 }
@@ -273,9 +275,10 @@ pub fn show(
                     ui.label(e.comp_pwm_ch.to_string())
                         .on_hover_text("Complementary PWM channels (deadtime-capable CHx/CHxN pairs)");
                     ui.label(format!(
-                        "{}/{}",
+                        "{}/{}/{}",
                         if e.has_usb { "Y" } else { "-" },
                         if e.has_hrtim { "Y" } else { "-" },
+                        if e.has_eth { "Y" } else { "-" },
                     ));
                     ui.label(e.dma_pool_total.to_string());
                     match verdict {

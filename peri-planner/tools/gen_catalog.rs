@@ -179,6 +179,7 @@ fn entry_from(v: &Value) -> Option<CatalogEntry> {
         octospi: inst_count(&names, "OCTOSPI"),
         has_sdmmc: names.iter().any(|n| n.starts_with("SDMMC")),
         has_fmc: names.contains("FMC"),
+        has_eth: names.iter().any(|n| n.starts_with("ETH")),
         dma_pool_total: dma_channels.len() as u16,
         gpio_pins: gpio.len() as u16,
         packages: packages.into_iter().collect(),

@@ -54,6 +54,9 @@ pub struct CatalogEntry {
     pub octospi: u8,
     pub has_sdmmc: bool,
     pub has_fmc: bool,
+    /// Ethernet MAC present (the `ETH` / `ETH1` peripheral).
+    #[serde(default)]
+    pub has_eth: bool,
     /// Total physical DMA channels across all controllers (DMA / GPDMA / BDMA /
     /// MDMA / LPDMA), **deduplicated across cores** — dual-core parts list the
     /// same controllers under each core, so a naive sum double-counts. This is
@@ -136,6 +139,7 @@ pub struct SearchQuery {
     pub require_hrtim: bool,
     pub require_sdmmc: bool,
     pub require_fmc: bool,
+    pub require_eth: bool,
     /// Require hardware over-current capability: a comparator AND an advanced
     /// timer present — the necessary condition for a COMP → timer-break OCP path
     /// (the actual routing is a Tier-2 fabric check). A loose, sound Tier-1
@@ -174,6 +178,7 @@ impl SearchQuery {
             && (!self.require_hrtim || e.has_hrtim)
             && (!self.require_sdmmc || e.has_sdmmc)
             && (!self.require_fmc || e.has_fmc)
+            && (!self.require_eth || e.has_eth)
             && (!self.require_ocp_capable || (e.comp >= 1 && e.tim_adv >= 1))
             && self
                 .package_class
@@ -351,6 +356,18 @@ mod tests {
             CATALOG.iter().any(|e| e.package_classes().len() > 1),
             "expected at least one multi-footprint part"
         );
+    }
+
+    #[test]
+    fn ethernet_filter_narrows_to_eth_parts() {
+        let eth = search(&SearchQuery { require_eth: true, ..Default::default() });
+        assert!(!eth.is_empty() && eth.iter().all(|e| e.has_eth));
+        // The classic connectivity families carry an Ethernet MAC.
+        assert!(
+            eth.iter().any(|e| matches!(e.family.as_str(), "STM32F4" | "STM32F7" | "STM32H7")),
+            "expected F4/F7/H7 Ethernet parts"
+        );
+        assert!(eth.len() < search(&SearchQuery::default()).len());
     }
 
     #[test]
