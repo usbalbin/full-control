@@ -37,6 +37,9 @@ fn witness_text(w: &Witness) -> String {
                 Some(_) => format!("OCP: {comp} → {timer} BRK"),
                 None => format!("OCP: {comp} → {timer} break"),
             },
+            AssignedPeri::CompPwm { timer, channel, hs, ls } => {
+                format!("{timer} CH{channel}: HS={}, LS={}", hs.name(), ls.name())
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -93,6 +96,7 @@ pub fn show(
             num(ui, "Min DMA ch", &mut q.min_dma_channels);
             ui.end_row();
             num(ui, "Min adv timer", &mut q.min_tim_adv);
+            num(ui, "Min compl. PWM ch", &mut q.min_comp_pwm_ch);
             ui.end_row();
         });
 
@@ -206,12 +210,12 @@ pub fn show(
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new("partfinder_results")
             .striped(true)
-            .num_columns(11)
+            .num_columns(12)
             .spacing([14.0, 2.0])
             .show(ui, |ui| {
                 for h in [
                     "Part", "Family", "Flash", "RAM", "UART", "CAN", "ADC/DAC/COMP",
-                    "TIM (adv)", "USB/HRTIM", "DMA", "Verify",
+                    "TIM (adv)", "±PWM", "USB/HRTIM", "DMA", "Verify",
                 ] {
                     ui.strong(h);
                 }
@@ -245,6 +249,8 @@ pub fn show(
                     ui.label(e.fdcan.to_string());
                     ui.label(format!("{}/{}/{}", e.adc, e.dac, e.comp));
                     ui.label(format!("{} ({})", e.tim_total, e.tim_adv));
+                    ui.label(e.comp_pwm_ch.to_string())
+                        .on_hover_text("Complementary PWM channels (deadtime-capable CHx/CHxN pairs)");
                     ui.label(format!(
                         "{}/{}",
                         if e.has_usb { "Y" } else { "-" },

@@ -41,6 +41,14 @@ pub struct CatalogEntry {
     pub tim_adv: u8,
     /// Total TIMx instances (advanced + general-purpose + basic).
     pub tim_total: u8,
+    /// Distinct complementary-PWM channels — `(timer, CHxN)` pairs across all
+    /// timers (advanced TIM1/8/20 + complementary GP TIM15/16/17). Each is a
+    /// deadtime-capable high/low output pair: one synchronous-converter
+    /// half-bridge. The Tier-1 capacity bound for a "complementary PWM" demand —
+    /// a sound necessary upper bound (a channel also needs both pins placeable,
+    /// the Tier-2 check), and a useful filter on its own.
+    #[serde(default)]
+    pub comp_pwm_ch: u8,
     pub has_usb: bool,
     pub has_hrtim: bool,
     pub octospi: u8,
@@ -103,6 +111,8 @@ pub struct SearchQuery {
     pub min_gpio_pins: u16,
     /// Minimum advanced-control timers (TIM1/8/20 — complementary PWM + breaks).
     pub min_tim_adv: u8,
+    /// Minimum complementary-PWM channels (deadtime-capable CHx/CHxN pairs).
+    pub min_comp_pwm_ch: u8,
     pub require_usb: bool,
     pub require_hrtim: bool,
     pub require_sdmmc: bool,
@@ -137,6 +147,7 @@ impl SearchQuery {
             && e.dma_pool_total >= self.min_dma_channels
             && e.gpio_pins >= self.min_gpio_pins
             && e.tim_adv >= self.min_tim_adv
+            && e.comp_pwm_ch >= self.min_comp_pwm_ch
             && (!self.require_usb || e.has_usb)
             && (!self.require_hrtim || e.has_hrtim)
             && (!self.require_sdmmc || e.has_sdmmc)

@@ -36,6 +36,47 @@ fn has_any(names: &BTreeSet<String>, want: &[&str]) -> bool {
     want.iter().any(|w| names.contains(*w))
 }
 
+/// A bare `TIM<n>` instance name (not LPTIM / HRTIM, whose outputs aren't CHxN).
+fn is_plain_timer(name: &str) -> bool {
+    name.strip_prefix("TIM")
+        .map(|r| !r.is_empty() && r.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(false)
+}
+
+/// A complementary-output signal `CH<n>N` (e.g. "CH1N").
+fn is_chxn(sig: &str) -> bool {
+    sig.strip_prefix("CH")
+        .and_then(|r| r.strip_suffix('N'))
+        .map(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(false)
+}
+
+/// Count distinct complementary-PWM channels: `(timer instance, CHxN signal)`
+/// pairs over every timer's pin/AF table, unioned across cores. Each is a
+/// deadtime-capable high/low output pair (one converter half-bridge). A sound
+/// upper bound on what a part can wire (the channel also needs both pins broken
+/// out — the Tier-2 check); counting the signal, not the pin, keeps it package-
+/// invariant and never under-counts a feasible part.
+fn comp_pwm_channels(v: &Value) -> u8 {
+    let mut slots: BTreeSet<(String, String)> = BTreeSet::new();
+    for core in v["cores"].as_array().into_iter().flatten() {
+        for p in core["peripherals"].as_array().into_iter().flatten() {
+            let Some(pname) = p["name"].as_str() else { continue };
+            if !is_plain_timer(pname) {
+                continue;
+            }
+            for pc in p["pins"].as_array().into_iter().flatten() {
+                if let Some(sig) = pc["signal"].as_str() {
+                    if is_chxn(sig) {
+                        slots.insert((pname.to_string(), sig.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    slots.len() as u8
+}
+
 fn entry_from(v: &Value) -> Option<CatalogEntry> {
     let name = v["name"].as_str()?.to_string();
     // Normalize family: the freshly-merged C5 data declares "STM32C5 Series"
@@ -123,6 +164,7 @@ fn entry_from(v: &Value) -> Option<CatalogEntry> {
         opamp: inst_count(&names, "OPAMP"),
         tim_adv,
         tim_total: inst_count(&names, "TIM"),
+        comp_pwm_ch: comp_pwm_channels(v),
         has_usb: has_any(&names, &["USB", "USB_OTG_FS", "USB_OTG_HS"]),
         has_hrtim: has_any(&names, &["HRTIM", "HRTIM1"]),
         octospi: inst_count(&names, "OCTOSPI"),

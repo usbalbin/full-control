@@ -120,6 +120,10 @@ fn entry_kind_count(e: &CatalogEntry, kind: &str) -> u8 {
         // bound. The break-timer side (and the COMP→break edge) is the Tier-2
         // check, since the catalog has no break-capable-timer count column.
         "OCP" => e.comp,
+        // Distinct complementary-PWM channels: a sound upper bound (a channel
+        // also needs both pins placeable — the Tier-2 check). Counts advanced AND
+        // complementary-GP timers, so it never under-counts a feasible part.
+        "COMP_PWM" => e.comp_pwm_ch,
         _ => 0,
     }
 }
@@ -168,6 +172,10 @@ pub enum AssignedPeri {
     /// names the specific BRK (1) / BRK2 (2) input when a fabric edge pins it
     /// down, else `None` (the universal break-mux assumption; see `ocp_candidates`).
     Ocp { comp: &'static str, timer: &'static str, break_input: Option<u8> },
+    /// A complementary PWM channel: a timer channel driving a high-side (CHx) and
+    /// low-side (CHxN) output with deadtime — one synchronous-converter
+    /// half-bridge. `hs`/`ls` are the assigned output pins.
+    CompPwm { timer: &'static str, channel: u8, hs: PinId, ls: PinId },
 }
 
 /// A full allocation witness for a feasible design.
@@ -253,14 +261,84 @@ fn ocp_candidates(d: &McuDescriptor) -> Vec<CandMeta> {
     }
 }
 
+/// High- and low-side complementary timer-output roles, indexed by channel-1.
+/// These are the BARE signal strings (`pins_for` keys them per timer instance);
+/// CH4N exists only on advanced timers, CH1N on every complementary timer.
+const CH_ROLES: [&str; 4] = ["CH1", "CH2", "CH3", "CH4"];
+const CHN_ROLES: [&str; 4] = ["CH1N", "CH2N", "CH3N", "CH4N"];
+
+/// Every wireable complementary-PWM slot on `d`: `(timer number, timer name,
+/// channel)` for each complementary-capable timer channel that breaks out BOTH a
+/// high-side (CHx) and a low-side (CHxN) pin on this package. Data-driven from the
+/// raw pin/AF table, so it works lineup-wide through the descriptor asset. A
+/// channel with a CHxN signal but no usable CHx pin (or vice-versa) is omitted —
+/// you can't wire a half-bridge without both legs.
+fn comp_pwm_slots(d: &McuDescriptor) -> Vec<(u8, &'static str, u8)> {
+    let mut slots = Vec::new();
+    for t in d.timers.iter().filter(|t| t.has_complementary) {
+        let Some(peri) = peri_name(d, "TIM", t.number) else { continue };
+        for ch in 0..4u8 {
+            let hs = pins_for(d.raw, SignalId { peripheral: peri, role: CH_ROLES[ch as usize] });
+            let ls = pins_for(d.raw, SignalId { peripheral: peri, role: CHN_ROLES[ch as usize] });
+            if !hs.is_empty() && !ls.is_empty() {
+                slots.push((t.number, peri, ch + 1));
+            }
+        }
+    }
+    slots
+}
+
+/// Distinct wireable complementary-PWM channels on `d` — the definitive Tier-2
+/// slot-capacity bound (exact from real CHx/CHxN pins).
+fn comp_pwm_slot_count(d: &McuDescriptor) -> usize {
+    comp_pwm_slots(d).len()
+}
+
+/// Candidates for one complementary-PWM channel: every wireable `(timer,channel)`
+/// slot, each placed on a distinct high-side (CHx) and low-side (CHxN) pin. The
+/// slot token `Sub("TIMCH", timer, channel)` makes the kernel hand each demanded
+/// channel a DISTINCT timer channel (so N half-bridges need N real complementary
+/// outputs), while a single advanced timer can still supply several. Deliberately
+/// a different `Res` variant from OCP's `Inst("TIM", n)`, so a PWM channel and an
+/// OCP break on the same timer don't spuriously conflict this increment. Both
+/// output pins are `Pin` tokens, so they contend with every other peripheral.
+fn complementary_pwm_candidates(d: &McuDescriptor) -> Vec<CandMeta> {
+    let mut out = Vec::new();
+    for (tnum, peri, channel) in comp_pwm_slots(d) {
+        let ch = (channel - 1) as usize;
+        let hs_pins = pins_for(d.raw, SignalId { peripheral: peri, role: CH_ROLES[ch] });
+        let ls_pins = pins_for(d.raw, SignalId { peripheral: peri, role: CHN_ROLES[ch] });
+        let slot = Res::Sub("TIMCH", tnum, channel);
+        for &hs in &hs_pins {
+            for &ls in &ls_pins {
+                if hs == ls {
+                    continue; // a pin can't be both legs
+                }
+                out.push(CandMeta {
+                    candidate: Candidate::new(
+                        format!("{peri} CH{channel}"),
+                        vec![slot, Res::Pin(hs), Res::Pin(ls)],
+                    ),
+                    assigned: AssignedPeri::CompPwm { timer: peri, channel, hs, ls },
+                });
+            }
+        }
+    }
+    out
+}
+
 /// All candidates for one requirement of `kind` with `options`. For a peripheral
 /// kind: every instance of every underlying class (so a SERIAL demand can take a
 /// USART, UART or LPUART), each with its pin placements for the configured
-/// signals. For "OCP": every comparator→break-timer pairing. The kernel picks
-/// distinct ones via `Inst` exclusivity.
+/// signals. For "OCP": every comparator→break-timer pairing. For "COMP_PWM":
+/// every wireable complementary timer channel. The kernel picks distinct ones via
+/// `Inst` / `Sub` exclusivity.
 fn kind_candidates(d: &McuDescriptor, kind: &str, options: &[&str], dma: u8) -> Vec<CandMeta> {
     if kind == "OCP" {
         return ocp_candidates(d);
+    }
+    if kind == "COMP_PWM" {
+        return complementary_pwm_candidates(d);
     }
     let gpio = required_signals(kind, options);
     let mut out = Vec::new();
@@ -311,6 +389,10 @@ fn channel_demand(demands: &[Demand]) -> usize {
 /// an instance/pin conflict.
 const CHANNEL_UNMET_BASE: u32 = u32::MAX - 1024;
 
+/// Sentinel ids for a complementary-PWM slot shortfall (more channels demanded
+/// than the chip has distinct complementary timer channels). Distinct id range.
+const SLOT_UNMET_BASE: u32 = u32::MAX - 2048;
+
 /// Lower `demands` into a feasibility check against `d`.
 ///
 /// Instances and their GPIO pins go through the backtracking kernel — the
@@ -360,6 +442,25 @@ fn run(d: &McuDescriptor, demands: &[Demand]) -> (Solution, Vec<Vec<AssignedPeri
             metas.push(meta.clone());
         }
     }
+
+    // Definitive complementary-PWM slot guard, BEFORE the CSP. Distinct wireable
+    // (timer,channel) slots is a hard cap; demanding more is infeasible by
+    // counting alone. Short-circuiting here both gives a clean `Infeasible` and
+    // spares the backtracker from proving slot-exhaustion by permuting the many
+    // per-slot pin candidates (the symmetric blow-up pattern).
+    let pwm_demand: usize =
+        demands.iter().filter(|dem| dem.kind == "COMP_PWM").map(|dem| dem.count as usize).sum();
+    if pwm_demand > 0 {
+        let cap = comp_pwm_slot_count(d);
+        if pwm_demand > cap {
+            let mut sol = Solution { assigned: Vec::new(), unmet: Vec::new(), indeterminate: false };
+            for k in 0..(pwm_demand - cap).min(1024) {
+                sol.unmet.push(SLOT_UNMET_BASE + k as u32);
+            }
+            return (sol, metas);
+        }
+    }
+
     let mut sol = assign_backtracking(&reqs);
 
     // DMA channel capacity is a pigeonhole count — definitive (never
@@ -444,6 +545,7 @@ impl DemandInput {
             "SERIAL" => "UART / USART",
             "UCPD" => "USB-PD (UCPD)",
             "OCP" => "HW OCP (COMP→timer)",
+            "COMP_PWM" => "Complementary PWM (CHx/CHxN)",
             other => other,
         }
     }
@@ -835,6 +937,118 @@ mod tests {
             "asset path has no fabric edge, so break input is unspecified, got {:?}",
             w[0],
         );
+    }
+
+    #[test]
+    fn comp_pwm_slots_are_data_driven_and_tier1_sound() {
+        // The descriptor's wireable complementary channels (both CHx AND CHxN
+        // pins placeable) must never EXCEED the catalog's comp_pwm_ch column —
+        // otherwise the Tier-1 bound (entry_kind_count) would wrongly prune a
+        // feasible part. This is the soundness invariant that makes the cheap
+        // catalog filter safe.
+        for (name, pkg) in [("STM32G474RE", Package::G474R), ("STM32C531RC", Package::C531R)] {
+            let d = pkg.descriptor();
+            let slots = comp_pwm_slot_count(d);
+            let cat = catalog::CATALOG.iter().find(|e| e.name == name).expect(name);
+            assert!(
+                slots <= cat.comp_pwm_ch as usize,
+                "{name}: descriptor {slots} wireable channels > catalog Tier-1 bound {}",
+                cat.comp_pwm_ch,
+            );
+            // TIM1 + TIM8 alone give 8 complementary channels on these families.
+            assert!(slots >= 8, "{name}: expected >=8 complementary channels, got {slots}");
+        }
+    }
+
+    #[test]
+    fn complementary_pwm_allocates_with_distinct_slots_and_pins() {
+        // Four complementary PWM channels (one advanced timer's worth) place onto
+        // four distinct (timer,channel) slots, each with a distinct HS (CHx) and
+        // LS (CHxN) pin — a four-phase synchronous converter front-end.
+        let d = Package::G474R.descriptor();
+        let (sol, w) =
+            allocate(d, &[Demand { kind: "COMP_PWM", count: 4, with_dma: false, options: vec![] }]);
+        assert!(sol.is_feasible() && !sol.indeterminate, "4 compl PWM on G474; unmet={:?}", sol.unmet);
+        assert_eq!(w.len(), 4);
+        let mut slots = BTreeSet::new();
+        let mut pins = Vec::new();
+        for ap in &w {
+            let AssignedPeri::CompPwm { timer, channel, hs, ls } = ap else {
+                panic!("COMP_PWM demand yields CompPwm witnesses, got {ap:?}");
+            };
+            assert!(timer.starts_with("TIM"), "named a timer, got {timer}");
+            assert!((1..=4).contains(channel), "channel 1..=4, got {channel}");
+            assert_ne!(hs, ls, "high- and low-side on distinct pins");
+            assert!(hs.name().starts_with('P') && ls.name().starts_with('P'), "pins named PXn");
+            slots.insert((*timer, *channel));
+            pins.push(*hs);
+            pins.push(*ls);
+        }
+        assert_eq!(slots.len(), 4, "four distinct (timer,channel) slots");
+        let distinct: BTreeSet<_> = pins.iter().collect();
+        assert_eq!(pins.len(), distinct.len(), "no pin reused across channels");
+    }
+
+    #[test]
+    fn complementary_pwm_exceeding_slots_is_infeasible() {
+        // Demanding more complementary channels than the chip has distinct
+        // complementary timer channels is infeasible — and DEFINITIVELY so (the
+        // slot count guard short-circuits before the backtracker, so it's a clean
+        // Infeasible, not a budget-cut indeterminate).
+        let d = Package::G474R.descriptor();
+        let cap = comp_pwm_slot_count(d);
+        let s = solve(
+            d,
+            &[Demand { kind: "COMP_PWM", count: (cap + 1) as u8, with_dma: false, options: vec![] }],
+        );
+        assert!(!s.is_feasible(), "demanding {} > {cap} complementary channels is infeasible", cap + 1);
+        assert!(!s.indeterminate, "slot exhaustion is a definitive count, not budget-cut");
+    }
+
+    #[test]
+    fn comp_pwm_and_ocp_are_independent_on_shared_timers() {
+        // A complementary-PWM channel (Res::Sub("TIMCH",..)) and an OCP route
+        // (Res::Inst("TIM",..)) use distinct Res variants, so they never fight
+        // over a timer — even on C531 where the PWM timers ARE the break timers.
+        // 4 PWM channels + 2 OCP routes coexist.
+        let d = Package::C531R.descriptor();
+        let s = solve(
+            d,
+            &[
+                Demand { kind: "COMP_PWM", count: 4, with_dma: false, options: vec![] },
+                Demand { kind: "OCP", count: 2, with_dma: false, options: vec![] },
+            ],
+        );
+        assert!(s.is_feasible() && !s.indeterminate, "PWM+OCP coexist on C531; unmet={:?}", s.unmet);
+    }
+
+    #[test]
+    fn comp_pwm_has_no_dma() {
+        // Complementary PWM is an output, not a DMA stream — the toggle is hidden
+        // and a stray with_dma never adds channel demand.
+        assert!(!DemandInput::new("COMP_PWM").supports_dma());
+        let with_dma = [Demand { kind: "COMP_PWM", count: 4, with_dma: true, options: vec![] }];
+        assert_eq!(channel_demand(&with_dma), 0);
+    }
+
+    #[test]
+    fn evaluate_complementary_pwm_verifies_and_tier1_is_sound() {
+        let demands = [Demand { kind: "COMP_PWM", count: 4, with_dma: false, options: vec![] }];
+        let results = evaluate(&SearchQuery::default(), &demands);
+        // G474RE (11 complementary channels) verifies for 4, with a 4-channel witness.
+        let g4 = results.iter().find(|(e, _, _)| e.name == "STM32G474RE").expect("G474RE");
+        assert_eq!(g4.1, Verdict::Verified);
+        assert!(g4.2.as_ref().is_some_and(|w| w.len() == 4), "Verified part carries a 4-channel witness");
+        // Tier-1 soundness: nothing that survived as Verified/BoundsOnly is below
+        // the necessary bound, and parts below it exist and are excluded (Infeasible).
+        assert!(
+            results
+                .iter()
+                .filter(|(_, v, _)| *v != Verdict::Infeasible)
+                .all(|(e, _, _)| e.comp_pwm_ch >= 4),
+            "every non-infeasible survivor meets the >=4 complementary-channel bound",
+        );
+        assert!(catalog::CATALOG.iter().any(|e| e.comp_pwm_ch < 4), "sub-4-channel parts exist");
     }
 
     #[test]
