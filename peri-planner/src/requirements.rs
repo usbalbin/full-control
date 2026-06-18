@@ -428,6 +428,41 @@ impl RequirementSpec {
     /// buttons. One entry per distinct requirement *shape* — PCM-phase
     /// variants (DEM / threshold) and ADC-conversion purposes get picked
     /// via the per-row spec combobox after add, not via separate buttons.
+    /// The Part-finder demand kind(s) this requirement contributes to — the
+    /// backward "find parts from this design" projection. A spec can shadow two
+    /// kinds (a complementary timer with a comparator break = COMP_PWM + OCP).
+    /// Empty for specs with no demand shadow (OPAMP / CAN / USB / bus-share).
+    pub fn demand_kinds(&self) -> Vec<&'static str> {
+        match self {
+            RequirementSpec::UseUsart { .. }
+            | RequirementSpec::UseUart { .. }
+            | RequirementSpec::UseLpuart { .. } => vec!["SERIAL"],
+            RequirementSpec::UseSpi { .. } => vec!["SPI"],
+            RequirementSpec::UseI2c { .. } => vec!["I2C"],
+            RequirementSpec::UseUcpd { .. } => vec!["UCPD"],
+            RequirementSpec::AdcConversion { .. } => vec!["ADC"],
+            RequirementSpec::UseHrtimSub { fault, .. } => {
+                let mut v = vec!["COMP_PWM"];
+                if fault.is_some() {
+                    v.push("OCP");
+                }
+                v
+            }
+            RequirementSpec::UseTim { complementary, bkin_comp, .. } => {
+                let mut v = Vec::new();
+                if *complementary {
+                    v.push("COMP_PWM");
+                }
+                if bkin_comp.is_some() {
+                    v.push("OCP");
+                }
+                v
+            }
+            RequirementSpec::ShortCircuitFault => vec!["OCP"],
+            _ => Vec::new(),
+        }
+    }
+
     pub fn add_palette() -> &'static [Self] {
         &[
             // Power
@@ -2375,5 +2410,31 @@ mod tests {
             .any(|o| o.peripheral == "SPI1" && o.role == "MOSI"));
         d.clear_pin(sig);
         assert!(d.pinned(sig).is_none() && !d.has_pins());
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    #[test]
+    fn demand_kinds_maps_specs_to_finder_kinds() {
+        for s in RequirementSpec::comms_palette() {
+            match s {
+                RequirementSpec::UseUsart { .. }
+                | RequirementSpec::UseUart { .. }
+                | RequirementSpec::UseLpuart { .. } => assert_eq!(s.demand_kinds(), vec!["SERIAL"]),
+                RequirementSpec::UseSpi { .. } => assert_eq!(s.demand_kinds(), vec!["SPI"]),
+                RequirementSpec::UseI2c { .. } => assert_eq!(s.demand_kinds(), vec!["I2C"]),
+                RequirementSpec::UseUcpd { .. } => assert_eq!(s.demand_kinds(), vec!["UCPD"]),
+                RequirementSpec::UseCan { .. } | RequirementSpec::UseUsb => {
+                    assert!(s.demand_kinds().is_empty())
+                }
+                _ => {}
+            }
+        }
+        // HRTIM sub-timer is complementary PWM.
+        assert_eq!(RequirementSpec::hrtim_palette()[0].demand_kinds(), vec!["COMP_PWM"]);
+        assert_eq!(RequirementSpec::ShortCircuitFault.demand_kinds(), vec!["OCP"]);
     }
 }

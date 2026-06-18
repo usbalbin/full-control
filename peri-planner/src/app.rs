@@ -179,6 +179,65 @@ impl PeriPlannerApp {
         }
     }
 
+    /// Logical-kind peripheral counts derived from the active design — the
+    /// backward "find parts from this design" projection (lossy: drops pins,
+    /// instance identity, HRTIM roles; recovers the coarse counts the Part
+    /// finder consumes).
+    fn design_demand_counts(&self) -> std::collections::BTreeMap<&'static str, u8> {
+        use std::collections::{BTreeMap, BTreeSet};
+        let mut c: BTreeMap<&'static str, u8> = BTreeMap::new();
+        let mut bump = |k: &'static str, n: u8| {
+            let e = c.entry(k).or_insert(0);
+            *e = e.saturating_add(n);
+        };
+        match self.mcu {
+            Mcu::G474 => {
+                for spec in &self.design.requirements {
+                    for k in spec.demand_kinds() {
+                        bump(k, 1);
+                    }
+                }
+            }
+            Mcu::C531 => {
+                for leg in &self.c531_design.legs {
+                    if leg.complementary {
+                        bump("COMP_PWM", (leg.channels_mask.count_ones() as u8).max(1));
+                    }
+                    if leg.ocp.is_some() {
+                        bump("OCP", 1);
+                    }
+                    if leg.adc_sense.is_some() {
+                        bump("ADC", 1);
+                    }
+                }
+            }
+            Mcu::H523 | Mcu::C5A3 => {
+                // Distinct peripheral instances per kind (a peripheral has
+                // several role locks; count the instance once).
+                let mut by_kind: BTreeMap<&'static str, BTreeSet<&str>> = BTreeMap::new();
+                for l in &self.h523_design.pin_locks {
+                    if let Some(k) = crate::select::kind_of(&l.peripheral) {
+                        by_kind.entry(k).or_default().insert(l.peripheral.as_str());
+                    }
+                }
+                for (k, set) in by_kind {
+                    bump(k, set.len() as u8);
+                }
+            }
+        }
+        c
+    }
+
+    /// Fill the Part-finder demands from the active design and open the finder
+    /// ("find parts that fit what I've sketched").
+    fn summarize_to_demands(&mut self) {
+        let counts = self.design_demand_counts();
+        for d in &mut self.catalog_demands {
+            d.count = counts.get(d.kind).copied().unwrap_or(0);
+        }
+        self.view = ViewMode::Catalog;
+    }
+
     fn render_top_bar(&mut self, ctx: &egui::Context, can_undo: bool, can_redo: bool) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -271,6 +330,35 @@ impl PeriPlannerApp {
                 if ui.button("Export").clicked() {
                     let text = self.design.export_summary();
                     ui.ctx().copy_text(text);
+                }
+            });
+            // Shared "design spec" strip: peripherals declared once (in the Part
+            // finder) are summarized here and actionable from every planner view —
+            // the lightweight "declare once" link between the finder and allocator.
+            let active: Vec<String> = self
+                .catalog_demands
+                .iter()
+                .filter(|d| d.count > 0)
+                .map(|d| format!("{}×{}", d.kind, d.count))
+                .collect();
+            ui.horizontal(|ui| {
+                ui.label("Spec:");
+                if active.is_empty() {
+                    ui.label(
+                        egui::RichText::new("(none — declare peripherals in Part finder)").weak(),
+                    );
+                } else {
+                    ui.label(active.join("   "));
+                }
+                ui.separator();
+                if ui
+                    .button("⟳ Demands from design")
+                    .on_hover_text(
+                        "Count this design's peripherals into the Part-finder demands and open it",
+                    )
+                    .clicked()
+                {
+                    self.summarize_to_demands();
                 }
             });
         });
