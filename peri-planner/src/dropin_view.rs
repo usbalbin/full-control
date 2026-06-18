@@ -219,13 +219,15 @@ pub fn show(
                     } else {
                         ui.label(if c.same_family { "same family" } else { "—" });
                     }
-                    // Diff toggle.
-                    let open = focus.as_deref() == Some(c.name.as_str());
+                    // Diff toggle. The key is (name, footprint): one part name can
+                    // yield two rows (e.g. LQFP64_GP + LQFP64_N share a name).
+                    let key = format!("{}|{}", c.name, c.footprint);
+                    let open = focus.as_deref() == Some(key.as_str());
                     if ui
                         .selectable_label(open, if open { "hide ▾" } else { "pins ▸" })
                         .clicked()
                     {
-                        *focus = if open { None } else { Some(c.name.clone()) };
+                        *focus = if open { None } else { Some(key.clone()) };
                     }
                     ui.end_row();
 
@@ -234,7 +236,7 @@ pub fn show(
                         ui.label("");
                         let diff: Vec<&PosResult> =
                             c.positions.iter().filter(|p| is_interesting(p)).collect();
-                        egui::Grid::new(format!("dropin_diff_{}", c.name))
+                        egui::Grid::new(format!("dropin_diff_{key}"))
                             .num_columns(3)
                             .spacing([10.0, 1.0])
                             .show(ui, |ui| {

@@ -61,19 +61,37 @@ fn footprints_of(v: &Value) -> Vec<(String, String, Vec<PhysPin>)> {
         let Some(pkg_name) = pkg["package"].as_str() else {
             continue;
         };
-        let mut pins: Vec<PhysPin> = Vec::new();
+        // One PhysPin per PHYSICAL position. stm32-data encodes a merged ball
+        // (several die pads bonded to one ball/pin) inconsistently: most families
+        // list one pin entry with several signal tokens, but the C5 small
+        // packages list SEVERAL entries that share a `position` string. Union
+        // them here so a position is always one PhysPin carrying its full signal
+        // set — otherwise `PinoutRecord::at()` would see only the first and
+        // `n`/`positions()` would over-count physical pins.
+        let mut order: Vec<String> = Vec::new();
+        let mut by_pos: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
         for pc in pkg["pins"].as_array().into_iter().flatten() {
             let Some(pos) = pc["position"].as_str() else {
                 continue;
             };
-            let sigs: Vec<String> = pc["signals"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter_map(|s| s.as_str().map(str::to_string))
-                .collect();
-            pins.push(PhysPin { p: pos.to_string(), s: sigs });
+            if !by_pos.contains_key(pos) {
+                order.push(pos.to_string());
+            }
+            let entry = by_pos.entry(pos.to_string()).or_default();
+            for s in pc["signals"].as_array().into_iter().flatten() {
+                if let Some(sig) = s.as_str() {
+                    entry.insert(sig.to_string());
+                }
+            }
         }
+        let pins: Vec<PhysPin> = order
+            .into_iter()
+            .map(|p| {
+                let s = by_pos.remove(&p).unwrap_or_default().into_iter().collect();
+                PhysPin { p, s }
+            })
+            .collect();
         if !pins.is_empty() {
             out.push((name.to_string(), pkg_name.to_string(), pins));
         }

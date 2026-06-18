@@ -66,9 +66,11 @@ pub struct PinoutRecord {
     pub names: Vec<String>,
     /// Representative family, e.g. `"STM32G4"` (display / diagnostic only).
     pub fam: String,
-    /// Bonded-pin count (`== pins.len()`). A `"LQFP64"` that bonds only 52 pins
-    /// (some C5 lines) has `n == 52`: it is *not* the same footprint as a full
-    /// 64-pin part — the coverage gate in `dropin` relies on this.
+    /// Distinct physical-position count (`== pins.len()`, one `PhysPin` per
+    /// position after the generator merges co-located rows). A `"LQFP64"` whose
+    /// data bonds only 52 positions (C5 omits power pads) has `n == 52`: it is
+    /// *not* the same footprint as a full 64-position part — the position-set
+    /// gate in `dropin` rejects the difference.
     pub n: u16,
     pub pins: Vec<PhysPin>,
 }
@@ -162,21 +164,29 @@ pub enum PinFunction {
 impl PinFunction {
     /// Classify a raw signal token set into one [`PinFunction`]. The single place
     /// the data's quirks are interpreted:
-    ///   * all tokens are GPIO names (`P[A-Z][0-9]+`) -> `Gpio` (handles merged
-    ///     balls);
-    ///   * all tokens are canonical rails (`/`-fused tokens split first) ->
+    ///   * ANY token is a GPIO name (`P[A-Z][0-9]+`) -> `Gpio` (handles merged
+    ///     balls AND a GPIO co-located with an alternate token like
+    ///     `UCPD1_DBCC1` or a shared `NRST`);
+    ///   * else all tokens are canonical rails (`/`-fused tokens split first) ->
     ///     `Power`;
     ///   * empty -> `Nc`;
-    ///   * anything else (a dedicated pin, an unknown token, or a GPIO/power mix)
-    ///     -> `Dedicated`, which only ever matches an identical token set
-    ///     (conservative — cannot false-accept a GPIO or a rail).
+    ///   * anything else (a dedicated pin, an unknown token) -> `Dedicated`,
+    ///     which only ever matches an identical token set (conservative — cannot
+    ///     false-accept a GPIO or a rail).
     pub fn classify(tokens: &[String]) -> PinFunction {
         if tokens.is_empty() {
             return PinFunction::Nc;
         }
-        // Try all-GPIO.
-        let gpios: Option<Vec<PinId>> = tokens.iter().map(|t| PinId::from_metapac(t)).collect();
-        if let Some(mut pins) = gpios {
+        // A position bearing ANY GPIO token IS a GPIO: a co-located non-GPIO
+        // token (UCPD dead-battery, a shared NRST on a tiny merged ball) is an
+        // alternate function of the SAME physical pin, and the pin's GPIO
+        // identity is what gets wired / AF-muxed. Classifying it as Gpio keeps
+        // the wired function's serviceability a checked requirement — otherwise
+        // it would be buried in a verbatim-matched `Dedicated` bundle and the
+        // requirement silently dropped (a false-accept). The reset/boot signal
+        // is preserved independently by `has_reset_boot` (which scans raw tokens).
+        let mut pins: Vec<PinId> = tokens.iter().filter_map(|t| PinId::from_metapac(t)).collect();
+        if !pins.is_empty() {
             pins.sort();
             pins.dedup();
             return PinFunction::Gpio(pins);
@@ -231,8 +241,12 @@ impl PinoutRecord {
     /// the reset/boot net and must say so rather than claim a clean pass.
     pub fn has_reset_boot(&self) -> bool {
         self.pins.iter().any(|p| {
-            p.s.iter()
-                .any(|t| matches!(t.as_str(), "NRST" | "BOOT0" | "BOOT" | "PDR_ON"))
+            p.s.iter().any(|t| {
+                matches!(
+                    t.as_str(),
+                    "NRST" | "RSTN" | "BOOT0" | "BOOT" | "BOOT1" | "PDR_ON" | "NPOR"
+                )
+            })
         })
     }
 }
@@ -312,6 +326,23 @@ pub fn index() -> &'static [PartFootprint] {
 pub fn footprints_for(name: &str) -> &'static [&'static PinoutRecord] {
     static EMPTY: &[&PinoutRecord] = &[];
     by_name().get(name).map(|v| v.as_slice()).unwrap_or(EMPTY)
+}
+
+/// Resolve a part's footprint record by `(part_name, package label)`, tolerating
+/// an ordering-code suffix on `part_name`: compiled C5 descriptors carry one
+/// (e.g. `"STM32C531RCT6"`) while the index keys on the bare chip name
+/// (`"STM32C531RC"`). Exact match first, then the longest index name that is a
+/// prefix of `part_name`.
+pub fn footprint_for(part_name: &str, label: &str) -> Option<&'static PinoutRecord> {
+    if let Some(r) = footprints_for(part_name).iter().copied().find(|r| r.pkg == label) {
+        return Some(r);
+    }
+    asset()
+        .index
+        .iter()
+        .filter(|f| f.pkg == label && part_name.starts_with(f.name.as_str()))
+        .max_by_key(|f| f.name.len())
+        .and_then(|f| record(&f.h))
 }
 
 /// A record by its content hash.
@@ -443,6 +474,47 @@ mod tests {
             let g4_15 = g4.at("15").map(|p| p.function());
             let h5_15 = h5.at("15").map(|p| p.function());
             assert_ne!(g4_15, h5_15, "pos 15 should differ between G4 and H5 LQFP64");
+        }
+    }
+
+    #[test]
+    fn classify_gpio_with_co_located_token_is_gpio() {
+        // A GPIO sharing a ball with an alternate token (UCPD dead-battery, or a
+        // shared NRST on a tiny merged ball) must classify as Gpio so the wired
+        // function stays a checked requirement — not buried in a Dedicated bundle.
+        assert_eq!(
+            PinFunction::classify(&s(&["PA9", "UCPD1_DBCC1"])),
+            PinFunction::Gpio(vec![PinId { port: 'A', num: 9 }])
+        );
+        match PinFunction::classify(&s(&["NRST", "PA0", "PA1", "PA2"])) {
+            PinFunction::Gpio(pins) => assert_eq!(pins.len(), 3),
+            other => panic!("expected Gpio, got {other:?}"),
+        }
+        // A pure dedicated token (no GPIO) is still Dedicated.
+        assert_eq!(PinFunction::classify(&s(&["NRST"])), PinFunction::Dedicated(s(&["NRST"])));
+    }
+
+    #[test]
+    fn footprint_for_tolerates_ordering_code_suffix() {
+        // Compiled C5 descriptors carry an ordering-code suffix the index lacks.
+        let exact = footprint_for("STM32C531RC", "LQFP64");
+        let suffixed = footprint_for("STM32C531RCT6", "LQFP64");
+        assert!(exact.is_some(), "bare C531RC name should resolve");
+        assert_eq!(
+            exact.map(|r| r.h.clone()),
+            suffixed.map(|r| r.h.clone()),
+            "suffixed name must resolve to the same footprint"
+        );
+    }
+
+    #[test]
+    fn merged_ball_positions_are_unique_after_generator_merge() {
+        // The generator now unions co-located rows, so no record has two PhysPin
+        // entries at the same physical position (n == distinct positions).
+        for r in all_records() {
+            let distinct: BTreeSet<&str> = r.pins.iter().map(|p| p.p.as_str()).collect();
+            assert_eq!(distinct.len(), r.pins.len(), "{} has duplicate-position rows", r.pkg);
+            assert_eq!(r.n as usize, r.pins.len());
         }
     }
 }

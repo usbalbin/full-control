@@ -189,9 +189,23 @@ impl SourceProfile {
 pub fn build_source_profile(src: &DesignSource, package: Package) -> Option<SourceProfile> {
     let name = package.name();
     let label = package.package_label();
-    let footprint =
-        phys_pinout::footprints_for(name).iter().copied().find(|r| r.pkg == label)?;
-    Some(SourceProfile { name: name.to_string(), footprint, wired: src.wired() })
+    // Suffix-tolerant: compiled C5 descriptors carry an ordering-code suffix
+    // ("STM32C531RCT6") that the index doesn't key on ("STM32C531RC").
+    let footprint = phys_pinout::footprint_for(name, label)?;
+    // Keep only wired pins that physically exist as a GPIO on this footprint.
+    // Defends against stale locks from another MCU: `h523_design` (the pin-lock
+    // model) is shared between H523 and C5A3 and is not cleared on MCU switch.
+    let gpio_pins: BTreeSet<PinId> = footprint
+        .pins
+        .iter()
+        .filter_map(|p| match p.function() {
+            PinFunction::Gpio(ps) => Some(ps),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    let wired = src.wired().into_iter().filter(|w| gpio_pins.contains(&w.pin)).collect();
+    Some(SourceProfile { name: name.to_string(), footprint, wired })
 }
 
 /// The outcome at one physical position (drives the per-pin diff + coloring).
@@ -368,58 +382,21 @@ fn evaluate_candidate(
         let cand_fn = cand_rec.at(&sp.p).map(|p| p.function());
         let (kind, outcome, detail) = match sp.function() {
             PinFunction::Power(want_rails) => {
+                // EQUALITY, not subset: a candidate that fuses extra rails onto
+                // this position (e.g. VDD/VDDA where the source carried only VDD,
+                // keeping VDDA on a separate net elsewhere) would bridge two
+                // distinct board nets through the part — a short, not a drop-in.
                 let outcome = match &cand_fn {
-                    Some(PinFunction::Power(have)) if want_rails.iter().all(|r| have.contains(r)) => {
-                        PosOutcome::PowerOk
-                    }
+                    Some(PinFunction::Power(have)) if *have == want_rails => PosOutcome::PowerOk,
                     _ => PosOutcome::PowerMismatch,
                 };
                 let detail = format!("power {want_rails:?} → {}", describe(&cand_fn));
                 (SourceKind::Power, outcome, detail)
             }
             PinFunction::Gpio(pins) => {
-                if let Some(w) = pins.iter().find_map(|p| by_pin.get(p).copied()) {
-                    // Allocated: the candidate must be GPIO here and serve it.
-                    let mut best: Option<(MatchTier, String, String, PinId)> = None;
-                    if let Some(PinFunction::Gpio(cand_pins)) = &cand_fn {
-                        for cp in cand_pins {
-                            for cap in cand_af.get(cp).into_iter().flatten() {
-                                if let Some(t) =
-                                    serve_tier(&w.sig, &cap.peripheral, &cap.role, cap.af, cfg.strictness)
-                                    && best.as_ref().is_none_or(|(b, ..)| t < *b)
-                                {
-                                    best = Some((t, cap.peripheral.clone(), cap.role.clone(), *cp));
-                                }
-                            }
-                        }
-                    }
-                    match best {
-                        Some((tier, cperi, crole, cpin)) => {
-                            let outcome = match tier {
-                                MatchTier::Exact => PosOutcome::ServiceableExact,
-                                MatchTier::ClassRole => PosOutcome::ServiceableClassRole,
-                                MatchTier::ClassOnly => PosOutcome::ServiceableClassOnly,
-                            };
-                            let detail = format!(
-                                "{}.{} → {cperi}.{crole} @ {}",
-                                w.sig.peripheral,
-                                w.sig.role,
-                                cpin.name()
-                            );
-                            (SourceKind::Allocated, outcome, detail)
-                        }
-                        None => (
-                            SourceKind::Allocated,
-                            PosOutcome::FunctionFail,
-                            format!(
-                                "{}.{} not serviceable → {}",
-                                w.sig.peripheral,
-                                w.sig.role,
-                                describe(&cand_fn)
-                            ),
-                        ),
-                    }
-                } else {
+                let wired_here: Vec<&WiredFn> =
+                    pins.iter().filter_map(|p| by_pin.get(p).copied()).collect();
+                if wired_here.is_empty() {
                     // Unused source GPIO.
                     let outcome = match &cand_fn {
                         Some(PinFunction::Gpio(_)) => PosOutcome::UnusedOk,
@@ -431,6 +408,61 @@ fn evaluate_candidate(
                     };
                     let detail = format!("unused {} → {}", pins[0].name(), describe(&cand_fn));
                     (SourceKind::UnusedGpio, outcome, detail)
+                } else {
+                    // Allocated: EVERY wired function on this physical position
+                    // must be serviceable on the candidate. (A merged ball is one
+                    // net, so this is normally a single function — but if the user
+                    // locked several, all are required.)
+                    let cand_pins: &[PinId] = match &cand_fn {
+                        Some(PinFunction::Gpio(cps)) => cps,
+                        _ => &[],
+                    };
+                    let mut details: Vec<String> = Vec::new();
+                    let mut worst: Option<MatchTier> = Some(MatchTier::Exact);
+                    for w in &wired_here {
+                        let mut best: Option<(MatchTier, String, String, PinId)> = None;
+                        for cp in cand_pins {
+                            for cap in cand_af.get(cp).into_iter().flatten() {
+                                if let Some(t) = serve_tier(
+                                    &w.sig,
+                                    &cap.peripheral,
+                                    &cap.role,
+                                    cap.af,
+                                    cfg.strictness,
+                                ) && best.as_ref().is_none_or(|(b, ..)| t < *b)
+                                {
+                                    best = Some((t, cap.peripheral.clone(), cap.role.clone(), *cp));
+                                }
+                            }
+                        }
+                        match best {
+                            Some((tier, cperi, crole, cpin)) => {
+                                details.push(format!(
+                                    "{}.{} → {cperi}.{crole} @ {}",
+                                    w.sig.peripheral,
+                                    w.sig.role,
+                                    cpin.name()
+                                ));
+                                worst = worst.map(|b| b.max(tier));
+                            }
+                            None => {
+                                worst = None;
+                                details.push(format!(
+                                    "{}.{} not serviceable → {}",
+                                    w.sig.peripheral,
+                                    w.sig.role,
+                                    describe(&cand_fn)
+                                ));
+                            }
+                        }
+                    }
+                    let outcome = match worst {
+                        Some(MatchTier::Exact) => PosOutcome::ServiceableExact,
+                        Some(MatchTier::ClassRole) => PosOutcome::ServiceableClassRole,
+                        Some(MatchTier::ClassOnly) => PosOutcome::ServiceableClassOnly,
+                        None => PosOutcome::FunctionFail,
+                    };
+                    (SourceKind::Allocated, outcome, details.join("; "))
                 }
             }
             PinFunction::Dedicated(tokens) => {
@@ -465,13 +497,37 @@ fn evaluate_candidate(
     let reset_boot_unverified = !same_family
         && (!src.footprint.has_reset_boot() || !cand_rec.has_reset_boot());
 
+    // Footprint gate: a genuine drop-in has the IDENTICAL set of physical
+    // positions (ignoring NC). The per-position loop above only visits SOURCE
+    // positions, so it never sees a candidate position the source lacks —
+    // crucially the candidate's POWER pins. Without this, a source whose data
+    // omits its power pads (stm32-data drops all C5 power/ground bonds, so a C5
+    // "LQFP64" carries 52 positions, 0 of them power) would vacuously accept
+    // every full-bond foreign part as compatible. Comparing the non-NC position
+    // SETS rejects any size/placement difference in both directions.
+    let src_positions: BTreeSet<&str> = src
+        .footprint
+        .pins
+        .iter()
+        .filter(|p| !matches!(p.function(), PinFunction::Nc))
+        .map(|p| p.p.as_str())
+        .collect();
+    let cand_positions: BTreeSet<&str> = cand_rec
+        .pins
+        .iter()
+        .filter(|p| !matches!(p.function(), PinFunction::Nc))
+        .map(|p| p.p.as_str())
+        .collect();
+    let footprint_match = src_positions == cand_positions;
+
     let n_required = positions
         .iter()
         .filter(|p| matches!(p.kind, SourceKind::Power | SourceKind::Allocated))
         .count() as u16;
     let n_satisfied = positions.iter().filter(|p| p.outcome.is_satisfied()).count() as u16;
     let warnings = positions.iter().filter(|p| p.outcome == PosOutcome::PowerAsym).count() as u16;
-    let compatible = !positions.iter().any(|p| p.outcome.is_blocker(cfg.power_mode));
+    let compatible =
+        footprint_match && !positions.iter().any(|p| p.outcome.is_blocker(cfg.power_mode));
 
     let count = |o: &PosOutcome| positions.iter().filter(|p| &p.outcome == o).count() as i64;
     let score = 1000 * count(&PosOutcome::ServiceableExact)
@@ -514,7 +570,12 @@ fn describe(f: &Option<PinFunction>) -> String {
 /// the *same land-pattern footprint*, excluding the source's own prefix.
 pub fn find_replacements(src: &SourceProfile, cfg: MatchConfig) -> Vec<CandidateMatch> {
     let src_prefix = if src.name.len() >= 10 { &src.name[..10] } else { src.name.as_str() };
-    let src_class = package_class(&src.footprint.pkg);
+    // An unparseable source footprint name cannot be land-pattern-gated, and
+    // `None != None` is false, so comparing raw Options would silently admit
+    // every other unparseable package. Bail instead.
+    let Some(src_class) = package_class(&src.footprint.pkg) else {
+        return Vec::new();
+    };
 
     let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
     let mut out: Vec<CandidateMatch> = Vec::new();
@@ -530,7 +591,7 @@ pub fn find_replacements(src: &SourceProfile, cfg: MatchConfig) -> Vec<Candidate
         if !seen.insert((prefix.to_string(), f.pkg.clone())) {
             continue; // dedup flash variants of one (prefix, footprint)
         }
-        if package_class(&f.pkg) != src_class {
+        if package_class(&f.pkg) != Some(src_class) {
             continue; // different land pattern — never a board drop-in
         }
         let Some(rec) = phys_pinout::record(&f.h) else { continue };
@@ -817,18 +878,17 @@ mod tests {
     }
 
     #[test]
-    fn fused_rail_superset_satisfies_split_source() {
+    fn fused_rail_superset_is_rejected_as_short() {
+        // Source keeps VDD (pos1) and VDDA (pos3) on SEPARATE board nets.
         let footprint = Box::leak(Box::new(rec(
             "STM32G4",
             "LQFP4",
             vec![ph("1", &["VDD"]), ph("2", &["PA9"]), ph("3", &["VDDA"]), ph("4", &["PB0"])],
         )));
-        let src = SourceProfile {
-            name: "STM32G4XXRE".to_string(),
-            footprint,
-            wired: vec![],
-        };
-        // Candidate fuses VDD/VDDA onto pos1 and pos3 — superset rails satisfy.
+        let src = SourceProfile { name: "STM32G4XXRE".to_string(), footprint, wired: vec![] };
+        // Candidate FUSES VDD/VDDA onto pos1 and pos3 — dropping it in would short
+        // the source's separate VDD and VDDA nets together. Must be rejected (the
+        // power gate is rail-set EQUALITY, not subset).
         let cand = rec(
             "STM32C0",
             "LQFP4",
@@ -841,7 +901,38 @@ mod tests {
         );
         let af = oracle(&[]);
         let m = evaluate_candidate(&src, "STM32C0", &cand, &af, MatchConfig::default());
-        assert!(m.compatible, "{:?}", m.positions);
+        assert!(!m.compatible, "fused-rail candidate must not be a drop-in: {:?}", m.positions);
+        assert!(m.positions.iter().any(|p| p.outcome == PosOutcome::PowerMismatch));
+    }
+
+    #[test]
+    fn partial_bond_source_rejects_fuller_foreign_footprint() {
+        // A C5-like source whose data omits its power pads: 2 GPIO positions, NO
+        // power. The per-position loop has nothing to gate, so without the
+        // footprint position-set gate every fuller foreign part would vacuously
+        // pass. The candidate is a full-bond foreign LQFP with power pins the
+        // source lacks — it must be rejected.
+        let footprint = Box::leak(Box::new(rec(
+            "STM32C5",
+            "LQFP4",
+            vec![ph("2", &["PA0"]), ph("3", &["PA1"])],
+        )));
+        let src = SourceProfile { name: "STM32C5XXR0".to_string(), footprint, wired: vec![] };
+        let cand = rec(
+            "STM32F1",
+            "LQFP4",
+            vec![ph("1", &["VDD"]), ph("2", &["PA0"]), ph("3", &["PA1"]), ph("4", &["VSS"])],
+        );
+        let af = oracle(&[]);
+        let m = evaluate_candidate(&src, "STM32F103", &cand, &af, MatchConfig::default());
+        assert!(
+            !m.compatible,
+            "a fuller foreign footprint must not be a drop-in for a partial-bond source"
+        );
+        // And a same-position-set sibling (also power-omitted) IS compatible.
+        let sib = rec("STM32C5", "LQFP4", vec![ph("2", &["PA0"]), ph("3", &["PA1"])]);
+        let m2 = evaluate_candidate(&src, "STM32C5YY", &sib, &af, MatchConfig::default());
+        assert!(m2.compatible, "a same-footprint C5 sibling should be compatible: {:?}", m2.positions);
     }
 
     // ---------- Integration over the real lineup asset ----------
@@ -881,5 +972,30 @@ mod tests {
         );
         // The source's own prefix is never suggested.
         assert!(!results.iter().any(|c| c.name.starts_with("STM32G474R")));
+    }
+
+    #[test]
+    fn c531_source_resolves_and_never_false_accepts_foreign_families() {
+        // Regression for the critical false-accept: a C5 source's data omits all
+        // power pads (C531 LQFP64 = 52 positions, 0 power), so the per-position
+        // gates have nothing to check. The footprint position-set gate must still
+        // reject every fuller foreign-family LQFP64. Also exercises the suffix-
+        // tolerant source resolution (package.name() is "STM32C531RCT6").
+        let d = crate::c531_design::C531Design::new();
+        let profile = build_source_profile(&DesignSource::C531(&d), Package::C531R)
+            .expect("C531R footprint must resolve despite the ordering-code suffix");
+        assert_eq!(profile.footprint.pkg, "LQFP64");
+
+        let results = find_replacements(&profile, MatchConfig::default());
+        let foreign: Vec<&str> = results
+            .iter()
+            .filter(|c| c.compatible && c.family != "STM32C5")
+            .map(|c| c.name.as_str())
+            .collect();
+        assert!(
+            foreign.is_empty(),
+            "no foreign-family part may be a compatible drop-in for a power-omitted C5 source; got {:?}",
+            &foreign[..foreign.len().min(10)]
+        );
     }
 }
