@@ -302,6 +302,14 @@ fn comp_pwm_slot_count(d: &McuDescriptor) -> usize {
 /// a different `Res` variant from OCP's `Inst("TIM", n)`, so a PWM channel and an
 /// OCP break on the same timer don't spuriously conflict this increment. Both
 /// output pins are `Pin` tokens, so they contend with every other peripheral.
+///
+/// Caveat (pre-existing package-letter bridge): on a legacy multi-die family where
+/// flash/density variants of one package letter differ in peripheral inventory
+/// (e.g. STM32F030C6 vs the denser STM32F030CC, which adds a TIM15), the shared
+/// descriptor is the denser sibling, so a witness *can* name a timer the specific
+/// part lacks. The verdict stays sound regardless — `evaluate` gates on the
+/// per-part catalog `comp_pwm_ch`, never the descriptor. The priority families
+/// (G4/C5/H5) are single-die per package letter, so their witnesses are exact.
 fn complementary_pwm_candidates(d: &McuDescriptor) -> Vec<CandMeta> {
     let mut out = Vec::new();
     for (tnum, peri, channel) in comp_pwm_slots(d) {
@@ -957,6 +965,38 @@ mod tests {
             );
             // TIM1 + TIM8 alone give 8 complementary channels on these families.
             assert!(slots >= 8, "{name}: expected >=8 complementary channels, got {slots}");
+        }
+    }
+
+    #[test]
+    fn evaluate_comp_pwm_verdict_respects_catalog_bound_lineup_wide() {
+        // Soundness swept across the WHOLE lineup: `evaluate` must never return
+        // Verified for more complementary channels than the part's OWN catalog
+        // count. The per-part Tier-1 gate guarantees this even though the
+        // package-letter descriptor bridge can represent a denser sibling die —
+        // e.g. STM32F030C6 (5 channels) bridges to the STM32F030C descriptor whose
+        // representative STM32F030CC carries a TIM15 the C6 lacks (6 channels). The
+        // per-part catalog count (5) still gates the verdict, so the C6 is never
+        // verified for 6 — only the *witness* of such a legacy multi-die part might
+        // name the denser sibling's timer (see `complementary_pwm_candidates`).
+        for n in [4u8, 8, 12, 16] {
+            let demands = [Demand { kind: "COMP_PWM", count: n, with_dma: false, options: vec![] }];
+            let results = evaluate(&SearchQuery::default(), &demands);
+            let mut verified = 0usize;
+            for (e, v, _) in &results {
+                if *v == Verdict::Verified {
+                    assert!(
+                        e.comp_pwm_ch >= n,
+                        "{} Verified for {n} complementary channels but its catalog bound is {}",
+                        e.name,
+                        e.comp_pwm_ch,
+                    );
+                    verified += 1;
+                }
+            }
+            if n == 4 {
+                assert!(verified > 50, "expected many parts to verify 4 channels, got {verified}");
+            }
         }
     }
 
