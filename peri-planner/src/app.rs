@@ -28,6 +28,7 @@ enum ViewMode {
     Inventory,
     AfTable,
     Catalog,
+    Dropin,
     Converter,
 }
 
@@ -60,6 +61,12 @@ pub struct PeriPlannerApp {
     /// A part clicked in the Part finder, applied at the start of the next
     /// frame (deferred to avoid switching chips mid-render). Ephemeral.
     pending_select: Option<Package>,
+    /// Drop-in finder query (strictness + power-mode + family filter). Ephemeral.
+    dropin_query: crate::dropin::DropinQuery,
+    /// Memoized lineup-wide drop-in scan; reruns only on source/query change.
+    dropin_cache: crate::dropin::DropinCache,
+    /// Candidate whose per-pin diff is expanded in the drop-in finder. Ephemeral.
+    dropin_focus: Option<String>,
 }
 
 impl Default for PeriPlannerApp {
@@ -83,6 +90,9 @@ impl Default for PeriPlannerApp {
                 .collect(),
             catalog_eval_cache: Default::default(),
             pending_select: None,
+            dropin_query: Default::default(),
+            dropin_cache: Default::default(),
+            dropin_focus: None,
         }
     }
 }
@@ -245,6 +255,7 @@ impl PeriPlannerApp {
                 ui.selectable_value(&mut self.view, ViewMode::Inventory, "Inventory");
                 ui.selectable_value(&mut self.view, ViewMode::AfTable, "Pin / AF");
                 ui.selectable_value(&mut self.view, ViewMode::Catalog, "Part finder");
+                ui.selectable_value(&mut self.view, ViewMode::Dropin, "Drop-in finder");
                 ui.separator();
                 if ui.button("Export").clicked() {
                     let text = self.design.export_summary();
@@ -362,6 +373,10 @@ impl eframe::App for PeriPlannerApp {
             let catalog_query = &mut self.catalog_query;
             let catalog_demands = &mut self.catalog_demands;
             let catalog_cache = &mut self.catalog_eval_cache;
+            let mcu = self.mcu;
+            let dropin_query = &mut self.dropin_query;
+            let dropin_cache = &mut self.dropin_cache;
+            let dropin_focus = &mut self.dropin_focus;
             let mut jump = None;
             let mut conv_action: Option<ConverterAction> = None;
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -371,6 +386,18 @@ impl eframe::App for PeriPlannerApp {
                     }
                     ViewMode::Catalog => {
                         jump = crate::catalog_view::show(ui, catalog_query, catalog_demands, catalog_cache);
+                    }
+                    ViewMode::Dropin => {
+                        // C531 carries a converter-leg model (no locked pins);
+                        // H523 / C5A3 use the generic pin-lock model.
+                        let dsrc = if mcu == Mcu::C531 {
+                            crate::dropin::DesignSource::C531(c531)
+                        } else {
+                            crate::dropin::DesignSource::H523(h523)
+                        };
+                        jump = crate::dropin_view::show(
+                            ui, package, dsrc, dropin_query, dropin_cache, dropin_focus,
+                        );
                     }
                     ViewMode::Converter if package.mcu() == Mcu::C531 => {
                         conv_action = crate::c531_view::show(ui, c531, package);
@@ -1095,6 +1122,16 @@ impl eframe::App for PeriPlannerApp {
                         &mut self.catalog_query,
                         &mut self.catalog_demands,
                         &mut self.catalog_eval_cache,
+                    );
+                }
+                ViewMode::Dropin => {
+                    self.pending_select = crate::dropin_view::show(
+                        ui,
+                        self.package,
+                        crate::dropin::DesignSource::G474(&self.design),
+                        &mut self.dropin_query,
+                        &mut self.dropin_cache,
+                        &mut self.dropin_focus,
                     );
                 }
                 ViewMode::AfTable => {

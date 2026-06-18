@@ -12,19 +12,20 @@
 //! ## Soundness — the verdict is a conjunction of necessary conditions
 //! Every gate can only *reject*; loosening (strictness, power-mode) never flips a
 //! real failure to a pass:
-//!   1. **Footprint** — candidate must be the same land-pattern class + pin count
-//!      (`package_class`). A QFN is never a drop-in for a QFP.
-//!   2. **Coverage** — every source power/allocated position must *exist* on the
-//!      candidate (a `"LQFP64"` that bonds only 52 pins is not the same
-//!      footprint). A missing required position is a hard fail.
-//!   3. **Power** — every source power position must be the same canonical
-//!      [`Rail`] set on the candidate (rail subset), normalized so family
-//!      spelling variants compare correctly.
-//!   4. **Serviceability** — every allocated position must carry a
-//!      capability-equivalent signal on the *candidate's own* AF table (the
-//!      candidate's pin name at a position may differ from the source's).
-//!   5. **Analog** signals (no AF) are matched exactly regardless of strictness —
-//!      fixed silicon can't be re-muxed.
+//! 1. **Footprint** — candidate must be the same land-pattern class + pin count
+//!    (`package_class`). A QFN is never a drop-in for a QFP.
+//! 2. **Coverage** — every source power/allocated position must *exist* on the
+//!    candidate (a `"LQFP64"` that bonds only 52 pins is not the same
+//!    footprint). A missing required position is a hard fail.
+//! 3. **Power** — every source power position must be the same canonical
+//!    [`Rail`] set on the candidate (rail subset), normalized so family
+//!    spelling variants compare correctly.
+//! 4. **Serviceability** — every allocated position must carry a
+//!    capability-equivalent signal on the *candidate's own* AF table (the
+//!    candidate's pin name at a position may differ from the source's).
+//! 5. **Analog** signals (no AF) are matched exactly regardless of strictness —
+//!    fixed silicon can't be re-muxed.
+//!
 //! The only honest gaps (surfaced, never hidden): stm32-data omits NRST/BOOT0 for
 //! some families (so a cross-family reset/boot net can't be verified ->
 //! `reset_boot_unverified`), and carries no 5V-tolerance / pad-type data (a match
@@ -385,11 +386,9 @@ fn evaluate_candidate(
                             for cap in cand_af.get(cp).into_iter().flatten() {
                                 if let Some(t) =
                                     serve_tier(&w.sig, &cap.peripheral, &cap.role, cap.af, cfg.strictness)
+                                    && best.as_ref().is_none_or(|(b, ..)| t < *b)
                                 {
-                                    if best.as_ref().map_or(true, |(b, ..)| t < *b) {
-                                        best =
-                                            Some((t, cap.peripheral.clone(), cap.role.clone(), *cp));
-                                    }
+                                    best = Some((t, cap.peripheral.clone(), cap.role.clone(), *cp));
                                 }
                             }
                         }
