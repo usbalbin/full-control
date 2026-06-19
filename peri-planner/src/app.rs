@@ -354,6 +354,16 @@ impl PeriPlannerApp {
         const YELLOW: egui::Color32 = egui::Color32::from_rgb(210, 180, 80);
         egui::TopBottomPanel::bottom("status_line").show(ctx, |ui| {
             ui.horizontal(|ui| {
+                // Browsing a read-only asset part: identity + why it's not plannable.
+                if let Some(desc) = self.asset_part {
+                    ui.label(egui::RichText::new(desc.name).strong());
+                    ui.separator();
+                    ui.colored_label(
+                        YELLOW,
+                        "read-only — not plannable (lineup descriptor: no fabric / HRTIM)",
+                    );
+                    return;
+                }
                 ui.label(egui::RichText::new(self.package.chip_prefix()).strong());
                 ui.label(self.package.package_label());
                 ui.separator();
@@ -410,115 +420,146 @@ impl PeriPlannerApp {
     }
 
     fn render_top_bar(&mut self, ctx: &egui::Context, can_undo: bool, can_redo: bool) {
+        // Browsing a non-compiled catalog part: the same chrome, but the live
+        // planner controls (MCU/Package/Undo/Redo/Export + planner tabs) give way
+        // to a read-only badge — only the descriptor views (Inventory/Pin-AF/Part
+        // finder) apply, since an asset part carries no planner/fabric.
+        let browse_name: Option<&'static str> = self.asset_part.map(|d| d.name);
+        let browsing = browse_name.is_some();
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Peripheral planner").strong());
                 ui.separator();
-                ui.label("MCU:");
-                let mut pending_mcu: Option<Mcu> = None;
-                egui::ComboBox::from_id_salt("mcu")
-                    .selected_text(self.mcu.label())
-                    .show_ui(ui, |ui| {
-                        for &m in Mcu::ALL {
-                            let label = if m.is_implemented() {
-                                m.label().to_string()
-                            } else {
-                                format!("{} (preview)", m.label())
-                            };
-                            if ui.selectable_label(m == self.mcu, label).clicked() {
-                                pending_mcu = Some(m);
+                if let Some(name) = browse_name {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(120, 170, 220),
+                        format!("● Browsing {name}"),
+                    );
+                    ui.label(
+                        egui::RichText::new("read-only · package-letter pinout (flash-invariant)")
+                            .small()
+                            .weak(),
+                    );
+                    if ui.button("✕ Close").clicked() {
+                        self.asset_part = None;
+                    }
+                } else {
+                    ui.label("MCU:");
+                    let mut pending_mcu: Option<Mcu> = None;
+                    egui::ComboBox::from_id_salt("mcu")
+                        .selected_text(self.mcu.label())
+                        .show_ui(ui, |ui| {
+                            for &m in Mcu::ALL {
+                                let label = if m.is_implemented() {
+                                    m.label().to_string()
+                                } else {
+                                    format!("{} (preview)", m.label())
+                                };
+                                if ui.selectable_label(m == self.mcu, label).clicked() {
+                                    pending_mcu = Some(m);
+                                }
                             }
+                        });
+                    if let Some(m) = pending_mcu {
+                        // Each MCU keeps its own design state, so switching MCUs
+                        // invalidates undo history (a popped snapshot must never
+                        // restore into a different MCU's live view).
+                        self.set_active_mcu(m);
+                        // Reset package to the new MCU's default; keeps
+                        // self.variant stale on H523 (only consumed by G474
+                        // legacy code, which doesn't render on H523).
+                        self.package = m.default_package();
+                        if let Some(v) = self.package.to_g474_variant() {
+                            self.variant = v;
+                            self.mutate(|d| d.set_variant(v));
                         }
-                    });
-                if let Some(m) = pending_mcu {
-                    // Each MCU keeps its own design state, so switching MCUs
-                    // invalidates undo history (a popped snapshot must never
-                    // restore into a different MCU's live view).
-                    self.set_active_mcu(m);
-                    // Reset package to the new MCU's default; keeps
-                    // self.variant stale on H523 (only consumed by G474
-                    // legacy code, which doesn't render on H523).
-                    self.package = m.default_package();
-                    if let Some(v) = self.package.to_g474_variant() {
-                        self.variant = v;
-                        self.mutate(|d| d.set_variant(v));
-                    }
-                    if m == Mcu::C531 {
-                        // C531 has a real planner — land on it, not the inventory.
-                        if !matches!(
-                            self.view,
-                            ViewMode::Inventory | ViewMode::AfTable | ViewMode::Converter
-                        ) {
-                            self.view = ViewMode::Converter;
-                        }
-                    } else if m != Mcu::G474
-                        && !matches!(
-                            self.view,
-                            ViewMode::Inventory | ViewMode::AfTable | ViewMode::Peripherals
-                        )
-                    {
-                        // H523 / C5A3 land on the generic Peripherals planner.
-                        self.view = ViewMode::Peripherals;
-                    }
-                }
-                ui.separator();
-                ui.label("Package:");
-                let mut pending_package: Option<Package> = None;
-                egui::ComboBox::from_id_salt("package")
-                    .selected_text(self.package.display_label())
-                    .show_ui(ui, |ui| {
-                        for p in self.mcu.packages() {
-                            if ui.selectable_label(p == self.package, p.display_label()).clicked() {
-                                pending_package = Some(p);
+                        if m == Mcu::C531 {
+                            // C531 has a real planner — land on it, not inventory.
+                            if !matches!(
+                                self.view,
+                                ViewMode::Inventory | ViewMode::AfTable | ViewMode::Converter
+                            ) {
+                                self.view = ViewMode::Converter;
                             }
+                        } else if m != Mcu::G474
+                            && !matches!(
+                                self.view,
+                                ViewMode::Inventory | ViewMode::AfTable | ViewMode::Peripherals
+                            )
+                        {
+                            // H523 / C5A3 land on the generic Peripherals planner.
+                            self.view = ViewMode::Peripherals;
                         }
-                    });
-                if let Some(p) = pending_package {
-                    self.package = p;
-                    if let Some(v) = p.to_g474_variant() {
-                        self.variant = v;
-                        self.mutate(|d| d.set_variant(v));
                     }
-                }
-                ui.separator();
-                if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
-                    self.undo();
-                }
-                if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
-                    self.redo_op();
+                    ui.separator();
+                    ui.label("Package:");
+                    let mut pending_package: Option<Package> = None;
+                    egui::ComboBox::from_id_salt("package")
+                        .selected_text(self.package.display_label())
+                        .show_ui(ui, |ui| {
+                            for p in self.mcu.packages() {
+                                if ui
+                                    .selectable_label(p == self.package, p.display_label())
+                                    .clicked()
+                                {
+                                    pending_package = Some(p);
+                                }
+                            }
+                        });
+                    if let Some(p) = pending_package {
+                        self.package = p;
+                        if let Some(v) = p.to_g474_variant() {
+                            self.variant = v;
+                            self.mutate(|d| d.set_variant(v));
+                        }
+                    }
+                    ui.separator();
+                    if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
+                        self.undo();
+                    }
+                    if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
+                        self.redo_op();
+                    }
                 }
                 ui.separator();
                 ui.label("View:");
-                if self.mcu == Mcu::G474 {
-                    ui.selectable_value(&mut self.view, ViewMode::Fabric, "Power fabric");
-                    ui.selectable_value(&mut self.view, ViewMode::Hrtim, "HRTIM");
-                    ui.selectable_value(&mut self.view, ViewMode::Comms, "Comms");
-                    ui.selectable_value(&mut self.view, ViewMode::Timers, "Timers");
-                    ui.selectable_value(&mut self.view, ViewMode::Waveforms, "Waveforms");
-                    ui.selectable_value(&mut self.view, ViewMode::Package, "Package");
+                // Planner tabs are MCU-specific and editing-only — hidden while
+                // browsing a read-only asset part.
+                if !browsing {
+                    if self.mcu == Mcu::G474 {
+                        ui.selectable_value(&mut self.view, ViewMode::Fabric, "Power fabric");
+                        ui.selectable_value(&mut self.view, ViewMode::Hrtim, "HRTIM");
+                        ui.selectable_value(&mut self.view, ViewMode::Comms, "Comms");
+                        ui.selectable_value(&mut self.view, ViewMode::Timers, "Timers");
+                        ui.selectable_value(&mut self.view, ViewMode::Waveforms, "Waveforms");
+                        ui.selectable_value(&mut self.view, ViewMode::Package, "Package");
+                    }
+                    if self.mcu == Mcu::C531 {
+                        ui.selectable_value(&mut self.view, ViewMode::Converter, "Converter");
+                    }
+                    if self.mcu == Mcu::H523 || self.mcu == Mcu::C5A3 {
+                        ui.selectable_value(&mut self.view, ViewMode::Peripherals, "Peripherals");
+                    }
                 }
-                if self.mcu == Mcu::C531 {
-                    ui.selectable_value(&mut self.view, ViewMode::Converter, "Converter");
-                }
-                if self.mcu == Mcu::H523 || self.mcu == Mcu::C5A3 {
-                    ui.selectable_value(&mut self.view, ViewMode::Peripherals, "Peripherals");
-                }
+                // Descriptor views — available for both planner chips and asset parts.
                 ui.selectable_value(&mut self.view, ViewMode::Inventory, "Inventory");
                 ui.selectable_value(&mut self.view, ViewMode::AfTable, "Pin / AF");
                 ui.selectable_value(&mut self.view, ViewMode::Catalog, "Part finder");
-                ui.selectable_value(&mut self.view, ViewMode::Dropin, "Drop-in finder");
-                ui.separator();
-                if ui.button("Export").clicked() {
-                    // Family-correct: each MCU exports ITS model, not always G474.
-                    let text = match self.mcu {
-                        Mcu::G474 => self.design.export_summary(),
-                        Mcu::C531 => self.c531_design.export_summary(self.package.name()),
-                        Mcu::H523 | Mcu::C5A3 => {
-                            let empty = H523Design::new();
-                            self.h523(&empty).export_summary(self.package.name())
-                        }
-                    };
-                    ui.ctx().copy_text(text);
+                if !browsing {
+                    ui.selectable_value(&mut self.view, ViewMode::Dropin, "Drop-in finder");
+                    ui.separator();
+                    if ui.button("Export").clicked() {
+                        // Family-correct: each MCU exports ITS model, not always G474.
+                        let text = match self.mcu {
+                            Mcu::G474 => self.design.export_summary(),
+                            Mcu::C531 => self.c531_design.export_summary(self.package.name()),
+                            Mcu::H523 | Mcu::C5A3 => {
+                                let empty = H523Design::new();
+                                self.h523(&empty).export_summary(self.package.name())
+                            }
+                        };
+                        ui.ctx().copy_text(text);
+                    }
                 }
             });
             // Shared "design spec" strip: peripherals declared once (in the Part
@@ -539,79 +580,33 @@ impl PeriPlannerApp {
                 } else {
                     ui.label(active.join("   "));
                 }
-                ui.separator();
-                if !active.is_empty()
-                    && ui
-                        .button("Seed design ▸")
+                // The seed/summarize buttons act on the active PLANNER design;
+                // hide them while browsing a read-only asset part (which has none).
+                if !browsing {
+                    ui.separator();
+                    if !active.is_empty()
+                        && ui
+                            .button("Seed design ▸")
+                            .on_hover_text(
+                                "Add the demanded peripherals to the current design (idempotent — \
+                                 fills up to each demanded count)",
+                            )
+                            .clicked()
+                    {
+                        self.seed_from_demands();
+                    }
+                    if ui
+                        .button("⟳ Demands from design")
                         .on_hover_text(
-                            "Add the demanded peripherals to the current design (idempotent — \
-                             fills up to each demanded count)",
+                            "Count this design's peripherals into the Part-finder demands and open it",
                         )
                         .clicked()
-                {
-                    self.seed_from_demands();
-                }
-                if ui
-                    .button("⟳ Demands from design")
-                    .on_hover_text(
-                        "Count this design's peripherals into the Part-finder demands and open it",
-                    )
-                    .clicked()
-                {
-                    self.summarize_to_demands();
+                    {
+                        self.summarize_to_demands();
+                    }
                 }
             });
         });
-    }
-
-    /// Read-only browser for a non-compiled catalog part opened from a finder.
-    /// Renders Inventory / Pin-AF from the lineup descriptor asset — no planner,
-    /// no fabric (asset descriptors carry neither). The Part finder stays
-    /// available so the user can keep browsing; clicking another part re-targets
-    /// the browser (or, for a compiled part, lands in its planner next frame).
-    fn render_asset_browser(
-        &mut self,
-        ctx: &egui::Context,
-        desc: &'static crate::mcu::McuDescriptor,
-    ) {
-        egui::TopBottomPanel::top("asset_browser_top").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                ui.strong(format!("Browsing {}", desc.name));
-                ui.label(
-                    egui::RichText::new("read-only · package-letter pinout (flash-invariant)")
-                        .small()
-                        .weak(),
-                );
-                if ui.button("✕ Close").clicked() {
-                    self.asset_part = None;
-                }
-                ui.separator();
-                ui.label("View:");
-                ui.selectable_value(&mut self.view, ViewMode::Inventory, "Inventory");
-                ui.selectable_value(&mut self.view, ViewMode::AfTable, "Pin / AF");
-                ui.selectable_value(&mut self.view, ViewMode::Catalog, "Part finder");
-            });
-        });
-
-        let view = self.view;
-        let af_filter = &mut self.af_filter;
-        let catalog_query = &mut self.catalog_query;
-        let catalog_demands = &mut self.catalog_demands;
-        let catalog_cache = &mut self.catalog_eval_cache;
-        let catalog_sort = &mut self.catalog_sort;
-        let mut open: Option<String> = None;
-        egui::CentralPanel::default().show(ctx, |ui| match view {
-            ViewMode::AfTable => {
-                crate::af_view::show(ui, desc.raw, af_filter, None);
-            }
-            ViewMode::Catalog => {
-                open = crate::catalog_view::show(
-                    ui, catalog_query, catalog_demands, catalog_cache, catalog_sort,
-                );
-            }
-            _ => crate::inventory_view::show(ui, desc),
-        });
-        self.pending_open = open;
     }
 
     fn handle_package_action(&mut self, action: Option<crate::package_view::Action>) {
@@ -711,10 +706,31 @@ impl eframe::App for PeriPlannerApp {
             }
         }
 
-        // Read-only browse mode for a non-compiled part: a self-contained panel,
-        // bypassing both the G474 planner and the per-family thin path.
+        // Read-only browse mode for a non-compiled part: the SAME chrome as the
+        // planner (top bar shows a read-only badge + the descriptor views; status
+        // line shows the part identity), restricted to Inventory / Pin-AF / Part
+        // finder. Handled before the keyboard/undo block so Ctrl+Z never touches
+        // the underlying planner's history while browsing.
         if let Some(desc) = self.asset_part {
-            self.render_asset_browser(ctx, desc);
+            self.render_top_bar(ctx, false, false);
+            self.render_status_line(ctx);
+            let view = self.view;
+            let af_filter = &mut self.af_filter;
+            let catalog_query = &mut self.catalog_query;
+            let catalog_demands = &mut self.catalog_demands;
+            let catalog_cache = &mut self.catalog_eval_cache;
+            let catalog_sort = &mut self.catalog_sort;
+            let mut open: Option<String> = None;
+            egui::CentralPanel::default().show(ctx, |ui| match view {
+                ViewMode::AfTable => crate::af_view::show(ui, desc.raw, af_filter, None),
+                ViewMode::Catalog => {
+                    open = crate::catalog_view::show(
+                        ui, catalog_query, catalog_demands, catalog_cache, catalog_sort,
+                    );
+                }
+                _ => crate::inventory_view::show(ui, desc),
+            });
+            self.pending_open = open;
             return;
         }
 
