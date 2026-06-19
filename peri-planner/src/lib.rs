@@ -21,6 +21,7 @@ pub mod mcu_data;
 pub mod mcu_pinout;
 pub mod mcu_raw;
 pub mod package_view;
+pub mod peripherals_view;
 pub mod phys_pinout;
 pub mod picker;
 pub mod pinout;

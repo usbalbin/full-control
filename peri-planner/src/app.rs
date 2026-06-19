@@ -30,6 +30,7 @@ enum ViewMode {
     Catalog,
     Dropin,
     Converter,
+    Peripherals,
 }
 
 pub struct PeriPlannerApp {
@@ -358,9 +359,13 @@ impl PeriPlannerApp {
                             self.view = ViewMode::Converter;
                         }
                     } else if m != Mcu::G474
-                        && !matches!(self.view, ViewMode::Inventory | ViewMode::AfTable)
+                        && !matches!(
+                            self.view,
+                            ViewMode::Inventory | ViewMode::AfTable | ViewMode::Peripherals
+                        )
                     {
-                        self.view = ViewMode::Inventory;
+                        // H523 / C5A3 land on the generic Peripherals planner.
+                        self.view = ViewMode::Peripherals;
                     }
                 }
                 ui.separator();
@@ -401,6 +406,9 @@ impl PeriPlannerApp {
                 }
                 if self.mcu == Mcu::C531 {
                     ui.selectable_value(&mut self.view, ViewMode::Converter, "Converter");
+                }
+                if self.mcu == Mcu::H523 || self.mcu == Mcu::C5A3 {
+                    ui.selectable_value(&mut self.view, ViewMode::Peripherals, "Peripherals");
                 }
                 ui.selectable_value(&mut self.view, ViewMode::Inventory, "Inventory");
                 ui.selectable_value(&mut self.view, ViewMode::AfTable, "Pin / AF");
@@ -647,6 +655,9 @@ impl eframe::App for PeriPlannerApp {
                 match view {
                     ViewMode::AfTable => {
                         crate::af_view::show(ui, descriptor.raw, af_filter, Some(h523));
+                    }
+                    ViewMode::Peripherals => {
+                        crate::peripherals_view::show(ui, descriptor.raw, h523);
                     }
                     ViewMode::Catalog => {
                         jump = crate::catalog_view::show(
@@ -1408,8 +1419,8 @@ impl eframe::App for PeriPlannerApp {
                     // map on `Design`. Pass None.
                     crate::af_view::show(ui, self.package.descriptor().raw, &mut self.af_filter, None);
                 }
-                // C531-only view; never selectable while the G474 planner is active.
-                ViewMode::Converter => {}
+                // Non-G474 views; never selectable while the G474 planner is active.
+                ViewMode::Converter | ViewMode::Peripherals => {}
             }
         });
     }
