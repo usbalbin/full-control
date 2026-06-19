@@ -213,12 +213,12 @@ impl PeriPlannerApp {
                 }
             }
             Mcu::H523 | Mcu::C5A3 => {
-                // Distinct peripheral instances per kind (a peripheral has
-                // several role locks; count the instance once).
+                // Distinct DECLARED peripheral instances per kind (the intent;
+                // a declared use counts whether or not its roles are pinned yet).
                 let mut by_kind: BTreeMap<&'static str, BTreeSet<&str>> = BTreeMap::new();
-                for l in &self.h523_design.pin_locks {
-                    if let Some(k) = crate::select::kind_of(&l.peripheral) {
-                        by_kind.entry(k).or_default().insert(l.peripheral.as_str());
+                for u in &self.h523_design.uses {
+                    if let Some(k) = crate::select::kind_of(&u.peripheral) {
+                        by_kind.entry(k).or_default().insert(u.peripheral.as_str());
                     }
                 }
                 for (k, set) in by_kind {
@@ -1572,6 +1572,9 @@ fn seed_h523_into(
         let cur = have.get(dem.kind).copied().unwrap_or(0);
         for j in cur..dem.count {
             let Some(&inst) = instances.get(j as usize) else { break };
+            // Declare the use (shows in the Peripherals view) then greedily place
+            // each role on the first free pin.
+            design.add_use(inst, &signals);
             for &role in &signals {
                 if design.locked_pin(inst, role).is_some() {
                     continue;
@@ -1822,7 +1825,10 @@ mod seed_tests {
         let mut h = crate::h523_design::H523Design::new();
         let raw = crate::mcu::Package::H523R.descriptor().raw;
         seed_h523_into(&mut h, raw, &[dem("SERIAL", 1)], &BTreeMap::new());
-        // One serial instance with TX + RX on distinct real pins.
+        // The use is declared (shows in the Peripherals view)...
+        assert_eq!(h.uses.len(), 1);
+        assert_eq!(h.uses[0].roles, vec!["TX", "RX"]);
+        // ...and its TX + RX are placed on distinct real pins.
         assert_eq!(h.pin_locks.len(), 2);
         assert!(h.pin_locks.iter().any(|l| l.role == "TX"));
         assert!(h.pin_locks.iter().any(|l| l.role == "RX"));
