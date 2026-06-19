@@ -256,6 +256,60 @@ impl PeriPlannerApp {
         }
     }
 
+    /// A persistent, family-agnostic status line: active chip + design counts +
+    /// a validation rollup. Health at a glance from any view — the cross-family
+    /// equivalent of the G474-only capability panel.
+    fn render_status_line(&self, ctx: &egui::Context) {
+        use crate::requirements::Severity;
+        const GREEN: egui::Color32 = egui::Color32::from_rgb(100, 200, 120);
+        const YELLOW: egui::Color32 = egui::Color32::from_rgb(210, 180, 80);
+        egui::TopBottomPanel::bottom("status_line").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(self.package.chip_prefix()).strong());
+                ui.label(self.package.package_label());
+                ui.separator();
+                match self.mcu {
+                    Mcu::G474 => {
+                        let reqs = self.design.requirements.len();
+                        let assigned =
+                            self.design.assignments.iter().filter(|a| a.is_some()).count();
+                        let pins = self.design.pin_assignments.len();
+                        ui.label(format!("{reqs} reqs · {assigned} assigned · {pins} pins locked"));
+                        ui.separator();
+                        let warns = self
+                            .design
+                            .warnings()
+                            .into_iter()
+                            .filter(|c| c.severity == Severity::Warn)
+                            .count();
+                        if warns == 0 {
+                            ui.colored_label(GREEN, "✓ 0 warnings");
+                        } else {
+                            ui.colored_label(YELLOW, format!("⚠ {warns} warning(s)"));
+                        }
+                    }
+                    Mcu::C531 => {
+                        let problems = self.c531_design.validate(self.package);
+                        ui.label(format!("{} legs", self.c531_design.legs.len()));
+                        ui.separator();
+                        if problems.is_empty() {
+                            ui.colored_label(GREEN, "✓ realizable");
+                        } else {
+                            ui.colored_label(YELLOW, format!("⚠ {} problem(s)", problems.len()));
+                        }
+                    }
+                    Mcu::H523 | Mcu::C5A3 => {
+                        ui.label(format!("{} pins locked", self.h523_design.pin_locks.len()));
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new("— validation not yet implemented").weak(),
+                        );
+                    }
+                }
+            });
+        });
+    }
+
     fn render_top_bar(&mut self, ctx: &egui::Context, can_undo: bool, can_redo: bool) {
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -564,6 +618,7 @@ impl eframe::App for PeriPlannerApp {
 
         if self.mcu != Mcu::G474 {
             self.render_top_bar(ctx, can_undo, can_redo);
+            self.render_status_line(ctx);
             let descriptor = self.package.descriptor();
             let package = self.package;
             let view = self.view;
@@ -838,6 +893,7 @@ impl eframe::App for PeriPlannerApp {
             });
 
         self.render_top_bar(ctx, can_undo, can_redo);
+        self.render_status_line(ctx);
 
         // Requirements + Add + Locks in a resizable top panel. User can
         // drag to give more or less room to the fabric view below.
