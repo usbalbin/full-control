@@ -217,6 +217,14 @@ pub fn show(
     }
     if enter && can_lock && let Some(r) = &search_resp {
         r.request_focus();
+    } else if can_lock
+        && ui.memory(|m| m.focused().is_none())
+        && let Some(r) = &search_resp
+    {
+        // Land-and-type: on this allocation view, keep the search box focused by
+        // default (so switching here lets you type immediately, and placements
+        // chain) — unless the user has focused another widget (combo, button).
+        r.request_focus();
     }
 }
 
