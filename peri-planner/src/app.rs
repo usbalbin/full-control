@@ -299,11 +299,19 @@ impl PeriPlannerApp {
                         }
                     }
                     Mcu::H523 | Mcu::C5A3 => {
-                        ui.label(format!("{} pins locked", self.h523_design.pin_locks.len()));
+                        let uses = self.h523_design.uses.len();
+                        let locks = self.h523_design.pin_locks.len();
+                        let problems = self.h523_design.validate(self.package.descriptor().raw);
+                        ui.label(format!("{uses} peripherals · {locks} pins locked"));
                         ui.separator();
-                        ui.label(
-                            egui::RichText::new("— validation not yet implemented").weak(),
-                        );
+                        if problems.is_empty() {
+                            ui.colored_label(GREEN, "✓ complete");
+                        } else {
+                            ui.colored_label(
+                                YELLOW,
+                                format!("⚠ {} unplaced/unreachable", problems.len()),
+                            );
+                        }
                     }
                 }
             });

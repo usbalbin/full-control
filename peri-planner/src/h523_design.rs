@@ -11,6 +11,7 @@
 use std::collections::HashMap;
 
 use crate::mcu_pinout::PinId;
+use crate::mcu_raw::RawMcuData;
 
 /// A pinned (peripheral, role, pin) triple. Identifies the peripheral
 /// signal by its metapac names ("USART1", "TX") so the lock survives
@@ -23,6 +24,28 @@ pub struct PinLock {
     pub num: u8,
 }
 
+/// A declared peripheral use — "I am using USART2 for TX+RX". The intent layer
+/// above `PinLock`s: a use names a metapac instance and the roles wanted; each
+/// role is then placed on a pin (a `PinLock` keyed on the same `(peripheral,
+/// role)`). This is the family-agnostic equivalent of the G474 `Design`'s typed
+/// requirements, built directly on descriptor strings.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PeripheralUse {
+    pub peripheral: String,
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub note: String,
+}
+
+/// A reason a declared design isn't complete/realizable on the active package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum H523Problem {
+    /// A declared role has no pin locked yet.
+    Unplaced { peripheral: String, role: String },
+    /// A declared role cannot be placed on this package at all (no AF pin).
+    Unreachable { peripheral: String, role: String },
+}
+
 impl PinLock {
     pub fn pin(&self) -> PinId { PinId { port: self.port, num: self.num } }
     pub fn signal_key(&self) -> (&str, &str) { (&self.peripheral, &self.role) }
@@ -32,13 +55,20 @@ impl PinLock {
 pub struct H523Design {
     pub format_version: u32,
     pub pin_locks: Vec<PinLock>,
+    /// Declared peripheral uses — the intent layer above `pin_locks`.
+    #[serde(default)]
+    pub uses: Vec<PeripheralUse>,
 }
 
 pub const H523_DESIGN_FORMAT_VERSION: u32 = 1;
 
 impl H523Design {
     pub fn new() -> Self {
-        Self { format_version: H523_DESIGN_FORMAT_VERSION, pin_locks: Vec::new() }
+        Self {
+            format_version: H523_DESIGN_FORMAT_VERSION,
+            pin_locks: Vec::new(),
+            uses: Vec::new(),
+        }
     }
 
     /// Pin currently locked for this (peripheral, role) signal, if any.
@@ -94,5 +124,134 @@ impl H523Design {
             let _ = writeln!(s, "  {} {}: P{}{}", l.peripheral, l.role, l.port, l.num);
         }
         s
+    }
+
+    /// Declare a peripheral use. No-op if the instance is already declared.
+    pub fn add_use(&mut self, peripheral: &str, roles: &[&str]) {
+        if self.uses.iter().any(|u| u.peripheral == peripheral) {
+            return;
+        }
+        self.uses.push(PeripheralUse {
+            peripheral: peripheral.to_string(),
+            roles: roles.iter().map(|r| r.to_string()).collect(),
+            note: String::new(),
+        });
+    }
+
+    /// Remove a declared use (by index) and drop its pin locks.
+    pub fn remove_use(&mut self, index: usize) {
+        if index < self.uses.len() {
+            let u = self.uses.remove(index);
+            self.pin_locks.retain(|l| l.peripheral != u.peripheral);
+        }
+    }
+
+    /// Toggle a role on a declared use; unlocking the role if it's removed.
+    pub fn set_role(&mut self, index: usize, role: &str, on: bool) {
+        if let Some(u) = self.uses.get_mut(index) {
+            let has = u.roles.iter().any(|r| r == role);
+            if on && !has {
+                u.roles.push(role.to_string());
+            } else if !on && has {
+                let peripheral = u.peripheral.clone();
+                u.roles.retain(|r| r != role);
+                self.unlock(&peripheral, role);
+            }
+        }
+    }
+
+    /// Every `(peripheral, role)` declared across all uses.
+    pub fn declared_signals(&self) -> Vec<(&str, &str)> {
+        self.uses
+            .iter()
+            .flat_map(|u| u.roles.iter().map(move |r| (u.peripheral.as_str(), r.as_str())))
+            .collect()
+    }
+
+    /// Completeness / reachability check for the declared design on `raw`'s
+    /// package: a declared role that can't be placed on this package at all
+    /// (`Unreachable`) or hasn't been pinned yet (`Unplaced`). Empty == every
+    /// declared role is placed on a real pin.
+    pub fn validate(&self, raw: &'static RawMcuData) -> Vec<H523Problem> {
+        let rows: Vec<_> = crate::mcu_pinout::af_rows(raw).collect();
+        let mut out = Vec::new();
+        for u in &self.uses {
+            for role in &u.roles {
+                let reachable = rows
+                    .iter()
+                    .any(|r| r.signal.peripheral == u.peripheral && r.signal.role == *role);
+                if !reachable {
+                    out.push(H523Problem::Unreachable {
+                        peripheral: u.peripheral.clone(),
+                        role: role.clone(),
+                    });
+                } else if self.locked_pin(&u.peripheral, role).is_none() {
+                    out.push(H523Problem::Unplaced {
+                        peripheral: u.peripheral.clone(),
+                        role: role.clone(),
+                    });
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mcu::Package;
+    use crate::mcu_pinout::{pins_for, SignalId};
+
+    #[test]
+    fn add_use_dedups_and_set_role_toggles() {
+        let mut d = H523Design::new();
+        d.add_use("USART2", &["TX", "RX"]);
+        d.add_use("USART2", &["TX"]); // already declared -> ignored
+        assert_eq!(d.uses.len(), 1);
+        assert_eq!(d.uses[0].roles, vec!["TX", "RX"]);
+        d.set_role(0, "CTS", true);
+        assert!(d.uses[0].roles.iter().any(|r| r == "CTS"));
+        d.set_role(0, "RX", false);
+        assert!(!d.uses[0].roles.iter().any(|r| r == "RX"));
+    }
+
+    #[test]
+    fn validate_flags_unplaced_then_clears_when_locked() {
+        let raw = Package::H523R.descriptor().raw;
+        let mut d = H523Design::new();
+        d.add_use("USART1", &["TX", "RX"]);
+        assert_eq!(d.validate(raw).len(), 2); // both unplaced
+        let tx = pins_for(raw, SignalId { peripheral: "USART1", role: "TX" })[0];
+        d.lock("USART1", "TX", tx);
+        let p = d.validate(raw);
+        assert_eq!(p.len(), 1);
+        assert!(matches!(p[0], H523Problem::Unplaced { ref role, .. } if role == "RX"));
+    }
+
+    #[test]
+    fn validate_flags_unreachable_role() {
+        let raw = Package::H523R.descriptor().raw;
+        let mut d = H523Design::new();
+        d.add_use("USART1", &["NONSENSE"]);
+        assert_eq!(
+            d.validate(raw),
+            vec![H523Problem::Unreachable {
+                peripheral: "USART1".to_string(),
+                role: "NONSENSE".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn remove_use_drops_its_pin_locks() {
+        let raw = Package::H523R.descriptor().raw;
+        let mut d = H523Design::new();
+        d.add_use("USART1", &["TX"]);
+        let tx = pins_for(raw, SignalId { peripheral: "USART1", role: "TX" })[0];
+        d.lock("USART1", "TX", tx);
+        assert_eq!(d.pin_locks.len(), 1);
+        d.remove_use(0);
+        assert!(d.uses.is_empty() && d.pin_locks.is_empty());
     }
 }
