@@ -160,6 +160,19 @@ impl H523Design {
         }
     }
 
+    /// Equality ignoring the free-text `note` fields. Undo uses this so typing a
+    /// note doesn't create one undo step per keystroke (notes are low-stakes
+    /// annotations, reverted only as part of the next structural edit's undo).
+    pub fn eq_ignoring_notes(&self, other: &H523Design) -> bool {
+        self.pin_locks == other.pin_locks
+            && self.uses.len() == other.uses.len()
+            && self
+                .uses
+                .iter()
+                .zip(&other.uses)
+                .all(|(a, b)| a.peripheral == b.peripheral && a.roles == b.roles)
+    }
+
     /// Every `(peripheral, role)` declared across all uses.
     pub fn declared_signals(&self) -> Vec<(&str, &str)> {
         self.uses
@@ -227,6 +240,18 @@ mod tests {
         let p = d.validate(raw);
         assert_eq!(p.len(), 1);
         assert!(matches!(p[0], H523Problem::Unplaced { ref role, .. } if role == "RX"));
+    }
+
+    #[test]
+    fn eq_ignoring_notes_ignores_note_but_not_structure() {
+        let mut a = H523Design::new();
+        a.add_use("USART1", &["TX"]);
+        let mut b = a.clone();
+        b.uses[0].note = "buck leg A".to_string();
+        assert!(a.eq_ignoring_notes(&b), "a note-only change must compare equal");
+        assert_ne!(a, b, "but PartialEq still distinguishes the note");
+        b.set_role(0, "RX", true);
+        assert!(!a.eq_ignoring_notes(&b), "a role change is structural");
     }
 
     #[test]

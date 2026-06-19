@@ -17,6 +17,27 @@ use crate::solver::{TimerSlotUsage, ALL_CR_SLOTS_HELPER};
 const STORAGE_KEY: &str = "peri_planner_design_v4";
 const HISTORY_CAP: usize = 40;
 
+/// A point-in-time copy of whichever per-family design model is active — the
+/// generic unit of undo/redo. Unifies the HISTORY across families without
+/// unifying the model TYPES (which stay deliberately separate). The history
+/// stack only ever holds the active family's variant (it's cleared on a
+/// model-family switch), so restoring is always coherent with the live view.
+#[derive(Clone, PartialEq)]
+enum DesignSnapshot {
+    G474(Design),
+    H523(H523Design), // shared by H523 + C5A3
+    C531(C531Design),
+}
+
+/// Group MCUs by which design model backs them (G474 / shared-H523 / C531).
+fn model_family(m: Mcu) -> u8 {
+    match m {
+        Mcu::G474 => 0,
+        Mcu::H523 | Mcu::C5A3 => 1,
+        Mcu::C531 => 2,
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 enum ViewMode {
     Fabric,
@@ -46,8 +67,8 @@ pub struct PeriPlannerApp {
     package: Package,
     variant: ChipVariant,
     view: ViewMode,
-    history: Vec<Design>,
-    redo: Vec<Design>,
+    history: Vec<DesignSnapshot>,
+    redo: Vec<DesignSnapshot>,
     /// Role "picked up" in the package view, waiting to be dropped on a
     /// candidate pin. Not persisted — ephemeral interaction state.
     picked: Option<crate::picker::PickedRole>,
@@ -153,29 +174,66 @@ impl PeriPlannerApp {
         slf
     }
 
-    /// Wrap a mutation so it records a history entry iff state actually changed.
+    /// Snapshot whichever model is active.
+    fn snapshot_active(&self) -> DesignSnapshot {
+        match self.mcu {
+            Mcu::G474 => DesignSnapshot::G474(self.design.clone()),
+            Mcu::H523 | Mcu::C5A3 => DesignSnapshot::H523(self.h523_design.clone()),
+            Mcu::C531 => DesignSnapshot::C531(self.c531_design.clone()),
+        }
+    }
+
+    /// Restore a snapshot into its matching live model.
+    fn restore_snapshot(&mut self, snap: DesignSnapshot) {
+        match snap {
+            DesignSnapshot::G474(d) => self.design = d,
+            DesignSnapshot::H523(d) => self.h523_design = d,
+            DesignSnapshot::C531(d) => self.c531_design = d,
+        }
+    }
+
+    /// Whether the active non-G474 model changed vs `before` (ignoring H523 note
+    /// edits, which aren't their own undo step). G474 is recorded by `mutate`.
+    fn non_g474_changed(&self, before: &DesignSnapshot) -> bool {
+        match before {
+            DesignSnapshot::H523(b) => !self.h523_design.eq_ignoring_notes(b),
+            DesignSnapshot::C531(b) => self.c531_design != *b,
+            DesignSnapshot::G474(_) => false,
+        }
+    }
+
+    /// Push a pre-edit snapshot onto the undo stack (cap-trimmed) and invalidate
+    /// redo — the single place both the G474 `mutate` path and the non-G474
+    /// frame-diff record history.
+    fn push_history(&mut self, snap: DesignSnapshot) {
+        self.history.push(snap);
+        if self.history.len() > HISTORY_CAP {
+            self.history.remove(0);
+        }
+        self.redo.clear();
+    }
+
+    /// Wrap a G474 mutation so it records a history entry iff state changed.
     fn mutate(&mut self, f: impl FnOnce(&mut Design)) {
         let before = self.design.clone();
         f(&mut self.design);
         if self.design != before {
-            self.history.push(before);
-            if self.history.len() > HISTORY_CAP {
-                self.history.remove(0);
-            }
-            self.redo.clear();
+            self.push_history(DesignSnapshot::G474(before));
         }
     }
 
     fn undo(&mut self) {
         if let Some(prev) = self.history.pop() {
-            let current = std::mem::replace(&mut self.design, prev);
+            let current = self.snapshot_active();
+            self.restore_snapshot(prev);
             self.redo.push(current);
         }
     }
 
     fn redo_op(&mut self) {
         if let Some(next) = self.redo.pop() {
-            let current = std::mem::replace(&mut self.design, next);
+            let current = self.snapshot_active();
+            self.restore_snapshot(next);
             self.history.push(current);
         }
     }
@@ -341,6 +399,14 @@ impl PeriPlannerApp {
                         }
                     });
                 if let Some(m) = pending_mcu {
+                    let prev = self.mcu;
+                    // Switching the active design model invalidates undo history:
+                    // a popped snapshot of one family can't restore into another's
+                    // live view. (H523<->C5A3 share a model, so they keep theirs.)
+                    if model_family(m) != model_family(prev) {
+                        self.history.clear();
+                        self.redo.clear();
+                    }
                     self.mcu = m;
                     // Reset package to the new MCU's default; keeps
                     // self.variant stale on H523 (only consumed by G474
@@ -633,6 +699,11 @@ impl eframe::App for PeriPlannerApp {
         let can_redo = !self.redo.is_empty();
 
         if self.mcu != Mcu::G474 {
+            // Bracket the whole non-G474 frame to record edits (a Seed in the top
+            // bar, or a view action) as ONE undo step. These models don't go
+            // through `mutate`; the deferred-action views apply ≤1 edit per frame.
+            let mcu_before = self.mcu;
+            let before = self.snapshot_active();
             self.render_top_bar(ctx, can_undo, can_redo);
             self.render_status_line(ctx);
             let descriptor = self.package.descriptor();
@@ -684,6 +755,11 @@ impl eframe::App for PeriPlannerApp {
             });
             self.pending_open = jump;
             self.apply_converter_action(conv_action);
+            // Record the frame's edit unless the frame switched MCU (history was
+            // cleared) or only a note changed.
+            if self.mcu == mcu_before && self.non_g474_changed(&before) {
+                self.push_history(before);
+            }
             return;
         }
 
