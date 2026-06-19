@@ -116,8 +116,17 @@ pub fn show(ui: &mut egui::Ui, raw: &'static RawMcuData, design: &mut H523Design
                             action = Some(Action::Remove(i));
                         }
                     });
+                    let roles = available_roles(raw, &u.peripheral);
+                    if roles.is_empty() {
+                        // The shared H5/C5 design can carry a use declared on the
+                        // other family; explain the otherwise-mute card.
+                        ui.colored_label(
+                            RED,
+                            "— not available on this package (declared on another chip)",
+                        );
+                    }
                     egui::Grid::new(("roles", i)).num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
-                        for role in available_roles(raw, &u.peripheral) {
+                        for role in roles {
                             let declared_role = u.roles.iter().any(|r| r == role);
                             let mut on = declared_role;
                             if ui.checkbox(&mut on, role).changed() {
