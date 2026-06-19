@@ -81,4 +81,18 @@ impl H523Design {
     pub fn unlock(&mut self, peripheral: &str, role: &str) {
         self.pin_locks.retain(|l| !(l.peripheral == peripheral && l.role == role));
     }
+
+    /// A copy-paste pin-allocation summary for `part_name`.
+    pub fn export_summary(&self, part_name: &str) -> String {
+        use std::fmt::Write as _;
+        let mut s = format!("{part_name} — pin allocation ({} locks)\n", self.pin_locks.len());
+        let mut locks = self.pin_locks.clone();
+        locks.sort_by(|a, b| {
+            (a.peripheral.as_str(), a.role.as_str()).cmp(&(b.peripheral.as_str(), b.role.as_str()))
+        });
+        for l in &locks {
+            let _ = writeln!(s, "  {} {}: P{}{}", l.peripheral, l.role, l.port, l.num);
+        }
+        s
+    }
 }

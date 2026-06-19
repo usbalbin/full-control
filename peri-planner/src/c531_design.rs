@@ -256,6 +256,29 @@ impl C531Design {
     pub fn is_valid(&self, package: Package) -> bool {
         self.validate(package).is_empty()
     }
+
+    /// A copy-paste converter-plan summary for `part_name`.
+    pub fn export_summary(&self, part_name: &str) -> String {
+        use std::fmt::Write as _;
+        let mut s = format!("{part_name} — converter plan ({} legs)\n", self.legs.len());
+        for (i, leg) in self.legs.iter().enumerate() {
+            let _ = write!(s, "  leg {}: {:?} ch-mask={:#06b}", i + 1, leg.tim, leg.channels_mask);
+            if leg.complementary {
+                let _ = write!(s, " complementary");
+            }
+            if leg.dead_time {
+                let _ = write!(s, " dead-time");
+            }
+            if let Some(ocp) = &leg.ocp {
+                let _ = write!(s, " OCP({:?}→BRK{})", ocp.comp, ocp.break_input);
+            }
+            if let Some((adc, ch)) = leg.adc_sense {
+                let _ = write!(s, " sense({adc:?}.{ch})");
+            }
+            let _ = writeln!(s);
+        }
+        s
+    }
 }
 
 #[cfg(test)]

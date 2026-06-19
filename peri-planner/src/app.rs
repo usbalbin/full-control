@@ -346,7 +346,14 @@ impl PeriPlannerApp {
                 ui.selectable_value(&mut self.view, ViewMode::Dropin, "Drop-in finder");
                 ui.separator();
                 if ui.button("Export").clicked() {
-                    let text = self.design.export_summary();
+                    // Family-correct: each MCU exports ITS model, not always G474.
+                    let text = match self.mcu {
+                        Mcu::G474 => self.design.export_summary(),
+                        Mcu::C531 => self.c531_design.export_summary(self.package.name()),
+                        Mcu::H523 | Mcu::C5A3 => {
+                            self.h523_design.export_summary(self.package.name())
+                        }
+                    };
                     ui.ctx().copy_text(text);
                 }
             });
