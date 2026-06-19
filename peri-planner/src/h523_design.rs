@@ -51,13 +51,22 @@ impl PinLock {
     pub fn signal_key(&self) -> (&str, &str) { (&self.peripheral, &self.role) }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct H523Design {
     pub format_version: u32,
     pub pin_locks: Vec<PinLock>,
     /// Declared peripheral uses — the intent layer above `pin_locks`.
     #[serde(default)]
     pub uses: Vec<PeripheralUse>,
+}
+
+/// `default()` is the canonical empty design — identical to `new()` (notably
+/// carrying the current `format_version`, not a derived 0) so that map
+/// `or_default()` / `unwrap_or_default()` produce a coherent fresh design.
+impl Default for H523Design {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 pub const H523_DESIGN_FORMAT_VERSION: u32 = 1;

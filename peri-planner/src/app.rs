@@ -17,25 +17,16 @@ use crate::solver::{TimerSlotUsage, ALL_CR_SLOTS_HELPER};
 const STORAGE_KEY: &str = "peri_planner_design_v4";
 const HISTORY_CAP: usize = 40;
 
-/// A point-in-time copy of whichever per-family design model is active — the
+/// A point-in-time copy of whichever per-MCU design model is active — the
 /// generic unit of undo/redo. Unifies the HISTORY across families without
 /// unifying the model TYPES (which stay deliberately separate). The history
-/// stack only ever holds the active family's variant (it's cleared on a
-/// model-family switch), so restoring is always coherent with the live view.
+/// stack only ever holds the active MCU's variant (it's cleared on ANY MCU
+/// switch), so restoring is always coherent with the live view.
 #[derive(Clone, PartialEq)]
 enum DesignSnapshot {
     G474(Design),
-    H523(H523Design), // shared by H523 + C5A3
+    H523(H523Design), // snapshot of the active H523-family (H523 or C5A3) design
     C531(C531Design),
-}
-
-/// Group MCUs by which design model backs them (G474 / shared-H523 / C531).
-fn model_family(m: Mcu) -> u8 {
-    match m {
-        Mcu::G474 => 0,
-        Mcu::H523 | Mcu::C5A3 => 1,
-        Mcu::C531 => 2,
-    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -56,12 +47,15 @@ enum ViewMode {
 
 pub struct PeriPlannerApp {
     design: Design,
-    /// Pin-lock state for non-G474 MCUs. Lives separately from `design`
-    /// because `Design` is HRTIM/COMP/OPAMP-shaped and would be all-empty
-    /// fields here. Future H523 features extend this struct.
-    h523_design: H523Design,
-    /// C531 timer-PWM converter plan. Like `h523_design`, kept separate from
-    /// the HRTIM-shaped G474 `Design` (C531 has no HRTIM).
+    /// Pin-lock + declared-use state for the H523-family MCUs (H523, C5A3),
+    /// keyed PER MCU so switching between them never carries one chip's plan
+    /// into the other. Lives separately from `design` because `Design` is
+    /// HRTIM/COMP/OPAMP-shaped and would be all-empty fields here. (G474 and
+    /// C531 are 1:1 with their model and keep dedicated fields; a future
+    /// named-project spine would fold all of these into one per-MCU store.)
+    h523_designs: std::collections::HashMap<Mcu, H523Design>,
+    /// C531 timer-PWM converter plan. Like the H523-family designs, kept
+    /// separate from the HRTIM-shaped G474 `Design` (C531 has no HRTIM).
     c531_design: C531Design,
     mcu: Mcu,
     package: Package,
@@ -104,7 +98,7 @@ impl Default for PeriPlannerApp {
     fn default() -> Self {
         Self {
             design: Design::default(),
-            h523_design: H523Design::new(),
+            h523_designs: std::collections::HashMap::new(),
             c531_design: C531Design::new(),
             mcu: Mcu::G474,
             package: Package::G474R,
@@ -153,8 +147,14 @@ impl PeriPlannerApp {
             if let Some(m) = eframe::get_value::<Mcu>(storage, "peri_planner_mcu_v1") {
                 slf.mcu = m;
             }
-            if let Some(d) = eframe::get_value::<H523Design>(storage, "peri_planner_h523_design_v1") {
-                slf.h523_design = d;
+            // Per-MCU H523-family designs, persisted as a Vec of (mcu, design)
+            // pairs (sidesteps enum-keyed-map serialization). Save-compat with
+            // the old single-design key isn't required, so it's simply dropped.
+            if let Some(v) = eframe::get_value::<Vec<(Mcu, H523Design)>>(
+                storage,
+                "peri_planner_h523_designs_v1",
+            ) {
+                slf.h523_designs = v.into_iter().collect();
             }
             if let Some(d) = eframe::get_value::<C531Design>(storage, "peri_planner_c531_design_v1") {
                 slf.c531_design = d;
@@ -174,20 +174,45 @@ impl PeriPlannerApp {
         slf
     }
 
+    /// The active H523-family design (H523 / C5A3 each keep their own), or an
+    /// empty borrow when none has been touched yet. Reads only — mutators use
+    /// `h523_designs.entry(self.mcu).or_default()`.
+    fn h523<'a>(&'a self, empty: &'a H523Design) -> &'a H523Design {
+        self.h523_designs.get(&self.mcu).unwrap_or(empty)
+    }
+
+    /// Switch the active MCU, clearing undo/redo history. Each MCU has its own
+    /// design state, so a snapshot of one MCU must never restore into another's
+    /// live view — that invariant is what makes per-MCU undo coherent. No-op if
+    /// already active. A package switch within an MCU keeps history (same design).
+    fn set_active_mcu(&mut self, m: Mcu) {
+        if m != self.mcu {
+            self.history.clear();
+            self.redo.clear();
+            self.mcu = m;
+        }
+    }
+
     /// Snapshot whichever model is active.
     fn snapshot_active(&self) -> DesignSnapshot {
         match self.mcu {
             Mcu::G474 => DesignSnapshot::G474(self.design.clone()),
-            Mcu::H523 | Mcu::C5A3 => DesignSnapshot::H523(self.h523_design.clone()),
+            Mcu::H523 | Mcu::C5A3 => {
+                DesignSnapshot::H523(self.h523_designs.get(&self.mcu).cloned().unwrap_or_default())
+            }
             Mcu::C531 => DesignSnapshot::C531(self.c531_design.clone()),
         }
     }
 
-    /// Restore a snapshot into its matching live model.
+    /// Restore a snapshot into its matching live model. History clears on every
+    /// MCU switch, so the active MCU here always matches the one the snapshot was
+    /// captured under — the H523 design lands back in the correct per-MCU slot.
     fn restore_snapshot(&mut self, snap: DesignSnapshot) {
         match snap {
             DesignSnapshot::G474(d) => self.design = d,
-            DesignSnapshot::H523(d) => self.h523_design = d,
+            DesignSnapshot::H523(d) => {
+                self.h523_designs.insert(self.mcu, d);
+            }
             DesignSnapshot::C531(d) => self.c531_design = d,
         }
     }
@@ -196,7 +221,10 @@ impl PeriPlannerApp {
     /// edits, which aren't their own undo step). G474 is recorded by `mutate`.
     fn non_g474_changed(&self, before: &DesignSnapshot) -> bool {
         match before {
-            DesignSnapshot::H523(b) => !self.h523_design.eq_ignoring_notes(b),
+            DesignSnapshot::H523(b) => {
+                let empty = H523Design::new();
+                !self.h523(&empty).eq_ignoring_notes(b)
+            }
             DesignSnapshot::C531(b) => self.c531_design != *b,
             DesignSnapshot::G474(_) => false,
         }
@@ -274,7 +302,8 @@ impl PeriPlannerApp {
                 // Distinct DECLARED peripheral instances per kind (the intent;
                 // a declared use counts whether or not its roles are pinned yet).
                 let mut by_kind: BTreeMap<&'static str, BTreeSet<&str>> = BTreeMap::new();
-                for u in &self.h523_design.uses {
+                let empty = H523Design::new();
+                for u in &self.h523(&empty).uses {
                     if let Some(k) = crate::select::kind_of(&u.peripheral) {
                         by_kind.entry(k).or_default().insert(u.peripheral.as_str());
                     }
@@ -310,7 +339,8 @@ impl PeriPlannerApp {
             Mcu::C531 => seed_c531_into(&mut self.c531_design, &demands, &have),
             Mcu::H523 | Mcu::C5A3 => {
                 let raw = self.package.descriptor().raw;
-                seed_h523_into(&mut self.h523_design, raw, &demands, &have);
+                let d = self.h523_designs.entry(self.mcu).or_default();
+                seed_h523_into(d, raw, &demands, &have);
             }
         }
     }
@@ -358,9 +388,11 @@ impl PeriPlannerApp {
                         }
                     }
                     Mcu::H523 | Mcu::C5A3 => {
-                        let uses = self.h523_design.uses.len();
-                        let locks = self.h523_design.pin_locks.len();
-                        let problems = self.h523_design.validate(self.package.descriptor().raw);
+                        let empty = H523Design::new();
+                        let d = self.h523(&empty);
+                        let uses = d.uses.len();
+                        let locks = d.pin_locks.len();
+                        let problems = d.validate(self.package.descriptor().raw);
                         ui.label(format!("{uses} peripherals · {locks} pins locked"));
                         ui.separator();
                         if problems.is_empty() {
@@ -399,15 +431,10 @@ impl PeriPlannerApp {
                         }
                     });
                 if let Some(m) = pending_mcu {
-                    let prev = self.mcu;
-                    // Switching the active design model invalidates undo history:
-                    // a popped snapshot of one family can't restore into another's
-                    // live view. (H523<->C5A3 share a model, so they keep theirs.)
-                    if model_family(m) != model_family(prev) {
-                        self.history.clear();
-                        self.redo.clear();
-                    }
-                    self.mcu = m;
+                    // Each MCU keeps its own design state, so switching MCUs
+                    // invalidates undo history (a popped snapshot must never
+                    // restore into a different MCU's live view).
+                    self.set_active_mcu(m);
                     // Reset package to the new MCU's default; keeps
                     // self.variant stale on H523 (only consumed by G474
                     // legacy code, which doesn't render on H523).
@@ -487,7 +514,8 @@ impl PeriPlannerApp {
                         Mcu::G474 => self.design.export_summary(),
                         Mcu::C531 => self.c531_design.export_summary(self.package.name()),
                         Mcu::H523 | Mcu::C5A3 => {
-                            self.h523_design.export_summary(self.package.name())
+                            let empty = H523Design::new();
+                            self.h523(&empty).export_summary(self.package.name())
                         }
                     };
                     ui.ctx().copy_text(text);
@@ -621,8 +649,8 @@ impl PeriPlannerApp {
     }
 
     /// Apply an edit from the C531 Converter view to `c531_design`. Kept
-    /// outside the `Design` undo stack (like `h523_design`) — the converter
-    /// plan is a separate model.
+    /// outside the `Design` undo stack (like the H523-family designs) — the
+    /// converter plan is a separate model.
     fn apply_converter_action(&mut self, action: Option<ConverterAction>) {
         let Some(action) = action else { return };
         match action {
@@ -656,7 +684,9 @@ impl eframe::App for PeriPlannerApp {
         eframe::set_value(storage, "peri_planner_view_v1", &self.view);
         eframe::set_value(storage, "peri_planner_mcu_v1", &self.mcu);
         eframe::set_value(storage, "peri_planner_package_v1", &self.package);
-        eframe::set_value(storage, "peri_planner_h523_design_v1", &self.h523_design);
+        let h523_designs: Vec<(Mcu, H523Design)> =
+            self.h523_designs.iter().map(|(m, d)| (*m, d.clone())).collect();
+        eframe::set_value(storage, "peri_planner_h523_designs_v1", &h523_designs);
         eframe::set_value(storage, "peri_planner_c531_design_v1", &self.c531_design);
     }
 
@@ -666,7 +696,9 @@ impl eframe::App for PeriPlannerApp {
         // chip; any other opens the read-only descriptor browser.
         if let Some(name) = self.pending_open.take() {
             if let Some(pkg) = Package::for_chip_name(&name) {
-                self.mcu = pkg.mcu();
+                // Opening a part can switch the active MCU — clear undo history
+                // just like the MCU combo does (each MCU has its own design).
+                self.set_active_mcu(pkg.mcu());
                 self.package = pkg;
                 if let Some(v) = pkg.to_g474_variant() {
                     self.variant = v;
@@ -710,7 +742,10 @@ impl eframe::App for PeriPlannerApp {
             let package = self.package;
             let view = self.view;
             let af_filter = &mut self.af_filter;
-            let h523 = &mut self.h523_design;
+            // Active H523-family design, created on first touch for this MCU.
+            // (`render_top_bar` above may have switched MCU this frame; this binds
+            // to the now-active one — the post-render diff is skipped on a switch.)
+            let h523 = self.h523_designs.entry(self.mcu).or_default();
             let c531 = &self.c531_design;
             let catalog_query = &mut self.catalog_query;
             let catalog_demands = &mut self.catalog_demands;
@@ -1910,5 +1945,46 @@ mod seed_tests {
         assert!(h.pin_locks.iter().any(|l| l.role == "RX"));
         let pins: std::collections::BTreeSet<_> = h.pin_locks.iter().map(|l| l.pin()).collect();
         assert_eq!(pins.len(), 2, "TX and RX must land on distinct pins");
+    }
+
+    #[test]
+    fn per_mcu_h523_designs_are_independent_and_undo_is_coherent() {
+        let mut app = PeriPlannerApp::default(); // starts on G474
+        let empty = H523Design::new();
+
+        // Declaring on H523 must NOT appear on C5A3 (no shared field anymore).
+        app.set_active_mcu(Mcu::H523);
+        app.h523_designs.entry(Mcu::H523).or_default().add_use("USART1", &["TX"]);
+        app.set_active_mcu(Mcu::C5A3);
+        assert!(app.h523(&empty).uses.is_empty(), "C5A3 must not see H523's use");
+        app.h523_designs.entry(Mcu::C5A3).or_default().add_use("LPUART1", &["TX"]);
+
+        // Back on H523, its own use is intact (and distinct from C5A3's).
+        app.set_active_mcu(Mcu::H523);
+        assert_eq!(app.h523(&empty).uses.len(), 1);
+        assert_eq!(app.h523(&empty).uses[0].peripheral, "USART1");
+        assert_eq!(app.h523_designs[&Mcu::C5A3].uses[0].peripheral, "LPUART1");
+
+        // Switching MCUs clears undo history (a snapshot of one MCU must never
+        // restore into another's live view) — including H523<->C5A3.
+        app.history.push(app.snapshot_active());
+        app.set_active_mcu(Mcu::C5A3);
+        assert!(app.history.is_empty() && app.redo.is_empty(), "MCU switch clears history");
+
+        // Re-selecting the SAME MCU is a no-op: history is preserved (a package
+        // switch within an MCU keeps the same design + its undo stack).
+        app.history.push(app.snapshot_active());
+        app.set_active_mcu(Mcu::C5A3);
+        assert_eq!(app.history.len(), 1, "same-MCU re-select keeps history");
+
+        // restore_snapshot lands in the ACTIVE MCU's slot (the cleared-on-switch
+        // invariant guarantees active MCU == capture MCU).
+        app.set_active_mcu(Mcu::H523);
+        let snap = app.snapshot_active(); // H523 with just USART1
+        app.h523_designs.get_mut(&Mcu::H523).unwrap().add_use("SPI1", &["SCK"]);
+        assert_eq!(app.h523_designs[&Mcu::H523].uses.len(), 2);
+        app.restore_snapshot(snap);
+        assert_eq!(app.h523_designs[&Mcu::H523].uses.len(), 1, "restore reverts H523 slot");
+        assert_eq!(app.h523_designs[&Mcu::H523].uses[0].peripheral, "USART1");
     }
 }

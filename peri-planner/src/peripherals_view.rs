@@ -118,11 +118,12 @@ pub fn show(ui: &mut egui::Ui, raw: &'static RawMcuData, design: &mut H523Design
                     });
                     let roles = available_roles(raw, &u.peripheral);
                     if roles.is_empty() {
-                        // The shared H5/C5 design can carry a use declared on the
-                        // other family; explain the otherwise-mute card.
+                        // A use declared on a larger package of this MCU can become
+                        // unreachable after switching to a smaller one that doesn't
+                        // break the peripheral out; explain the otherwise-mute card.
                         ui.colored_label(
                             RED,
-                            "— not available on this package (declared on another chip)",
+                            "— not available on this package (declared on a larger variant of this MCU)",
                         );
                     }
                     egui::Grid::new(("roles", i)).num_columns(2).spacing([14.0, 4.0]).show(ui, |ui| {
