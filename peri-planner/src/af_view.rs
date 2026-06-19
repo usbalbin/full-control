@@ -6,7 +6,7 @@
 use eframe::egui;
 
 use crate::h523_design::H523Design;
-use crate::mcu_pinout::{af_rows, peripherals_with_pins, AfRow};
+use crate::mcu_pinout::{af_rows, peripherals_with_pins, AfRow, PinId};
 use crate::mcu_raw::RawMcuData;
 
 #[derive(Default)]
@@ -30,6 +30,9 @@ pub fn show(
     ui.separator();
 
     let peripherals = peripherals_with_pins(raw);
+    let can_lock = design.is_some();
+    let mut enter = false;
+    let mut search_resp: Option<egui::Response> = None;
     ui.horizontal(|ui| {
         ui.label("Peripheral:");
         egui::ComboBox::from_id_salt("af_peripheral")
@@ -64,11 +67,17 @@ pub fn show(
             });
 
         ui.label("Search:");
-        ui.add(egui::TextEdit::singleline(&mut filter.query).desired_width(120.0));
+        let resp = ui.add(
+            egui::TextEdit::singleline(&mut filter.query)
+                .desired_width(170.0)
+                .hint_text(if can_lock { "type, ↵ locks top" } else { "type to filter" }),
+        );
+        enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        search_resp = Some(resp);
         if !filter.query.is_empty() && ui.small_button("clear").clicked() {
             filter.query.clear();
         }
-        if design.is_some() {
+        if can_lock {
             ui.checkbox(&mut filter.locked_only, "Locked only");
         }
     });
@@ -102,6 +111,23 @@ pub fn show(
     } else {
         ui.label(egui::RichText::new(format!("{} entries", rows.len())).weak());
     }
+
+    // Enter-to-lock: place the wired signal on the first free matching pin among
+    // the currently-filtered rows. So "usart2 tx ↵" locks USART2.TX on its first
+    // free pin; add a pin to the query ("usart2 tx pa2") to target a specific one.
+    let enter_target: Option<(String, String, PinId)> = if enter {
+        design.as_deref().and_then(|d| {
+            rows.iter()
+                .find(|r| {
+                    d.locked_pin(r.signal.peripheral, r.signal.role) != Some(r.pin)
+                        && d.occupant_of(r.pin)
+                            .is_none_or(|occ| occ == (r.signal.peripheral, r.signal.role))
+                })
+                .map(|r| (r.signal.peripheral.to_string(), r.signal.role.to_string(), r.pin))
+        })
+    } else {
+        None
+    };
 
     let mut pending: Option<LockAction> = None;
     egui::ScrollArea::vertical().show(ui, |ui| {
@@ -169,11 +195,28 @@ pub fn show(
         });
     });
 
+    // A click takes priority; otherwise an Enter in the search box places the
+    // top match.
+    let mut locked_via_enter = false;
+    if pending.is_none()
+        && let Some((peripheral, role, pin)) = enter_target
+    {
+        pending = Some(LockAction::Lock { peripheral, role, pin });
+        locked_via_enter = true;
+    }
     if let (Some(d), Some(action)) = (design, pending) {
         match action {
             LockAction::Lock { peripheral, role, pin } => d.lock(&peripheral, &role, pin),
             LockAction::Unlock { peripheral, role } => d.unlock(&peripheral, &role),
         }
+    }
+    // Clear the query after a placement, and keep focus in the box on any Enter so
+    // the user can chain placements without reaching for the mouse.
+    if locked_via_enter {
+        filter.query.clear();
+    }
+    if enter && can_lock && let Some(r) = &search_resp {
+        r.request_focus();
     }
 }
 
