@@ -81,6 +81,14 @@ impl Ledger {
     pub fn claim_consumer(&mut self, c: &impl Consume) -> Result<(), Vec<Res>> {
         self.claim(&c.consumed())
     }
+
+    /// Release previously-claimed tokens (the backtracker's undo). Tokens not
+    /// held are ignored, so releasing a claim that partially failed is safe.
+    pub fn release(&mut self, items: &[Res]) {
+        for r in items {
+            self.held.remove(r);
+        }
+    }
 }
 
 /// The union of every consumer's tokens EXCEPT the one at `skip`. The

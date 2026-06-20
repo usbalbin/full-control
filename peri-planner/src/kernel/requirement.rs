@@ -17,8 +17,12 @@ pub type DmaDemand = u8;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ReqKind {
     /// One instance of `class`, optionally backed by `dma` DMA channels drawn
-    /// from that instance's allowed controller pools.
-    UsePeripheral { class: Class, dma: DmaDemand },
+    /// from that instance's allowed controller pools. `pinned` fixes it to a
+    /// specific instance index (the user wants *USART2* specifically); `None`
+    /// lets the solver choose any free instance. Pinning is what makes the
+    /// selector path need backtracking — a flexible use can otherwise greedily
+    /// take the instance a pinned use requires.
+    UsePeripheral { class: Class, dma: DmaDemand, pinned: Option<u8> },
 }
 
 /// A user requirement with a stable id (so an infeasibility can name exactly
@@ -30,8 +34,13 @@ pub struct Requirement {
 }
 
 impl Requirement {
-    /// "Use one `class` instance, with `dma` DMA channels (0 = none)."
+    /// "Use any free `class` instance, with `dma` DMA channels (0 = none)."
     pub fn use_peripheral(id: u32, class: Class, dma: DmaDemand) -> Self {
-        Self { id, kind: ReqKind::UsePeripheral { class, dma } }
+        Self { id, kind: ReqKind::UsePeripheral { class, dma, pinned: None } }
+    }
+
+    /// "Use `class` instance `inst` specifically, with `dma` DMA channels."
+    pub fn use_peripheral_pinned(id: u32, class: Class, dma: DmaDemand, inst: u8) -> Self {
+        Self { id, kind: ReqKind::UsePeripheral { class, dma, pinned: Some(inst) } }
     }
 }

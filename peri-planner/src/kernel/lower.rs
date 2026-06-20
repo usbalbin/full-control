@@ -7,16 +7,19 @@
 //! ([`super::tokens`]) stay chip-agnostic; this module is where descriptor data
 //! becomes [`Res`] tokens (`Inst` for the instance, `Pool` for each DMA channel).
 //!
-//! Increment 4 is GREEDY: instances are tried in order and DMA channels grabbed
-//! first-fit. The error direction is one-sided and safe:
-//!   - SOUND — never a false positive. An `Allocated` verdict is always a real,
-//!     conflict-free allocation (the `Ledger` claims atomically), so the selector
-//!     never calls an incapable chip capable.
-//!   - INCOMPLETE — possible false negative. A greedy instance/channel choice can
-//!     strand a later requirement that a different choice would have satisfied, so
-//!     `Infeasible` can occasionally be wrong (pessimistic, never optimistic).
+//! Increment 5 makes the verdict COMPLETE for the instance-contention that
+//! pinned requirements create: `feasible` backtracks over instance assignment,
+//! most-constrained-requirement first, bounded by problem size (single-digit reqs
+//! × instances) with NO wall-clock timeout — a timeout on a deep-but-satisfiable
+//! instance would itself be an unsound false negative. It stays SOUND (an
+//! `Allocated` witness is always a real, conflict-free allocation).
 //!
-//! Most-constrained-first ordering + backtracking close the gap in Increment 5.
+//! DMA channels are still grabbed greedily within an instance's *allowed pools*.
+//! That is complete whenever those pools are interchangeable — true for every
+//! in-scope family (G4 DMAMUX fans every request to {DMA1,DMA2}; C5 LPDMA legs
+//! reach both controllers). A chip whose instances reach *disjoint* controllers
+//! would need channel-distribution backtracking too; none in scope does, so it's
+//! a documented residual rather than a live gap.
 
 use crate::mcu::McuDescriptor;
 
@@ -40,8 +43,9 @@ pub enum Outcome {
     /// Every requirement placed; the witness is a concrete, conflict-free
     /// allocation.
     Allocated(Vec<Placed>),
-    /// One or more requirements couldn't be placed (the rest were greedily
-    /// placed); `unmet` names them by id.
+    /// No complete assignment exists. `unmet` is a best-effort list of culprit
+    /// ids (from a greedy pass), not necessarily minimal — the verdict itself is
+    /// authoritative (backtracking proved no full assignment).
     Infeasible { unmet: Vec<u32> },
 }
 
@@ -67,78 +71,144 @@ fn pool_capacity(desc: &McuDescriptor, pool: &str) -> u8 {
     desc.dma_pools().iter().find(|p| p.name == pool).map(|p| p.channels).unwrap_or(0)
 }
 
-/// Greedily reserve `need` DMA channels for instance `(class, i)` from the union
-/// of its legs' allowed pools, avoiding channels already held or already chosen
-/// in `extra`. Pushes the chosen `Pool` tokens onto `extra` and the `(pool, ch)`
-/// witness onto `chans`. Returns false (leaving `extra`/`chans` to be discarded
-/// by the caller) if the instance can't supply `need` free channels.
-fn grab_channels(
-    led: &Ledger,
-    desc: &McuDescriptor,
-    class: Class,
-    i: u8,
-    need: u8,
-    extra: &mut Vec<Res>,
-    chans: &mut Vec<(&'static str, u8)>,
-) -> bool {
-    // The instance's allowed pools, de-duplicated across its DMA legs.
+/// Controller pools instance `(class, i)` can draw DMA from (the union of its
+/// legs), each with its channel capacity. Interchangeable for the greedy channel
+/// grab (see module docs).
+fn allowed_pools(desc: &McuDescriptor, class: Class, i: u8) -> Vec<(&'static str, u8)> {
     let routes = desc.dma_routes(&format!("{class}{i}"));
-    let mut pools: Vec<&'static str> = routes.iter().flat_map(|leg| leg.pools.iter().copied()).collect();
-    pools.sort_unstable();
-    pools.dedup();
+    let names: std::collections::BTreeSet<&'static str> =
+        routes.iter().flat_map(|leg| leg.pools.iter().copied()).collect();
+    names.into_iter().map(|n| (n, pool_capacity(desc, n))).collect()
+}
 
+/// Free channels currently available to instance `(class, i)` across its pools.
+fn free_channels(led: &Ledger, desc: &McuDescriptor, class: Class, i: u8) -> u8 {
+    allowed_pools(desc, class, i)
+        .iter()
+        .map(|(pool, cap)| (0..*cap).filter(|&ch| !led.held().contains(&Res::Pool(pool, ch))).count() as u8)
+        .sum()
+}
+
+/// Whether instance `(class, i)` can host a use needing `dma` channels right now:
+/// the instance is free and enough channels remain in its pools.
+fn can_place(led: &Ledger, desc: &McuDescriptor, class: Class, i: u8, dma: u8) -> bool {
+    !led.held().contains(&Res::Inst(class, i))
+        && (dma == 0 || free_channels(led, desc, class, i) >= dma)
+}
+
+/// What a successful [`commit`] claimed: the tokens (to release on backtrack)
+/// and the `(pool, channel)` DMA witness.
+type Committed = (Vec<Res>, Vec<(&'static str, u8)>);
+
+/// Commit instance `(class, i)` with `dma` channels into `led`: claim the `Inst`
+/// token + `dma` lowest-free `Pool` tokens from its allowed pools. Returns the
+/// claimed tokens (to release on backtrack) + the `(pool, channel)` witness, or
+/// `None` if it no longer fits.
+fn commit(led: &mut Ledger, desc: &McuDescriptor, class: Class, i: u8, dma: u8) -> Option<Committed> {
+    let inst = Res::Inst(class, i);
+    if led.held().contains(&inst) {
+        return None;
+    }
+    let mut claim = vec![inst];
+    let mut chans = Vec::new();
     let mut taken = 0u8;
-    for pool in pools {
-        for ch in 0..pool_capacity(desc, pool) {
-            if taken == need {
-                break;
+    'pools: for (pool, cap) in allowed_pools(desc, class, i) {
+        for ch in 0..cap {
+            if taken == dma {
+                break 'pools;
             }
             let tok = Res::Pool(pool, ch);
-            if !led.held().contains(&tok) && !extra.contains(&tok) {
-                extra.push(tok);
+            if !led.held().contains(&tok) && !claim.contains(&tok) {
+                claim.push(tok);
                 chans.push((pool, ch));
                 taken += 1;
             }
         }
-        if taken == need {
-            break;
-        }
     }
-    taken == need
+    if taken < dma {
+        return None;
+    }
+    led.claim(&claim).ok()?;
+    Some((claim, chans))
 }
 
-/// Decide whether `reqs` fit on `desc`, greedily. Each requirement claims a fresh
-/// instance of its class plus its DMA channels; the kernel `Ledger` enforces that
-/// nothing is shared.
-pub fn feasible(desc: &McuDescriptor, reqs: &[Requirement]) -> Outcome {
-    let mut led = Ledger::new();
-    let mut placed = Vec::new();
-    let mut unmet = Vec::new();
+/// A requirement reduced to the instances it may use on this chip.
+struct Item {
+    id: u32,
+    class: Class,
+    dma: u8,
+    /// The pinned instance (if present on the chip), else every instance of the
+    /// class.
+    insts: Vec<u8>,
+}
 
-    for req in reqs {
-        let ReqKind::UsePeripheral { class, dma } = req.kind;
-        let mut done = false;
-        for i in instances_of(desc, class) {
-            let mut claim = vec![Res::Inst(class, i)];
-            let mut chans = Vec::new();
-            if dma > 0 && !grab_channels(&led, desc, class, i, dma, &mut claim, &mut chans) {
-                continue; // this instance can't supply the channels; try the next
+/// Place every item by backtracking, most-constrained (fewest currently-viable
+/// instances) first. Returns true with `witness` filled, or false (and `witness`
+/// restored) if no complete assignment exists. Bounded by problem size — each
+/// level places exactly one more item — so it terminates without a timeout.
+fn backtrack(
+    desc: &McuDescriptor,
+    items: &[Item],
+    led: &mut Ledger,
+    witness: &mut Vec<Placed>,
+) -> bool {
+    let placed: std::collections::BTreeSet<u32> = witness.iter().map(|p| p.req_id).collect();
+    let next = items
+        .iter()
+        .filter(|it| !placed.contains(&it.id))
+        .min_by_key(|it| it.insts.iter().filter(|&&i| can_place(led, desc, it.class, i, it.dma)).count());
+    let Some(it) = next else {
+        return true; // every item placed
+    };
+    for &i in &it.insts {
+        if let Some((claim, chans)) = commit(led, desc, it.class, i, it.dma) {
+            witness.push(Placed { req_id: it.id, class: it.class, instance: i, dma: chans });
+            if backtrack(desc, items, led, witness) {
+                return true;
             }
-            if led.claim(&claim).is_ok() {
-                placed.push(Placed { req_id: req.id, class, instance: i, dma: chans });
-                done = true;
-                break;
-            }
-        }
-        if !done {
-            unmet.push(req.id);
+            witness.pop();
+            led.release(&claim);
         }
     }
+    false
+}
 
-    if unmet.is_empty() {
-        Outcome::Allocated(placed)
+/// Best-effort culprit naming when the set is infeasible: a single greedy pass,
+/// reporting the requirements it couldn't place. Not the minimal unsat core
+/// (that's a later increment) — the COMPLETE verdict comes from `backtrack`.
+fn greedy_unmet(desc: &McuDescriptor, items: &[Item]) -> Vec<u32> {
+    let mut led = Ledger::new();
+    let mut unmet = Vec::new();
+    for it in items {
+        if !it.insts.iter().any(|&i| commit(&mut led, desc, it.class, i, it.dma).is_some()) {
+            unmet.push(it.id);
+        }
+    }
+    unmet
+}
+
+/// Decide whether `reqs` fit on `desc`, complete over instance assignment via
+/// bounded backtracking (see module docs). The witness is a real allocation.
+pub fn feasible(desc: &McuDescriptor, reqs: &[Requirement]) -> Outcome {
+    let items: Vec<Item> = reqs
+        .iter()
+        .map(|r| {
+            let ReqKind::UsePeripheral { class, dma, pinned } = r.kind;
+            let mut insts = instances_of(desc, class);
+            if let Some(p) = pinned {
+                insts.retain(|&i| i == p);
+            }
+            Item { id: r.id, class, dma, insts }
+        })
+        .collect();
+
+    let mut led = Ledger::new();
+    let mut witness = Vec::new();
+    if backtrack(desc, &items, &mut led, &mut witness) {
+        witness.sort_by_key(|p| p.req_id);
+        Outcome::Allocated(witness)
     } else {
-        Outcome::Infeasible { unmet }
+        Outcome::Infeasible { unmet: greedy_unmet(desc, &items) }
     }
 }
 
@@ -228,5 +298,54 @@ mod tests {
             }
             o => panic!("expected C531 DMA to allocate now the data is wired in, got {o:?}"),
         }
+    }
+
+    #[test]
+    fn backtracking_resolves_pinned_contention() {
+        let d = g474();
+        let insts = instances_of(d, "USART");
+        assert!(insts.len() >= 2, "need >=2 USART instances to contend");
+        let pin = insts[0];
+        // Order chosen to trip a naive in-order greedy (Inc 4): the FLEXIBLE use
+        // comes first and would grab `pin`, stranding the use pinned to `pin`.
+        // The complete solver places the pinned (most-constrained) use first and
+        // yields `pin` to it, putting the flexible one elsewhere.
+        let reqs = vec![
+            Requirement::use_peripheral(0, "USART", 0),
+            Requirement::use_peripheral_pinned(1, "USART", 0, pin),
+        ];
+        match feasible(d, &reqs) {
+            Outcome::Allocated(p) => {
+                let pinned = p.iter().find(|x| x.req_id == 1).unwrap();
+                let flex = p.iter().find(|x| x.req_id == 0).unwrap();
+                assert_eq!(pinned.instance, pin, "pinned use takes its specific instance");
+                assert_ne!(flex.instance, pin, "flexible use must yield `pin`");
+            }
+            o => panic!("backtracking should satisfy pinned contention, got {o:?}"),
+        }
+    }
+
+    #[test]
+    fn two_uses_pinned_to_same_instance_conflict() {
+        // Both pinned to the same instance — only one can have it. Exercises the
+        // backtrack-undo path (place one, dead-end on the other, release, fail).
+        let d = g474();
+        let pin = instances_of(d, "USART")[0];
+        let reqs = vec![
+            Requirement::use_peripheral_pinned(0, "USART", 0, pin),
+            Requirement::use_peripheral_pinned(1, "USART", 0, pin),
+        ];
+        assert!(matches!(feasible(d, &reqs), Outcome::Infeasible { .. }));
+    }
+
+    #[test]
+    fn pin_to_nonexistent_instance_is_infeasible_and_named() {
+        let d = g474();
+        let bogus = 99;
+        assert!(!instances_of(d, "USART").contains(&bogus));
+        assert!(matches!(
+            feasible(d, &[Requirement::use_peripheral_pinned(0, "USART", 0, bogus)]),
+            Outcome::Infeasible { unmet } if unmet == vec![0],
+        ));
     }
 }
