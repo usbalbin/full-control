@@ -15,6 +15,10 @@ use crate::solver::{TimerSlotUsage, ALL_CR_SLOTS_HELPER};
 // v4: pin_assignments re-keyed from the typed Signal enum to the owned
 // (peripheral, role) form. Old v3 saves are intentionally dropped.
 const STORAGE_KEY: &str = "peri_planner_design_v4";
+/// The post-spine save: one RON blob holding all named projects. Replaces the
+/// pre-spine per-key save (which is read once, on first run, to seed the active
+/// project — see `seed_active_from_legacy_keys`).
+const PROJECTS_KEY: &str = "peri_planner_projects_v1";
 const HISTORY_CAP: usize = 40;
 
 /// A point-in-time copy of whichever per-MCU design model is active — the
@@ -45,21 +49,53 @@ enum ViewMode {
     Peripherals,
 }
 
-pub struct PeriPlannerApp {
+/// One named design — the savable unit ("project"). Holds the full design state:
+/// the G474 `Design`, the per-MCU H523-family map (so H523/C5A3 keep their own
+/// plan), the C531 converter plan, and the active chip selection. Ephemeral UI
+/// (view, finder query/demands, undo stacks, picked role) stays on
+/// `PeriPlannerApp` and is shared across projects.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct Project {
+    name: String,
     design: Design,
-    /// Pin-lock + declared-use state for the H523-family MCUs (H523, C5A3),
-    /// keyed PER MCU so switching between them never carries one chip's plan
-    /// into the other. Lives separately from `design` because `Design` is
-    /// HRTIM/COMP/OPAMP-shaped and would be all-empty fields here. (G474 and
-    /// C531 are 1:1 with their model and keep dedicated fields; a future
-    /// named-project spine would fold all of these into one per-MCU store.)
     h523_designs: std::collections::HashMap<Mcu, H523Design>,
-    /// C531 timer-PWM converter plan. Like the H523-family designs, kept
-    /// separate from the HRTIM-shaped G474 `Design` (C531 has no HRTIM).
     c531_design: C531Design,
     mcu: Mcu,
     package: Package,
     variant: ChipVariant,
+}
+
+impl Project {
+    fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            design: Design::default(),
+            h523_designs: std::collections::HashMap::new(),
+            c531_design: C531Design::new(),
+            mcu: Mcu::G474,
+            package: Package::G474R,
+            variant: ChipVariant::G474R,
+        }
+    }
+}
+
+/// The whole persisted project set (one RON blob). Save-compat with the
+/// pre-spine per-key save is NOT required, so this fully replaces it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Persisted {
+    active: Project,
+    others: Vec<Project>,
+}
+
+pub struct PeriPlannerApp {
+    /// The active named project — the live design state. A DIRECT field (not a
+    /// `Vec` index) so the render loop's simultaneous disjoint-field borrows
+    /// (e.g. `&mut active.h523_designs` alongside `&active.c531_design`) still
+    /// compile, exactly as the flat fields did before the spine.
+    active: Project,
+    /// The other (inactive) saved projects, in a stable order; switching swaps
+    /// one of these into `active`.
+    others: Vec<Project>,
     view: ViewMode,
     history: Vec<DesignSnapshot>,
     redo: Vec<DesignSnapshot>,
@@ -97,12 +133,8 @@ pub struct PeriPlannerApp {
 impl Default for PeriPlannerApp {
     fn default() -> Self {
         Self {
-            design: Design::default(),
-            h523_designs: std::collections::HashMap::new(),
-            c531_design: C531Design::new(),
-            mcu: Mcu::G474,
-            package: Package::G474R,
-            variant: ChipVariant::G474R,
+            active: Project::new("Untitled"),
+            others: Vec::new(),
             view: ViewMode::Fabric,
             history: Vec::new(),
             redo: Vec::new(),
@@ -128,57 +160,64 @@ impl PeriPlannerApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let mut slf = Self::default();
         if let Some(storage) = cc.storage {
-            if let Some(design) = eframe::get_value::<Design>(storage, STORAGE_KEY) {
-                slf.design = design;
-            }
-            // Legacy: older saves persisted the variant separately. Honour
-            // it only if it disagrees with the newly-loaded Design (which
-            // defaults to G474R via serde when absent). Keeps an older
-            // non-G474R session restorable through the bump.
-            if let Some(v) = eframe::get_value::<ChipVariant>(storage, "peri_planner_variant_v1") {
-                if slf.design.variant != v {
-                    slf.design.set_variant(v);
-                }
-            }
-            slf.variant = slf.design.variant;
+            // The view (ephemeral, global) restores regardless of project source.
             if let Some(v) = eframe::get_value::<ViewMode>(storage, "peri_planner_view_v1") {
                 slf.view = v;
             }
-            if let Some(m) = eframe::get_value::<Mcu>(storage, "peri_planner_mcu_v1") {
-                slf.mcu = m;
-            }
-            // Per-MCU H523-family designs, persisted as a Vec of (mcu, design)
-            // pairs (sidesteps enum-keyed-map serialization). Save-compat with
-            // the old single-design key isn't required, so it's simply dropped.
-            if let Some(v) = eframe::get_value::<Vec<(Mcu, H523Design)>>(
-                storage,
-                "peri_planner_h523_designs_v1",
-            ) {
-                slf.h523_designs = v.into_iter().collect();
-            }
-            if let Some(d) = eframe::get_value::<C531Design>(storage, "peri_planner_c531_design_v1") {
-                slf.c531_design = d;
-            }
-            if let Some(p) = eframe::get_value::<Package>(storage, "peri_planner_package_v1") {
-                slf.package = p;
+            if let Some(p) = eframe::get_value::<Persisted>(storage, PROJECTS_KEY) {
+                // Multi-project blob (post-spine). The source of truth.
+                slf.active = p.active;
+                slf.others = p.others;
             } else {
-                // First load after schema bump — derive package from the
-                // legacy G474-only ChipVariant.
-                slf.package = Package::from_g474_variant(slf.variant);
+                // No project blob yet: seed the single active project from the
+                // pre-spine per-key save so the user's current design survives
+                // the bump (read once; from now on the project blob is written).
+                Self::seed_active_from_legacy_keys(storage, &mut slf.active);
             }
             // Keep mcu / package consistent if storage drifted.
-            if slf.package.mcu() != slf.mcu {
-                slf.package = slf.mcu.default_package();
+            if slf.active.package.mcu() != slf.active.mcu {
+                slf.active.package = slf.active.mcu.default_package();
             }
         }
         slf
     }
 
+    /// One-time read of the pre-spine per-key save into `proj` (no project blob
+    /// existed). Not a compat shim — these keys are read once and then only the
+    /// project blob is ever written.
+    fn seed_active_from_legacy_keys(storage: &dyn eframe::Storage, proj: &mut Project) {
+        if let Some(design) = eframe::get_value::<Design>(storage, STORAGE_KEY) {
+            proj.design = design;
+        }
+        if let Some(v) = eframe::get_value::<ChipVariant>(storage, "peri_planner_variant_v1") {
+            if proj.design.variant != v {
+                proj.design.set_variant(v);
+            }
+        }
+        proj.variant = proj.design.variant;
+        if let Some(m) = eframe::get_value::<Mcu>(storage, "peri_planner_mcu_v1") {
+            proj.mcu = m;
+        }
+        if let Some(v) =
+            eframe::get_value::<Vec<(Mcu, H523Design)>>(storage, "peri_planner_h523_designs_v1")
+        {
+            proj.h523_designs = v.into_iter().collect();
+        }
+        if let Some(d) = eframe::get_value::<C531Design>(storage, "peri_planner_c531_design_v1") {
+            proj.c531_design = d;
+        }
+        if let Some(p) = eframe::get_value::<Package>(storage, "peri_planner_package_v1") {
+            proj.package = p;
+        } else {
+            proj.package = Package::from_g474_variant(proj.variant);
+        }
+    }
+
     /// The active H523-family design (H523 / C5A3 each keep their own), or an
     /// empty borrow when none has been touched yet. Reads only — mutators use
-    /// `h523_designs.entry(self.mcu).or_default()`.
+    /// `h523_designs.entry(self.active.mcu).or_default()`.
     fn h523<'a>(&'a self, empty: &'a H523Design) -> &'a H523Design {
-        self.h523_designs.get(&self.mcu).unwrap_or(empty)
+        self.active.h523_designs.get(&self.active.mcu).unwrap_or(empty)
     }
 
     /// Switch the active MCU, clearing undo/redo history. Each MCU has its own
@@ -186,21 +225,76 @@ impl PeriPlannerApp {
     /// live view — that invariant is what makes per-MCU undo coherent. No-op if
     /// already active. A package switch within an MCU keeps history (same design).
     fn set_active_mcu(&mut self, m: Mcu) {
-        if m != self.mcu {
+        if m != self.active.mcu {
             self.history.clear();
             self.redo.clear();
-            self.mcu = m;
+            self.active.mcu = m;
+        }
+    }
+
+    /// Switch the active project to `others[i]`, swapping the current active back
+    /// into `others` (so order stays stable). Undo history is per-project, so it
+    /// clears — a snapshot of one project must never restore into another's.
+    fn switch_project(&mut self, i: usize) {
+        if i < self.others.len() {
+            std::mem::swap(&mut self.active, &mut self.others[i]);
+            self.history.clear();
+            self.redo.clear();
+            self.asset_part = None;
+            self.land_on_active_view();
+        }
+    }
+
+    /// Create a fresh project and make it active (the old active joins `others`).
+    fn new_project(&mut self) {
+        let mut np = Project::new(format!("Untitled {}", self.others.len() + 2));
+        std::mem::swap(&mut self.active, &mut np);
+        self.others.push(np);
+        self.history.clear();
+        self.redo.clear();
+        self.asset_part = None;
+        self.land_on_active_view();
+    }
+
+    /// Delete the active project, promoting the first of `others` to active.
+    /// No-op when it's the only project (the Delete button is also disabled then).
+    fn delete_active(&mut self) {
+        if !self.others.is_empty() {
+            self.active = self.others.remove(0);
+            self.history.clear();
+            self.redo.clear();
+            self.asset_part = None;
+            self.land_on_active_view();
+        }
+    }
+
+    /// Keep the (global) view coherent with the active project's chip: a
+    /// family-specific tab (G474 Fabric/HRTIM…, C531 Converter, H5/C5 Peripherals)
+    /// from a previous project would render blank on a different family, so fall
+    /// back to that family's landing view. Shared tabs (Inventory/Pin-AF/finders)
+    /// are kept so cross-project comparison isn't interrupted.
+    fn land_on_active_view(&mut self) {
+        let shared = matches!(
+            self.view,
+            ViewMode::Inventory | ViewMode::AfTable | ViewMode::Catalog | ViewMode::Dropin
+        );
+        if !shared {
+            self.view = match self.active.mcu {
+                Mcu::G474 => ViewMode::Fabric,
+                Mcu::C531 => ViewMode::Converter,
+                Mcu::H523 | Mcu::C5A3 => ViewMode::Peripherals,
+            };
         }
     }
 
     /// Snapshot whichever model is active.
     fn snapshot_active(&self) -> DesignSnapshot {
-        match self.mcu {
-            Mcu::G474 => DesignSnapshot::G474(self.design.clone()),
+        match self.active.mcu {
+            Mcu::G474 => DesignSnapshot::G474(self.active.design.clone()),
             Mcu::H523 | Mcu::C5A3 => {
-                DesignSnapshot::H523(self.h523_designs.get(&self.mcu).cloned().unwrap_or_default())
+                DesignSnapshot::H523(self.active.h523_designs.get(&self.active.mcu).cloned().unwrap_or_default())
             }
-            Mcu::C531 => DesignSnapshot::C531(self.c531_design.clone()),
+            Mcu::C531 => DesignSnapshot::C531(self.active.c531_design.clone()),
         }
     }
 
@@ -209,11 +303,11 @@ impl PeriPlannerApp {
     /// captured under — the H523 design lands back in the correct per-MCU slot.
     fn restore_snapshot(&mut self, snap: DesignSnapshot) {
         match snap {
-            DesignSnapshot::G474(d) => self.design = d,
+            DesignSnapshot::G474(d) => self.active.design = d,
             DesignSnapshot::H523(d) => {
-                self.h523_designs.insert(self.mcu, d);
+                self.active.h523_designs.insert(self.active.mcu, d);
             }
-            DesignSnapshot::C531(d) => self.c531_design = d,
+            DesignSnapshot::C531(d) => self.active.c531_design = d,
         }
     }
 
@@ -225,7 +319,7 @@ impl PeriPlannerApp {
                 let empty = H523Design::new();
                 !self.h523(&empty).eq_ignoring_notes(b)
             }
-            DesignSnapshot::C531(b) => self.c531_design != *b,
+            DesignSnapshot::C531(b) => self.active.c531_design != *b,
             DesignSnapshot::G474(_) => false,
         }
     }
@@ -243,9 +337,9 @@ impl PeriPlannerApp {
 
     /// Wrap a G474 mutation so it records a history entry iff state changed.
     fn mutate(&mut self, f: impl FnOnce(&mut Design)) {
-        let before = self.design.clone();
-        f(&mut self.design);
-        if self.design != before {
+        let before = self.active.design.clone();
+        f(&mut self.active.design);
+        if self.active.design != before {
             self.push_history(DesignSnapshot::G474(before));
         }
     }
@@ -277,16 +371,16 @@ impl PeriPlannerApp {
             let e = c.entry(k).or_insert(0);
             *e = e.saturating_add(n);
         };
-        match self.mcu {
+        match self.active.mcu {
             Mcu::G474 => {
-                for spec in &self.design.requirements {
+                for spec in &self.active.design.requirements {
                     for k in spec.demand_kinds() {
                         bump(k, 1);
                     }
                 }
             }
             Mcu::C531 => {
-                for leg in &self.c531_design.legs {
+                for leg in &self.active.c531_design.legs {
                     if leg.complementary {
                         bump("COMP_PWM", (leg.channels_mask.count_ones() as u8).max(1));
                     }
@@ -334,12 +428,12 @@ impl PeriPlannerApp {
         let demands: Vec<crate::select::DemandInput> =
             self.catalog_demands.iter().filter(|d| d.count > 0).cloned().collect();
         let have = self.design_demand_counts();
-        match self.mcu {
+        match self.active.mcu {
             Mcu::G474 => self.mutate(|d| seed_g474_into(d, &demands, &have)),
-            Mcu::C531 => seed_c531_into(&mut self.c531_design, &demands, &have),
+            Mcu::C531 => seed_c531_into(&mut self.active.c531_design, &demands, &have),
             Mcu::H523 | Mcu::C5A3 => {
-                let raw = self.package.descriptor().raw;
-                let d = self.h523_designs.entry(self.mcu).or_default();
+                let raw = self.active.package.descriptor().raw;
+                let d = self.active.h523_designs.entry(self.active.mcu).or_default();
                 seed_h523_into(d, raw, &demands, &have);
             }
         }
@@ -364,18 +458,19 @@ impl PeriPlannerApp {
                     );
                     return;
                 }
-                ui.label(egui::RichText::new(self.package.chip_prefix()).strong());
-                ui.label(self.package.package_label());
+                ui.label(egui::RichText::new(self.active.package.chip_prefix()).strong());
+                ui.label(self.active.package.package_label());
                 ui.separator();
-                match self.mcu {
+                match self.active.mcu {
                     Mcu::G474 => {
-                        let reqs = self.design.requirements.len();
+                        let reqs = self.active.design.requirements.len();
                         let assigned =
-                            self.design.assignments.iter().filter(|a| a.is_some()).count();
-                        let pins = self.design.pin_assignments.len();
+                            self.active.design.assignments.iter().filter(|a| a.is_some()).count();
+                        let pins = self.active.design.pin_assignments.len();
                         ui.label(format!("{reqs} reqs · {assigned} assigned · {pins} pins locked"));
                         ui.separator();
                         let warns = self
+                            .active
                             .design
                             .warnings()
                             .into_iter()
@@ -388,8 +483,8 @@ impl PeriPlannerApp {
                         }
                     }
                     Mcu::C531 => {
-                        let problems = self.c531_design.validate(self.package);
-                        ui.label(format!("{} legs", self.c531_design.legs.len()));
+                        let problems = self.active.c531_design.validate(self.active.package);
+                        ui.label(format!("{} legs", self.active.c531_design.legs.len()));
                         ui.separator();
                         if problems.is_empty() {
                             ui.colored_label(GREEN, "✓ realizable");
@@ -402,7 +497,7 @@ impl PeriPlannerApp {
                         let d = self.h523(&empty);
                         let uses = d.uses.len();
                         let locks = d.pin_locks.len();
-                        let problems = d.validate(self.package.descriptor().raw);
+                        let problems = d.validate(self.active.package.descriptor().raw);
                         ui.label(format!("{uses} peripherals · {locks} pins locked"));
                         ui.separator();
                         if problems.is_empty() {
@@ -427,6 +522,58 @@ impl PeriPlannerApp {
         let browse_name: Option<&'static str> = self.asset_part.map(|d| d.name);
         let browsing = browse_name.is_some();
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
+            // Named-project switcher — the savable design envelope. Hidden while
+            // browsing a read-only asset part (which isn't a project).
+            if !browsing {
+                let mut switch_to: Option<usize> = None;
+                let mut do_new = false;
+                let mut do_delete = false;
+                ui.horizontal(|ui| {
+                    ui.label("Project:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.active.name)
+                            .desired_width(150.0)
+                            .hint_text("name this design"),
+                    );
+                    if !self.others.is_empty() {
+                        egui::ComboBox::from_id_salt("project_switch")
+                            .selected_text("Switch ▾")
+                            .show_ui(ui, |ui| {
+                                for (i, p) in self.others.iter().enumerate() {
+                                    if ui.button(&p.name).clicked() {
+                                        switch_to = Some(i);
+                                        ui.close();
+                                    }
+                                }
+                            });
+                    }
+                    if ui.button("＋ New").on_hover_text("start a new empty design").clicked() {
+                        do_new = true;
+                    }
+                    if ui
+                        .add_enabled(!self.others.is_empty(), egui::Button::new("🗑 Delete"))
+                        .on_hover_text("delete the active project")
+                        .clicked()
+                    {
+                        do_delete = true;
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("({} total)", self.others.len() + 1))
+                            .weak()
+                            .small(),
+                    );
+                });
+                if let Some(i) = switch_to {
+                    self.switch_project(i);
+                }
+                if do_new {
+                    self.new_project();
+                }
+                if do_delete {
+                    self.delete_active();
+                }
+                ui.separator();
+            }
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Peripheral planner").strong());
                 ui.separator();
@@ -447,7 +594,7 @@ impl PeriPlannerApp {
                     ui.label("MCU:");
                     let mut pending_mcu: Option<Mcu> = None;
                     egui::ComboBox::from_id_salt("mcu")
-                        .selected_text(self.mcu.label())
+                        .selected_text(self.active.mcu.label())
                         .show_ui(ui, |ui| {
                             for &m in Mcu::ALL {
                                 let label = if m.is_implemented() {
@@ -455,7 +602,7 @@ impl PeriPlannerApp {
                                 } else {
                                     format!("{} (preview)", m.label())
                                 };
-                                if ui.selectable_label(m == self.mcu, label).clicked() {
+                                if ui.selectable_label(m == self.active.mcu, label).clicked() {
                                     pending_mcu = Some(m);
                                 }
                             }
@@ -466,11 +613,11 @@ impl PeriPlannerApp {
                         // restore into a different MCU's live view).
                         self.set_active_mcu(m);
                         // Reset package to the new MCU's default; keeps
-                        // self.variant stale on H523 (only consumed by G474
+                        // self.active.variant stale on H523 (only consumed by G474
                         // legacy code, which doesn't render on H523).
-                        self.package = m.default_package();
-                        if let Some(v) = self.package.to_g474_variant() {
-                            self.variant = v;
+                        self.active.package = m.default_package();
+                        if let Some(v) = self.active.package.to_g474_variant() {
+                            self.active.variant = v;
                             self.mutate(|d| d.set_variant(v));
                         }
                         if m == Mcu::C531 {
@@ -495,11 +642,11 @@ impl PeriPlannerApp {
                     ui.label("Package:");
                     let mut pending_package: Option<Package> = None;
                     egui::ComboBox::from_id_salt("package")
-                        .selected_text(self.package.display_label())
+                        .selected_text(self.active.package.display_label())
                         .show_ui(ui, |ui| {
-                            for p in self.mcu.packages() {
+                            for p in self.active.mcu.packages() {
                                 if ui
-                                    .selectable_label(p == self.package, p.display_label())
+                                    .selectable_label(p == self.active.package, p.display_label())
                                     .clicked()
                                 {
                                     pending_package = Some(p);
@@ -507,9 +654,9 @@ impl PeriPlannerApp {
                             }
                         });
                     if let Some(p) = pending_package {
-                        self.package = p;
+                        self.active.package = p;
                         if let Some(v) = p.to_g474_variant() {
-                            self.variant = v;
+                            self.active.variant = v;
                             self.mutate(|d| d.set_variant(v));
                         }
                     }
@@ -526,7 +673,7 @@ impl PeriPlannerApp {
                 // Planner tabs are MCU-specific and editing-only — hidden while
                 // browsing a read-only asset part.
                 if !browsing {
-                    if self.mcu == Mcu::G474 {
+                    if self.active.mcu == Mcu::G474 {
                         ui.selectable_value(&mut self.view, ViewMode::Fabric, "Power fabric");
                         ui.selectable_value(&mut self.view, ViewMode::Hrtim, "HRTIM");
                         ui.selectable_value(&mut self.view, ViewMode::Comms, "Comms");
@@ -534,10 +681,10 @@ impl PeriPlannerApp {
                         ui.selectable_value(&mut self.view, ViewMode::Waveforms, "Waveforms");
                         ui.selectable_value(&mut self.view, ViewMode::Package, "Package");
                     }
-                    if self.mcu == Mcu::C531 {
+                    if self.active.mcu == Mcu::C531 {
                         ui.selectable_value(&mut self.view, ViewMode::Converter, "Converter");
                     }
-                    if self.mcu == Mcu::H523 || self.mcu == Mcu::C5A3 {
+                    if self.active.mcu == Mcu::H523 || self.active.mcu == Mcu::C5A3 {
                         ui.selectable_value(&mut self.view, ViewMode::Peripherals, "Peripherals");
                     }
                 }
@@ -550,12 +697,12 @@ impl PeriPlannerApp {
                     ui.separator();
                     if ui.button("Export").clicked() {
                         // Family-correct: each MCU exports ITS model, not always G474.
-                        let text = match self.mcu {
-                            Mcu::G474 => self.design.export_summary(),
-                            Mcu::C531 => self.c531_design.export_summary(self.package.name()),
+                        let text = match self.active.mcu {
+                            Mcu::G474 => self.active.design.export_summary(),
+                            Mcu::C531 => self.active.c531_design.export_summary(self.active.package.name()),
                             Mcu::H523 | Mcu::C5A3 => {
                                 let empty = H523Design::new();
-                                self.h523(&empty).export_summary(self.package.name())
+                                self.h523(&empty).export_summary(self.active.package.name())
                             }
                         };
                         ui.ctx().copy_text(text);
@@ -617,9 +764,9 @@ impl PeriPlannerApp {
                 match self.picked {
                     None => {
                         // Try to identify a role from the signal on this pin.
-                        let pin_signals = picker::current_pin_signals(&self.design, self.variant);
+                        let pin_signals = picker::current_pin_signals(&self.active.design, self.active.variant);
                         if let Some(sig) = pin_signals.get(&pin).copied() {
-                            self.picked = picker::role_for_pin(pin, sig, self.variant, &self.design);
+                            self.picked = picker::role_for_pin(pin, sig, self.active.variant, &self.active.design);
                         }
                     }
                     Some(role) => {
@@ -628,8 +775,8 @@ impl PeriPlannerApp {
                             self.picked = None;
                             return;
                         }
-                        if let Some(mv) = picker::resolve_move(&self.design, self.variant, role, pin) {
-                            let variant = self.variant;
+                        if let Some(mv) = picker::resolve_move(&self.active.design, self.active.variant, role, pin) {
+                            let variant = self.active.variant;
                             self.mutate(|d| picker::apply_move(d, variant, mv));
                         }
                         self.picked = None;
@@ -653,6 +800,7 @@ impl PeriPlannerApp {
                 // Default a new leg to the first advanced-control timer on the
                 // chip (TIM1 on C531) so OCP routing is available out of the box.
                 let default_tim = self
+                    .active
                     .package
                     .descriptor()
                     .timers
@@ -660,11 +808,11 @@ impl PeriPlannerApp {
                     .filter(|t| t.kind == crate::mcu::TimerKind::Advanced)
                     .find_map(|t| TimId::ALL.iter().copied().find(|id| id.number() == t.number))
                     .unwrap_or(TimId::Tim1);
-                self.c531_design.add_leg(ConverterLeg::pwm(default_tim));
+                self.active.c531_design.add_leg(ConverterLeg::pwm(default_tim));
             }
-            ConverterAction::RemoveLeg(i) => self.c531_design.remove_leg(i),
+            ConverterAction::RemoveLeg(i) => self.active.c531_design.remove_leg(i),
             ConverterAction::SetLeg(i, leg) => {
-                if let Some(slot) = self.c531_design.legs.get_mut(i) {
+                if let Some(slot) = self.active.c531_design.legs.get_mut(i) {
                     *slot = leg;
                 }
             }
@@ -674,15 +822,14 @@ impl PeriPlannerApp {
 
 impl eframe::App for PeriPlannerApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, STORAGE_KEY, &self.design);
-        eframe::set_value(storage, "peri_planner_variant_v1", &self.variant);
+        // One blob for all projects (RON handles the enum-keyed h523 map).
+        let blob = Persisted {
+            active: self.active.clone(),
+            others: self.others.clone(),
+        };
+        eframe::set_value(storage, PROJECTS_KEY, &blob);
+        // The view is ephemeral/global (shared across projects), kept separate.
         eframe::set_value(storage, "peri_planner_view_v1", &self.view);
-        eframe::set_value(storage, "peri_planner_mcu_v1", &self.mcu);
-        eframe::set_value(storage, "peri_planner_package_v1", &self.package);
-        let h523_designs: Vec<(Mcu, H523Design)> =
-            self.h523_designs.iter().map(|(m, d)| (*m, d.clone())).collect();
-        eframe::set_value(storage, "peri_planner_h523_designs_v1", &h523_designs);
-        eframe::set_value(storage, "peri_planner_c531_design_v1", &self.c531_design);
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
@@ -694,9 +841,9 @@ impl eframe::App for PeriPlannerApp {
                 // Opening a part can switch the active MCU — clear undo history
                 // just like the MCU combo does (each MCU has its own design).
                 self.set_active_mcu(pkg.mcu());
-                self.package = pkg;
+                self.active.package = pkg;
                 if let Some(v) = pkg.to_g474_variant() {
-                    self.variant = v;
+                    self.active.variant = v;
                 }
                 self.asset_part = None;
                 self.view = ViewMode::Inventory;
@@ -746,28 +893,28 @@ impl eframe::App for PeriPlannerApp {
         let can_undo = !self.history.is_empty();
         let can_redo = !self.redo.is_empty();
 
-        if self.mcu != Mcu::G474 {
+        if self.active.mcu != Mcu::G474 {
             // Bracket the whole non-G474 frame to record edits (a Seed in the top
             // bar, or a view action) as ONE undo step. These models don't go
             // through `mutate`; the deferred-action views apply ≤1 edit per frame.
-            let mcu_before = self.mcu;
+            let mcu_before = self.active.mcu;
             let before = self.snapshot_active();
             self.render_top_bar(ctx, can_undo, can_redo);
             self.render_status_line(ctx);
-            let descriptor = self.package.descriptor();
-            let package = self.package;
+            let descriptor = self.active.package.descriptor();
+            let package = self.active.package;
             let view = self.view;
             let af_filter = &mut self.af_filter;
             // Active H523-family design, created on first touch for this MCU.
             // (`render_top_bar` above may have switched MCU this frame; this binds
             // to the now-active one — the post-render diff is skipped on a switch.)
-            let h523 = self.h523_designs.entry(self.mcu).or_default();
-            let c531 = &self.c531_design;
+            let h523 = self.active.h523_designs.entry(self.active.mcu).or_default();
+            let c531 = &self.active.c531_design;
             let catalog_query = &mut self.catalog_query;
             let catalog_demands = &mut self.catalog_demands;
             let catalog_cache = &mut self.catalog_eval_cache;
             let catalog_sort = &mut self.catalog_sort;
-            let mcu = self.mcu;
+            let mcu = self.active.mcu;
             let dropin_query = &mut self.dropin_query;
             let dropin_cache = &mut self.dropin_cache;
             let dropin_focus = &mut self.dropin_focus;
@@ -808,34 +955,35 @@ impl eframe::App for PeriPlannerApp {
             self.apply_converter_action(conv_action);
             // Record the frame's edit unless the frame switched MCU (history was
             // cleared) or only a note changed.
-            if self.mcu == mcu_before && self.non_g474_changed(&before) {
+            if self.active.mcu == mcu_before && self.non_g474_changed(&before) {
                 self.push_history(before);
             }
             return;
         }
 
-        self.design.normalize();
+        self.active.design.normalize();
 
-        let phases = self.design.phases();
-        let external_eevs = self.design.external_eevs();
-        let fault = self.design.first_fault();
-        let drive_dac = self.design.first_drive_dac();
-        let plan = self.design.master_triggered_sequencer();
-        let phase_timers = self.design.phase_timers_and_dem();
-        let phase_edges = self.design.phase_edges();
-        let phase_dac_timers = self.design.phase_dac_timers();
-        let non_pcm_hrtim = self.design.non_pcm_hrtim_uses();
-        let phase_shift_links = self.design.phase_shift_links();
+        let phases = self.active.design.phases();
+        let external_eevs = self.active.design.external_eevs();
+        let fault = self.active.design.first_fault();
+        let drive_dac = self.active.design.first_drive_dac();
+        let plan = self.active.design.master_triggered_sequencer();
+        let phase_timers = self.active.design.phase_timers_and_dem();
+        let phase_edges = self.active.design.phase_edges();
+        let phase_dac_timers = self.active.design.phase_dac_timers();
+        let non_pcm_hrtim = self.active.design.non_pcm_hrtim_uses();
+        let phase_shift_links = self.active.design.phase_shift_links();
         let adc_sequencers: Vec<fabric_view::AdcSequencerView> =
-            build_adc_sequencer_views(&self.design);
+            build_adc_sequencer_views(&self.active.design);
         let used_timers: Vec<HrtimId> = phase_timers.iter().map(|(t, _)| *t).collect();
         let all_used: std::collections::HashSet<Resource> = self
+            .active
             .design
             .assignments
             .iter()
             .flatten()
             .flat_map(|a| a.consumed())
-            .chain(self.design.locks.iter().copied())
+            .chain(self.active.design.locks.iter().copied())
             .collect();
 
         egui::SidePanel::right("resources")
@@ -847,8 +995,8 @@ impl eframe::App for PeriPlannerApp {
 
                 ui.label(format!(
                     "Requirements: {}   Assigned: {}",
-                    self.design.requirements.len(),
-                    self.design.assignments.iter().flatten().count()
+                    self.active.design.requirements.len(),
+                    self.active.design.assignments.iter().flatten().count()
                 ));
 
                 ui.separator();
@@ -860,7 +1008,7 @@ impl eframe::App for PeriPlannerApp {
 
                 ui.separator();
                 ui.label("ADC sequencers (claimed):");
-                let seqs: Vec<_> = self.design.assignments.iter().flatten().filter_map(|a| match a {
+                let seqs: Vec<_> = self.active.design.assignments.iter().flatten().filter_map(|a| match a {
                     Assignment::AdcSequencer { adc, kind, trigger, .. } => Some((*adc, *kind, *trigger)),
                     _ => None,
                 }).collect();
@@ -875,7 +1023,7 @@ impl eframe::App for PeriPlannerApp {
                 ui.separator();
                 ui.label("Capability checks:");
                 let mut fix_to_apply: Option<Fix> = None;
-                for c in self.design.warnings() {
+                for c in self.active.design.warnings() {
                     let (color, glyph) = match c.severity {
                         Severity::Ok => (egui::Color32::from_rgb(100, 200, 120), "OK  "),
                         Severity::Info => (egui::Color32::from_rgb(120, 170, 220), "INFO"),
@@ -900,23 +1048,23 @@ impl eframe::App for PeriPlannerApp {
                 let mut pending_clear_all_pins = false;
                 ui.horizontal(|ui| {
                     ui.label("Pin map:");
-                    if self.design.has_pins()
+                    if self.active.design.has_pins()
                         && ui.small_button("Clear pin locks").clicked()
                     {
                         pending_clear_all_pins = true;
                     }
                 });
-                let signals = self.design.used_signals();
+                let signals = self.active.design.used_signals();
                 if signals.is_empty() {
                     ui.label("  (no pin-mappable signals yet)");
                 } else {
-                    let unreachable = pinout::unreachable_signals(&signals, self.variant);
+                    let unreachable = pinout::unreachable_signals(&signals, self.active.variant);
                     for (idx, s) in signals.iter().enumerate() {
-                        let cands = self.design.pin_candidates(*s, self.variant);
-                        let locked = self.design.is_pinned(*s);
+                        let cands = self.active.design.pin_candidates(*s, self.active.variant);
+                        let locked = self.active.design.is_pinned(*s);
                         ui.horizontal(|ui| {
                             ui.label(format!("  {:<14} ->", s.name()));
-                            let all_cands = pinout::pins_for(*s, self.variant);
+                            let all_cands = pinout::pins_for(*s, self.active.variant);
                             if all_cands.is_empty() {
                                 ui.colored_label(
                                     egui::Color32::from_rgb(220, 100, 100),
@@ -925,7 +1073,7 @@ impl eframe::App for PeriPlannerApp {
                             } else if all_cands.len() == 1 {
                                 ui.label(all_cands[0].name());
                             } else {
-                                let current = self.design.pinned(*s);
+                                let current = self.active.design.pinned(*s);
                                 let label = current
                                     .map(|p| p.name())
                                     .unwrap_or_else(|| format!("{} options", cands.len()));
@@ -974,7 +1122,7 @@ impl eframe::App for PeriPlannerApp {
                         });
                     }
                     let conflicts =
-                        pinout::conflicting_signal_pairs(&signals, self.variant);
+                        pinout::conflicting_signal_pairs(&signals, self.active.variant);
                     if !conflicts.is_empty() {
                         ui.label(
                             egui::RichText::new("  Pin-contention candidates:")
@@ -995,7 +1143,7 @@ impl eframe::App for PeriPlannerApp {
                             format!(
                                 "  {} signal(s) have no pin on {} -- incompatible chip.",
                                 unreachable.len(),
-                                self.variant.display_label()
+                                self.active.variant.display_label()
                             ),
                         );
                     }
@@ -1082,14 +1230,14 @@ impl eframe::App for PeriPlannerApp {
             });
             ui.horizontal_wrapped(|ui| {
                 ui.label("Locks:");
-                if self.design.locks.is_empty() {
+                if self.active.design.locks.is_empty() {
                     ui.label(
                         egui::RichText::new("(none)")
                             .weak()
                             .italics(),
                     );
                 }
-                let locks_snapshot: Vec<Resource> = self.design.locks.iter().copied().collect();
+                let locks_snapshot: Vec<Resource> = self.active.design.locks.iter().copied().collect();
                 for r in &locks_snapshot {
                     if ui.small_button(format!("{} x", resource_label(*r))).clicked() {
                         self.mutate(|d| d.clear_lock(*r));
@@ -1100,7 +1248,7 @@ impl eframe::App for PeriPlannerApp {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
-                    let n = self.design.requirements.len();
+                    let n = self.active.design.requirements.len();
                     let mid = n.div_ceil(2);
                     let render_row = |ui: &mut egui::Ui,
                                       i: usize,
@@ -1374,14 +1522,14 @@ impl eframe::App for PeriPlannerApp {
                         for i in 0..mid {
                             render_row(
                                 &mut cols[0], i,
-                                &self.design,
+                                &self.active.design,
                                 &mut to_remove, &mut to_set_spec, &mut to_set_assignment,
                             );
                         }
                         for i in mid..n {
                             render_row(
                                 &mut cols[1], i,
-                                &self.design,
+                                &self.active.design,
                                 &mut to_remove, &mut to_set_spec, &mut to_set_assignment,
                             );
                         }
@@ -1425,14 +1573,14 @@ impl eframe::App for PeriPlannerApp {
                             non_pcm_hrtim: &non_pcm_hrtim,
                             phase_shift_links: &phase_shift_links,
                         },
-                        &self.design.locks,
+                        &self.active.design.locks,
                     );
                     if let Some(r) = click {
                         self.mutate(|d| d.toggle_lock(r));
                     }
                 }
                 ViewMode::Hrtim => {
-                    let action = crate::hrtim_view::show(ui, &self.design);
+                    let action = crate::hrtim_view::show(ui, &self.active.design);
                     if let Some(a) = action {
                         use crate::hrtim_view::HrtimAction;
                         match a {
@@ -1464,7 +1612,7 @@ impl eframe::App for PeriPlannerApp {
                     }
                 }
                 ViewMode::Comms => {
-                    let action = crate::comms_view::show(ui, &self.design, self.variant);
+                    let action = crate::comms_view::show(ui, &self.active.design, self.active.variant);
                     if let Some(a) = action {
                         use crate::comms_view::CommsAction;
                         match a {
@@ -1476,7 +1624,7 @@ impl eframe::App for PeriPlannerApp {
                     }
                 }
                 ViewMode::Timers => {
-                    let action = crate::timers_view::show(ui, &self.design, self.variant);
+                    let action = crate::timers_view::show(ui, &self.active.design, self.active.variant);
                     if let Some(a) = action {
                         use crate::timers_view::TimersAction;
                         match a {
@@ -1488,14 +1636,14 @@ impl eframe::App for PeriPlannerApp {
                     }
                 }
                 ViewMode::Waveforms => {
-                    crate::waveform_view::show(ui, &self.design.assignments);
+                    crate::waveform_view::show(ui, &self.active.design.assignments);
                 }
                 ViewMode::Package => {
                     // Header + legend.
                     if let Some(role) = self.picked {
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new(format!("Moving: {}", role.description(&self.design)))
+                                egui::RichText::new(format!("Moving: {}", role.description(&self.active.design)))
                                     .color(egui::Color32::from_rgb(220, 170, 60))
                                     .strong(),
                             );
@@ -1513,13 +1661,13 @@ impl eframe::App for PeriPlannerApp {
                         );
                     }
                     let paints = crate::picker::build_pin_paints(
-                        &self.design, self.variant, self.picked,
+                        &self.active.design, self.active.variant, self.picked,
                     );
-                    let action = crate::package_view::show(ui, self.variant, &paints);
+                    let action = crate::package_view::show(ui, self.active.variant, &paints);
                     self.handle_package_action(action);
                 }
                 ViewMode::Inventory => {
-                    crate::inventory_view::show(ui, self.package.descriptor());
+                    crate::inventory_view::show(ui, self.active.package.descriptor());
                 }
                 ViewMode::Catalog => {
                     self.pending_open = crate::catalog_view::show(
@@ -1533,8 +1681,8 @@ impl eframe::App for PeriPlannerApp {
                 ViewMode::Dropin => {
                     self.pending_open = crate::dropin_view::show(
                         ui,
-                        self.package,
-                        crate::dropin::DesignSource::G474(&self.design),
+                        self.active.package,
+                        crate::dropin::DesignSource::G474(&self.active.design),
                         &mut self.dropin_query,
                         &mut self.dropin_cache,
                         &mut self.dropin_focus,
@@ -1544,7 +1692,7 @@ impl eframe::App for PeriPlannerApp {
                     // G474 path doesn't expose the lock UI yet — pin
                     // locking flows through the existing pin_assignments
                     // map on `Design`. Pass None.
-                    crate::af_view::show(ui, self.package.descriptor().raw, &mut self.af_filter, None);
+                    crate::af_view::show(ui, self.active.package.descriptor().raw, &mut self.af_filter, None);
                 }
                 // Non-G474 views; never selectable while the G474 planner is active.
                 ViewMode::Converter | ViewMode::Peripherals => {}
@@ -1844,7 +1992,7 @@ fn resource_label(r: Resource) -> String {
 impl PeriPlannerApp {
     fn design_used(&self) -> Vec<(&'static str, Vec<String>)> {
         let mut by_kind = BTreeMap::<&'static str, Vec<String>>::new();
-        for a in self.design.assignments.iter().flatten() {
+        for a in self.active.design.assignments.iter().flatten() {
             for r in a.consumed() {
                 let (k, v) = match r {
                     Resource::Dac(d) => ("DAC", format!("{:?}", d)),
@@ -1970,16 +2118,16 @@ mod seed_tests {
 
         // Declaring on H523 must NOT appear on C5A3 (no shared field anymore).
         app.set_active_mcu(Mcu::H523);
-        app.h523_designs.entry(Mcu::H523).or_default().add_use("USART1", &["TX"]);
+        app.active.h523_designs.entry(Mcu::H523).or_default().add_use("USART1", &["TX"]);
         app.set_active_mcu(Mcu::C5A3);
         assert!(app.h523(&empty).uses.is_empty(), "C5A3 must not see H523's use");
-        app.h523_designs.entry(Mcu::C5A3).or_default().add_use("LPUART1", &["TX"]);
+        app.active.h523_designs.entry(Mcu::C5A3).or_default().add_use("LPUART1", &["TX"]);
 
         // Back on H523, its own use is intact (and distinct from C5A3's).
         app.set_active_mcu(Mcu::H523);
         assert_eq!(app.h523(&empty).uses.len(), 1);
         assert_eq!(app.h523(&empty).uses[0].peripheral, "USART1");
-        assert_eq!(app.h523_designs[&Mcu::C5A3].uses[0].peripheral, "LPUART1");
+        assert_eq!(app.active.h523_designs[&Mcu::C5A3].uses[0].peripheral, "LPUART1");
 
         // Switching MCUs clears undo history (a snapshot of one MCU must never
         // restore into another's live view) — including H523<->C5A3.
@@ -1997,10 +2145,63 @@ mod seed_tests {
         // invariant guarantees active MCU == capture MCU).
         app.set_active_mcu(Mcu::H523);
         let snap = app.snapshot_active(); // H523 with just USART1
-        app.h523_designs.get_mut(&Mcu::H523).unwrap().add_use("SPI1", &["SCK"]);
-        assert_eq!(app.h523_designs[&Mcu::H523].uses.len(), 2);
+        app.active.h523_designs.get_mut(&Mcu::H523).unwrap().add_use("SPI1", &["SCK"]);
+        assert_eq!(app.active.h523_designs[&Mcu::H523].uses.len(), 2);
         app.restore_snapshot(snap);
-        assert_eq!(app.h523_designs[&Mcu::H523].uses.len(), 1, "restore reverts H523 slot");
-        assert_eq!(app.h523_designs[&Mcu::H523].uses[0].peripheral, "USART1");
+        assert_eq!(app.active.h523_designs[&Mcu::H523].uses.len(), 1, "restore reverts H523 slot");
+        assert_eq!(app.active.h523_designs[&Mcu::H523].uses[0].peripheral, "USART1");
+    }
+
+    #[test]
+    fn projects_are_independent_and_switch_clears_undo() {
+        let mut app = PeriPlannerApp::default(); // one project "Untitled" (G474)
+        assert!(app.others.is_empty());
+
+        // Edit the active project's design state.
+        app.set_active_mcu(Mcu::H523);
+        app.active.h523_designs.entry(Mcu::H523).or_default().add_use("USART1", &["TX"]);
+
+        // New project: fresh + independent; the old one is preserved in `others`.
+        app.new_project();
+        assert_eq!(app.others.len(), 1);
+        assert_eq!(app.active.mcu, Mcu::G474, "new project starts on the default chip");
+        assert!(app.active.h523_designs.is_empty(), "new project has its own empty design");
+
+        // Building undo history on this project...
+        app.history.push(app.snapshot_active());
+        assert!(!app.history.is_empty());
+        // ...clears when switching projects (no cross-project snapshots).
+        app.switch_project(0);
+        assert!(app.history.is_empty() && app.redo.is_empty(), "project switch clears undo");
+
+        // Back on the first project with its design intact.
+        assert_eq!(app.active.mcu, Mcu::H523);
+        assert_eq!(app.active.h523_designs[&Mcu::H523].uses[0].peripheral, "USART1");
+
+        // Delete promotes the other project to active; deleting the last is a no-op.
+        app.delete_active();
+        assert!(app.others.is_empty());
+        let last = app.active.name.clone();
+        app.delete_active();
+        assert_eq!(app.active.name, last, "deleting the only project is a no-op");
+    }
+
+    #[test]
+    fn project_blob_round_trips_through_ron() {
+        // The persisted shape (RON, via eframe) must round-trip — including the
+        // enum-keyed h523 map inside each Project.
+        let mut active = Project::new("buck rev C");
+        active.mcu = Mcu::H523;
+        active.h523_designs.entry(Mcu::H523).or_default().add_use("USART2", &["TX", "RX"]);
+        active.h523_designs.entry(Mcu::C5A3).or_default().add_use("LPUART1", &["TX"]);
+        let blob = Persisted { active, others: vec![Project::new("scratch")] };
+        let ron = ron::ser::to_string(&blob).expect("serialize");
+        let back: Persisted = ron::from_str(&ron).expect("deserialize");
+        assert_eq!(back.active.name, "buck rev C");
+        assert_eq!(back.active.mcu, Mcu::H523);
+        assert_eq!(back.active.h523_designs[&Mcu::H523].uses[0].peripheral, "USART2");
+        assert_eq!(back.active.h523_designs[&Mcu::C5A3].uses[0].peripheral, "LPUART1");
+        assert_eq!(back.others.len(), 1);
+        assert_eq!(back.others[0].name, "scratch");
     }
 }

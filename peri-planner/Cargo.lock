@@ -2338,6 +2338,7 @@ dependencies = [
  "egui",
  "egui_plot",
  "flate2",
+ "ron",
  "serde",
  "serde_json",
  "stm32-metapac",

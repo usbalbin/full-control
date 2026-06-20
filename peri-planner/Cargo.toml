@@ -105,6 +105,11 @@ extract-c5a3z = ["extract", "stm32-metapac/stm32c5a3zgt6"]
 # C531: the analog-rich C5 line (3 COMP + OPAMP + TIM1/TIM8). LQFP64 (R).
 extract-c531r = ["extract", "stm32-metapac/stm32c531rct6"]
 
+[dev-dependencies]
+# Matches the version eframe's `persistence` backend already locks; used only to
+# assert the persisted project blob round-trips (enum-keyed map included).
+ron = "0.11"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Pinned to match trunk 0.21.x's supported wasm-bindgen runtime — newer
 # versions (0.2.116+) emit a `clone_ref` intrinsic that older trunk doesn't
