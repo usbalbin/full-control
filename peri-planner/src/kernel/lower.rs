@@ -15,6 +15,7 @@
 //!   - INCOMPLETE — possible false negative. A greedy instance/channel choice can
 //!     strand a later requirement that a different choice would have satisfied, so
 //!     `Infeasible` can occasionally be wrong (pessimistic, never optimistic).
+//!
 //! Most-constrained-first ordering + backtracking close the gap in Increment 5.
 
 use crate::mcu::McuDescriptor;
@@ -207,20 +208,25 @@ mod tests {
     }
 
     #[test]
-    fn dma_demand_on_c5_without_pool_data_is_infeasible_not_waved_through() {
-        // C531's compiled descriptor has no DMA pool data at the pinned metapac
-        // rev (a known gap). A DMA demand must be reported infeasible — never
-        // silently "allocated" — while a no-DMA use of the same class still fits.
+    fn c5_dma_resolves_now_that_chip_json_is_wired_in() {
+        // C531's DMA pools are now sourced from the chip JSON (metapac drops C5
+        // DMA; `tools/extract.rs` injects it via `tools/json_dma.rs`). LPDMA1(4) +
+        // LPDMA2(4) = 8 channels, so a DMA-backed USART use ALLOCATES — where it
+        // was previously infeasible-for-lack-of-data.
         let c531 = Package::C531R.descriptor();
-        assert_eq!(c531.dma_channel_total(), 0, "precondition: C5 DMA pools empty here");
-        assert!(matches!(
-            feasible(c531, &[req(0, "USART", 1)]),
-            Outcome::Infeasible { .. }
-        ));
-        // The instance itself exists, so a no-DMA use is fine.
+        assert_eq!(c531.dma_channel_total(), 8, "C531 = LPDMA1(4) + LPDMA2(4)");
         if instances_of(c531, "USART").is_empty() {
             return; // no USART on this package — nothing to assert
         }
-        assert!(matches!(feasible(c531, &[req(0, "USART", 0)]), Outcome::Allocated(_)));
+        match feasible(c531, &[req(0, "USART", 2)]) {
+            Outcome::Allocated(p) => {
+                assert_eq!(p[0].dma.len(), 2, "USART RX+TX claims 2 channels");
+                assert!(
+                    p[0].dma.iter().all(|(pool, _)| pool.starts_with("LPDMA")),
+                    "C5 DMA channels come from the LPDMA controllers",
+                );
+            }
+            o => panic!("expected C531 DMA to allocate now the data is wired in, got {o:?}"),
+        }
     }
 }

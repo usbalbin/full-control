@@ -1110,12 +1110,13 @@ mod tests {
     }
 
     #[test]
-    fn rxtx_demand_infeasible_when_dma_metadata_absent() {
-        // C531's DMA is empty in the compiled metapac, so a RX+TX demand finds no
-        // channel candidates -> infeasible. Documents the data-currency gap
-        // (resolves on a metapac refresh); the catalog already knows C531 has 8.
+    fn rxtx_demand_resolves_now_c5_dma_is_wired_in() {
+        // C531's DMA is now sourced from the chip JSON (LPDMA1+LPDMA2 = 8 channels;
+        // metapac dropped it, `tools/extract.rs` injects it via `tools/json_dma.rs`).
+        // A RX+TX serial demand finds channel candidates and is feasible — the
+        // descriptor and the catalog's long-standing count of 8 finally agree.
         let d = Package::C531R.descriptor();
         let s = solve(d, &[Demand { kind: "SERIAL", count: 1, with_dma: true, options: vec![] }]);
-        assert!(!s.is_feasible());
+        assert!(s.is_feasible(), "C5 SERIAL+DMA resolves now the descriptor carries DMA");
     }
 }
