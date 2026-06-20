@@ -179,6 +179,10 @@ impl PeriPlannerApp {
                 slf.active.package = slf.active.mcu.default_package();
             }
         }
+        // The view is global and (on a legacy load) restored independently of the
+        // active chip — keep them coherent so a restored chip never lands on a tab
+        // from another family. Idempotent for the normal (blob) load.
+        slf.land_on_active_view();
         slf
     }
 
