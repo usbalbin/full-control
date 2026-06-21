@@ -16,7 +16,6 @@ pub mod g474;
 pub mod h523_design;
 pub mod hrtim_view;
 pub mod inventory_view;
-pub mod kernel;
 pub mod mcu;
 pub mod mcu_data;
 pub mod mcu_pinout;
