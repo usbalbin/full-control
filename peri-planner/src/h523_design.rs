@@ -225,7 +225,6 @@ impl H523Design {
             origin: PinOrigin::Locked,
             af,
             role_kind: RoleKind::Gpio, // model carries no typed comms flags
-            dma: None,
             irqs: Vec::new(),
             package_pin: None,
             net: None,

@@ -339,7 +339,7 @@ impl C531Design {
                 };
                 plan.placements.push(Placement {
                     signal, pin, origin, af, role_kind,
-                    dma: None, irqs: Vec::new(), package_pin: None, net: None,
+                    irqs: Vec::new(), package_pin: None, net: None,
                 });
             }
 
@@ -353,7 +353,7 @@ impl C531Design {
                         role_kind: RoleKind::AdcInput {
                             adc: adc_name, channel, purpose: "sense".into(), sequencer_group: None,
                         },
-                        dma: None, irqs: Vec::new(), package_pin: None, net: None,
+                        irqs: Vec::new(), package_pin: None, net: None,
                     });
                 }
             }

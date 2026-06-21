@@ -98,7 +98,7 @@ impl Project {
             package: self.package.name().to_string(),
             family: self.family_tag().to_string(),
         };
-        match self.mcu {
+        let mut plan = match self.mcu {
             Mcu::G474 => self.design.to_pin_plan(target),
             Mcu::H523 | Mcu::C5A3 => {
                 let empty = H523Design::default();
@@ -106,7 +106,11 @@ impl Project {
                 d.to_pin_plan(target, self.package.raw())
             }
             Mcu::C531 => self.c531_design.to_pin_plan(self.package, target),
-        }
+        };
+        // Generic DMA channel assignment (descriptor-driven, one place for all
+        // families) after the family lowerer produced placements/routes.
+        crate::pin_plan::assign_dma(&mut plan, self.package.descriptor());
+        plan
     }
 }
 

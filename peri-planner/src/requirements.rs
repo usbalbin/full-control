@@ -2170,7 +2170,7 @@ impl Design {
                 });
                 plan.placements.push(Placement {
                     signal, pin, origin, af, role_kind: role_kind(a, sig),
-                    dma: None, irqs: Vec::new(), package_pin: None, net: None,
+                    irqs: Vec::new(), package_pin: None, net: None,
                 });
             }
         }

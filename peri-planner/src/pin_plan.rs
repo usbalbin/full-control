@@ -49,6 +49,11 @@ pub struct PinPlan {
     /// conflict set — that is always recomputed.
     #[serde(default)]
     pub locks: Vec<Lock>,
+    /// Concrete DMA channel assignments, keyed by `(peripheral, function)` —
+    /// e.g. `(ADC1, stream)`, `(USART1, tx)`. Filled by the generic [`assign_dma`]
+    /// post-pass (not the family lowerers), so it stays one data-driven place.
+    #[serde(default)]
+    pub dma_assignments: Vec<DmaAssignment>,
 }
 
 /// Stable chip identity (open strings, no closed enums — a new line is data).
@@ -86,10 +91,6 @@ pub struct Placement {
     /// behavioral values.
     #[serde(default)]
     pub role_kind: RoleKind,
-    /// Resolved DMA channel for this signal, if it uses DMA. Concrete
-    /// `(controller, channel)`, not a count. `None` = blocking / not resolved.
-    #[serde(default)]
-    pub dma: Option<DmaBinding>,
     /// IRQ lines this instance needs for `bind_interrupts!` (metapac names).
     #[serde(default)]
     pub irqs: Vec<String>,
@@ -139,11 +140,19 @@ pub enum RoleKind {
     OpampIo,
 }
 
-/// Resolved DMA channel. `(controller, channel)` survives regeneration.
+/// A concrete DMA channel assigned to a peripheral function. `channel` is the
+/// embassy singleton NAME (`"DMA1_CH3"`, `"GPDMA1_CH0"`) — taken verbatim from
+/// the descriptor's `DmaPoolDef.chans`, so codegen emits a real
+/// `peripherals::DMA1_CH3` with no base-index guessing.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DmaBinding {
-    pub controller: String,
-    pub channel: u8,
+pub struct DmaAssignment {
+    /// Peripheral instance, e.g. `"ADC1"`, `"USART1"`.
+    pub peripheral: String,
+    /// Function the channel serves, e.g. `"stream"`, `"tx"`, `"rx"`. Becomes the
+    /// `{function}_dma` bundle field.
+    pub function: String,
+    /// The DMA channel singleton name, e.g. `"DMA1_CH3"`.
+    pub channel: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +269,7 @@ impl PinPlan {
             placements: Vec::new(),
             routes: Vec::new(),
             slot_claims: Vec::new(),
+            dma_assignments: Vec::new(),
             locks: Vec::new(),
         }
     }
@@ -270,5 +280,98 @@ impl PinPlan {
         self.placements.sort_by(|a, b| {
             (&a.signal.peripheral, &a.signal.role).cmp(&(&b.signal.peripheral, &b.signal.role))
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adc_in(adc: &str) -> Placement {
+        Placement {
+            signal: OwnedSignal { peripheral: adc.into(), role: "IN1".into() },
+            pin: Some(PinId { port: 'A', num: 0 }),
+            origin: PinOrigin::Forced,
+            af: None,
+            role_kind: RoleKind::default(),
+            irqs: Vec::new(),
+            package_pin: None,
+            net: None,
+        }
+    }
+
+    #[test]
+    fn assign_dma_gives_each_adc_a_distinct_real_channel() {
+        // Two ADC instances used -> each gets one conflict-free, real channel
+        // name from a controller its dma_routes allow.
+        let desc = crate::mcu::Package::G474R.descriptor();
+        let mut plan = PinPlan::empty(Target { package: "G474R".into(), family: "G4".into() });
+        plan.placements.push(adc_in("ADC1"));
+        plan.placements.push(adc_in("ADC2"));
+        assign_dma(&mut plan, desc);
+
+        assert_eq!(plan.dma_assignments.len(), 2, "one stream channel per ADC");
+        assert!(plan.dma_assignments.iter().all(|d| d.function == "stream"));
+        // Real metapac channel names, and DISTINCT (no double-booking).
+        let chans: Vec<&str> = plan.dma_assignments.iter().map(|d| d.channel.as_str()).collect();
+        assert!(chans.iter().all(|c| c.contains("_CH")), "real channel singleton names: {chans:?}");
+        assert_ne!(chans[0], chans[1], "two ADCs must not share a channel");
+    }
+
+    #[test]
+    fn assign_dma_skips_when_no_route() {
+        // A peripheral with no ADC placements -> no DMA assignment fabricated.
+        let desc = crate::mcu::Package::G474R.descriptor();
+        let mut plan = PinPlan::empty(Target { package: "G474R".into(), family: "G4".into() });
+        plan.placements.push(Placement {
+            signal: OwnedSignal { peripheral: "USART1".into(), role: "TX".into() },
+            pin: Some(PinId { port: 'A', num: 9 }),
+            origin: PinOrigin::Locked, af: Some(7), role_kind: RoleKind::default(),
+            irqs: Vec::new(), package_pin: None, net: None,
+        });
+        assign_dma(&mut plan, desc);
+        assert!(plan.dma_assignments.is_empty(), "comms DMA is not presumed in v1");
+    }
+}
+
+/// Generic, descriptor-driven DMA channel assignment — a one-way post-pass over
+/// a lowered plan (the family models carry no DMA intent, so this lives in one
+/// place, not three). Run after the family lowerer.
+///
+/// v1 INTENT = **ADC streams only**: a converter's ADC is universally
+/// DMA-driven, so each used ADC instance gets one conflict-free channel from a
+/// controller its `dma_routes` allow. Comms (tx/rx) DMA is genuinely optional
+/// and stays a future opt-in — we don't presume it. Channels are picked
+/// distinctly (by singleton name) so no two peripherals double-book one.
+pub fn assign_dma(plan: &mut PinPlan, desc: &crate::mcu::McuDescriptor) {
+    use std::collections::BTreeSet;
+
+    // Distinct ADC instances the design actually uses (from placements).
+    let mut adcs: Vec<String> = Vec::new();
+    for p in &plan.placements {
+        let inst = &p.signal.peripheral;
+        if inst.starts_with("ADC") && !adcs.contains(inst) {
+            adcs.push(inst.clone());
+        }
+    }
+
+    let mut used: BTreeSet<&'static str> = BTreeSet::new();
+    for adc in adcs {
+        // The ADC's DMA-capable signal(s) → allowed controller pools. No leg
+        // means this ADC can't DMA on this chip; skip honestly.
+        let Some(leg) = desc.dma_routes(&adc).first() else { continue };
+        // First conflict-free channel from an allowed pool.
+        let picked = leg.pools.iter().find_map(|pool_name| {
+            let pool = desc.dma_pools().iter().find(|p| p.name == *pool_name)?;
+            pool.chans.iter().copied().find(|c| !used.contains(c))
+        });
+        if let Some(ch) = picked {
+            used.insert(ch);
+            plan.dma_assignments.push(DmaAssignment {
+                peripheral: adc,
+                function: "stream".to_string(),
+                channel: ch.to_string(),
+            });
+        }
     }
 }

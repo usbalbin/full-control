@@ -11,7 +11,7 @@
 //! itself does not depend on embassy, so codegen is string generation, not
 //! compilation.
 
-use crate::pin_plan::{FabricNode, Placement, PinPlan};
+use crate::pin_plan::{DmaAssignment, FabricNode, Placement, PinPlan};
 
 /// Peripheral classes whose embassy singleton we bind as a `Board` field.
 /// Their pins are bound regardless; analog peripherals (COMP/OPAMP) get pin
@@ -104,6 +104,16 @@ pub fn generate_board(plan: &PinPlan) -> String {
         }
     }
 
+    // DMA channel fields for an instance's bundle: `{function}_dma:
+    // peripherals::{CHANNEL}` (e.g. `stream_dma: peripherals::DMA1_CH3`).
+    let dma_fields = |inst: &str| -> Vec<(String, &str)> {
+        plan.dma_assignments
+            .iter()
+            .filter(|d: &&DmaAssignment| d.peripheral == inst)
+            .map(|d| (format!("{}_dma", ident(&d.function)), d.channel.as_str()))
+            .collect()
+    };
+
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -140,6 +150,9 @@ pub fn generate_board(plan: &PinPlan) -> String {
                 }
             }
         }
+        for (fname, chan) in dma_fields(inst) {
+            let _ = writeln!(s, "    pub {fname}: peripherals::{chan},");
+        }
         let _ = writeln!(s, "}}");
         let _ = writeln!(s);
     }
@@ -150,6 +163,9 @@ pub fn generate_board(plan: &PinPlan) -> String {
         let _ = writeln!(s, "/// Resources for {inst} — internal fabric instance (no pins on this design).");
         let _ = writeln!(s, "pub struct {ty} {{");
         let _ = writeln!(s, "    pub instance: peripherals::{inst},");
+        for (fname, chan) in dma_fields(inst) {
+            let _ = writeln!(s, "    pub {fname}: peripherals::{chan},");
+        }
         let _ = writeln!(s, "}}");
         let _ = writeln!(s);
     }
@@ -181,10 +197,17 @@ pub fn generate_board(plan: &PinPlan) -> String {
                 parts.push(format!("{}: p.{}", ident(&p.signal.role), pin.name()));
             }
         }
+        for (fname, chan) in dma_fields(inst) {
+            parts.push(format!("{fname}: p.{chan}"));
+        }
         let _ = writeln!(s, "            {}: {} {{ {} }},", ident(inst), type_name(inst), parts.join(", "));
     }
     for inst in &fabric_only {
-        let _ = writeln!(s, "            {}: {} {{ instance: p.{inst} }},", ident(inst), type_name(inst));
+        let mut parts = vec![format!("instance: p.{inst}")];
+        for (fname, chan) in dma_fields(inst) {
+            parts.push(format!("{fname}: p.{chan}"));
+        }
+        let _ = writeln!(s, "            {}: {} {{ {} }},", ident(inst), type_name(inst), parts.join(", "));
     }
     let _ = writeln!(s, "        }}");
     let _ = writeln!(s, "    }}");
@@ -308,7 +331,6 @@ mod tests {
             origin: PinOrigin::Locked,
             af: None,
             role_kind: RoleKind::Gpio,
-            dma: None,
             irqs: Vec::new(),
             package_pin: None,
             net: None,
@@ -393,7 +415,8 @@ mod tests {
             ocp: Some(Ocp { comp: CompId::Comp1, break_input: 1, threshold_dac: Some(DacId::Dac1Ch1) }),
             adc_sense: Some((AdcInstance::Adc1, 1)),
         });
-        let plan = d.to_pin_plan(Package::C531R, Target { package: "C531R".into(), family: "C5".into() });
+        let mut plan = d.to_pin_plan(Package::C531R, Target { package: "C531R".into(), family: "C5".into() });
+        crate::pin_plan::assign_dma(&mut plan, Package::C531R.descriptor());
         let code = generate(&plan);
 
         // Pin-bearing bundles: TIM1 (HS/LS) + ADC1 sense, with instance fields.
@@ -402,6 +425,10 @@ mod tests {
         assert!(code.contains("    pub ch1: peripherals::"));
         assert!(code.contains("    pub ch1n: peripherals::"));
         assert!(code.contains("pub struct Adc1 {"));
+        // The ADC stream gets a concrete, real DMA channel name in its bundle
+        // (C531 LPDMA is 0-based — could not have been synthesized from a count).
+        assert!(code.contains("    pub stream_dma: peripherals::LPDMA1_CH0,"));
+        assert!(code.contains("stream_dma: p.LPDMA1_CH0"));
 
         // Pinless fabric instances the OCP uses -> instance-only bundles.
         assert!(code.contains("pub struct Comp1 {"));
