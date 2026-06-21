@@ -1,11 +1,14 @@
 # peri-planner → Firmware (embassy/RTIC) Codegen — Design
 
-> Status: **discussion, pre-implementation (2026-06-21).** Produced from three
-> grounding workflows (peri-planner data model + persistence; KiCad extension
-> surface; embassy/RTIC pin idioms; HRTIM/fault model; prior-art codegen
-> philosophy). Nothing here is built. Goal: peri-planner is the single source of
-> truth for a pin/peripheral plan, and *generates* the firmware wiring instead of
-> the user transcribing it by hand a second time (the first time being KiCad).
+> Status (2026-06-21): the design (§§0–7) plus the **unified `PinPlan`** (§8),
+> the three family lowerers + dispatch, **Tier-1 codegen** (resource bundles +
+> `Behavior` contract, §8.6–8.7), and **DMA channel assignment** (§8.8) are
+> **built and tested**. Goal: peri-planner is the single source of truth for a
+> pin/peripheral plan, and *generates* the firmware wiring instead of the user
+> transcribing it by hand a second time (the first time being KiCad).
+>
+> **Using the generated scaffold:** see
+> [`firmware-codegen-usage.md`](firmware-codegen-usage.md) for the worked how-to.
 
 ## 0. The problem and the reframe
 
