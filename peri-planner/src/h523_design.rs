@@ -190,6 +190,70 @@ impl H523Design {
             .collect()
     }
 
+    /// Lower this (generic, descriptor-driven) design into the unified
+    /// [`PinPlan`](crate::pin_plan::PinPlan). One-way / derived: the result is
+    /// never edited back (see `docs/firmware-codegen-design.md` §8). This is the
+    /// *generic* lowerer — it touches nothing family-specific, so it serves H5,
+    /// C5A3, and any future descriptor-only family unchanged. `raw` is the
+    /// active package's descriptor, used only to look up AF numbers.
+    ///
+    /// `routes`/`slot_claims` stay empty: a descriptor-only family has no analog
+    /// crossbar. `dma`/`irqs`/`package_pin`/`net` stay unset (no producer yet);
+    /// their `serde(default)` slots mean adding those later won't reshape the type.
+    pub fn to_pin_plan(
+        &self,
+        target: crate::pin_plan::Target,
+        raw: &'static RawMcuData,
+    ) -> crate::pin_plan::PinPlan {
+        use crate::mcu_pinout::{af_rows, OwnedSignal};
+        use crate::pin_plan::{Placement, PinOrigin, PinPlan, RoleKind};
+
+        // AF lookup for a placed (peripheral, role, pin). `None` for analog pins.
+        let af_of = |peripheral: &str, role: &str, pin: PinId| -> Option<u8> {
+            af_rows(raw)
+                .find(|r| {
+                    r.pin == pin && r.signal.peripheral == peripheral && r.signal.role == role
+                })
+                .and_then(|r| r.af)
+        };
+
+        let placed = |signal: OwnedSignal, pin: Option<PinId>, af: Option<u8>| Placement {
+            signal,
+            pin,
+            // Everything in this model is user-driven intent (a lock, or a
+            // declared-but-unplaced use), so the origin is always `Locked`.
+            origin: PinOrigin::Locked,
+            af,
+            role_kind: RoleKind::Gpio, // model carries no typed comms flags
+            dma: None,
+            irqs: Vec::new(),
+            package_pin: None,
+            net: None,
+        };
+
+        let mut plan = PinPlan::empty(target);
+
+        // 1. Every pin-locked signal → a placed Placement (pin_locks authoritative).
+        for l in &self.pin_locks {
+            let pin = l.pin();
+            let sig = OwnedSignal { peripheral: l.peripheral.clone(), role: l.role.clone() };
+            let af = af_of(&l.peripheral, &l.role, pin);
+            plan.placements.push(placed(sig, Some(pin), af));
+        }
+
+        // 2. Declared-but-unplaced roles → a Placement with `pin: None`, so the
+        //    plan is self-describing without re-running `validate()`.
+        for (peripheral, role) in self.declared_signals() {
+            if self.locked_pin(peripheral, role).is_none() {
+                let sig = OwnedSignal { peripheral: peripheral.to_string(), role: role.to_string() };
+                plan.placements.push(placed(sig, None, None));
+            }
+        }
+
+        plan.sort_placements();
+        plan
+    }
+
     /// Completeness / reachability check for the declared design on `raw`'s
     /// package: a declared role that can't be placed on this package at all
     /// (`Unreachable`) or hasn't been pinned yet (`Unplaced`). Empty == every
@@ -275,6 +339,40 @@ mod tests {
                 role: "NONSENSE".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn to_pin_plan_lowers_locks_and_unplaced_generically() {
+        use crate::pin_plan::{PinOrigin, Target, PIN_PLAN_FORMAT_VERSION};
+        let raw = Package::H523R.descriptor().raw;
+        let mut d = H523Design::new();
+        d.add_use("USART1", &["TX", "RX"]);
+        let tx = pins_for(raw, SignalId { peripheral: "USART1", role: "TX" })[0];
+        d.lock("USART1", "TX", tx);
+
+        let plan = d.to_pin_plan(
+            Target { package: "H523RE".into(), family: "H5".into() },
+            raw,
+        );
+
+        // Descriptor-only family: no analog fabric.
+        assert_eq!(plan.format_version, PIN_PLAN_FORMAT_VERSION);
+        assert!(plan.routes.is_empty() && plan.slot_claims.is_empty());
+
+        // TX is placed (origin Locked, real pin, an AF pin so af is Some).
+        let tx_p = plan.placements.iter().find(|p| p.signal.role == "TX").unwrap();
+        assert_eq!(tx_p.signal.peripheral, "USART1");
+        assert_eq!(tx_p.pin, Some(tx));
+        assert_eq!(tx_p.origin, PinOrigin::Locked);
+        assert!(tx_p.af.is_some(), "USART TX is an alternate-function pin");
+
+        // RX is declared but unplaced → carried with pin: None.
+        let rx_p = plan.placements.iter().find(|p| p.signal.role == "RX").unwrap();
+        assert_eq!(rx_p.pin, None);
+
+        // Stable order by (peripheral, role): RX sorts before TX.
+        assert_eq!(plan.placements.len(), 2);
+        assert_eq!(plan.placements[0].signal.role, "RX");
     }
 
     #[test]
