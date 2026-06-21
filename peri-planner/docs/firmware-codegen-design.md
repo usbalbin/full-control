@@ -421,27 +421,47 @@ All behind `serde(default)`, so filling them later won't reshape the type.
 - `Project::to_pin_plan` — the single dispatch point; picks the per-family lowerer
   by active MCU and builds one consistent `Target` (family = open string). (G474's
   lowerer was refactored to take a `Target` too, for uniformity.)
-- `src/codegen.rs` `generate(&PinPlan) -> String` — the Tier-1 firmware scaffold:
-  - **Board layer** (`generate_board`): a `Board` struct naming every peripheral
-    instance + pin, destructured from embassy `Peripherals` via `Board::take(p)`.
-    Pure structural. Instance fields only for Tier-1 classes (USART/UART/LPUART/
-    SPI/I2C/TIM/ADC/DAC/FDCAN/HRTIM); analog COMP/OPAMP bind pins only. Unplaced
-    signals → comment, never a bogus field.
+- `src/codegen.rs` `generate(&PinPlan) -> String` — the firmware scaffold:
+  - **Resource bundles** (`generate_board`): one bundle struct per peripheral
+    instance (its typed singleton + role-named pins), aggregated into a `Board`
+    with `Board::take(p)` destructuring embassy `Peripherals`. Instance field only
+    for Tier-1 classes (USART/UART/LPUART/SPI/I2C/TIM/ADC/DAC/FDCAN/HRTIM); analog
+    COMP/OPAMP bundle pins only. Unplaced signals → comment, never a bogus field.
   - **Behavior contract** (`write_behavior`): the §4 holes — `Behavior` struct +
     `Default`, one field per value the plan can't know (baud / freq / bitrate /
     PWM freq + dead-time), derived from each instance's class + role kinds.
   - Wired to a **"Gen firmware"** button (copies the scaffold to clipboard).
-  - Verified on the real default-G474 design (HRTIM channel/fault pins, ADC/DAC
-    instances, `Behavior{hrtim1_freq_hz, hrtim1_dead_time_ns}`).
+  - Verified on the real default-G474 design (`Hrtim1{instance, cha1..chd2, flt5}`,
+    `Adc1`, `Dac1` bundles; `Behavior{hrtim1_freq_hz, hrtim1_dead_time_ns}`).
 
-**Next (frontier — diminishing confidence without a compile target):** driver
-*constructor* emission (`SimplePwm::new` / `Uart::new` / …). The exact embassy
-constructor shapes are version-sensitive and peri-planner has no embassy dependency
-to compile against, so this is best developed in the firmware crate (`hard-rt`)
-where it builds. Also blocked on the deferred `dma`/`irqs` producers (async
-constructors + `bind_interrupts!` need them). The Board (named resources) +
-`Behavior` (the holes) deliberately do the mechanical, error-prone part and leave
-idiomatic driver construction to the expert.
+### 8.7 The bundle boundary — DECIDED 2026-06-21 (we do NOT generate init)
+
+We deliberately stop at **resource bundles** and never emit driver *constructor*
+calls (`SimplePwm::new`, `Uart::new`, …). Rationale (user's call, endorsed):
+
+- **embassy's init API churns**; chasing it is unsustainable and peri-planner has
+  no embassy dependency to compile against, so emitted constructors would be
+  blind guesses.
+- **embassy constructors are generic over pin marker traits** (`TxPin<USART1>`,
+  `Channel1Pin<TIM1>`). The user writes the call once against a bundle —
+  `Uart::new(b.usart1.instance, b.usart1.rx, b.usart1.tx, …)` — and re-pinning +
+  regenerating changes only the bundle field *types* (the *names* are stable), so
+  the call still compiles. **The bundle is a version-stable interface; the init
+  call is the user's, written once.**
+- Generated code therefore touches only `peripherals::X` + `Peripherals` field
+  access — the most stable surface in embassy-stm32. Codegen ≈ never breaks on an
+  embassy bump.
+- This dissolves the earlier "validate constructors against `hard-rt`" frontier:
+  there are no constructors to validate.
+
+**Caveats:** `bind_interrupts!` needs literal IRQ idents (a macro), so IRQs aren't
+fully bundleable — the user writes that block (or we emit it separately, since IRQ
+names track the instance, not the pins). DMA channels *are* bundleable (a
+`DMA1_CH3` singleton is a field like a pin) once the DMA producer lands.
+
+**Possible future niceties (not needed):** a shared trait per class so one generic
+`fn setup_uart<B: UartBundle>(b: B)` handles any UART bundle; user-assigned
+semantic bundle names (ties to the deferred `net`/label idea).
 
 Related: [[project-peri-planner]], [[project-save-compat-not-required]],
 [[user-role]].
