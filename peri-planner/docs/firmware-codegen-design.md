@@ -466,5 +466,32 @@ names track the instance, not the pins). DMA channels *are* bundleable (a
 `fn setup_uart<B: UartBundle>(b: B)` handles any UART bundle; user-assigned
 semantic bundle names (ties to the deferred `net`/label idea).
 
+### 8.8 DMA channels — DONE 2026-06-21 (data layer + allocator + codegen)
+
+DMA needed two things, both built:
+
+1. **Channel NAMES in the descriptor.** `DmaPoolDef` gained `chans: &[&str]` (the
+   controller's channel singleton names). The naming base varies by controller
+   family — classic DMA is 1-based (`DMA1_CH1`), GPDMA/LPDMA 0-based
+   (`GPDMA1_CH0`/`LPDMA1_CH0`) — so codegen must use real names, not synthesize.
+   `tools/extract.rs` reads them from metapac `ch.name`; `tools/json_dma.rs` from
+   chip-JSON `ch.name` (C5 path). All 13 compiled descriptors regenerated. The
+   whole-lineup asset stubs `chans: &[]` for now (codegen runs on compiled
+   planner descriptors).
+2. **Allocation + intent.** One generic representation
+   (`PinPlan.dma_assignments: Vec<DmaAssignment{peripheral, function, channel}>`,
+   channel = real singleton name) + a generic post-pass `assign_dma(plan, desc)`
+   run after the family lowerer (DMA intent isn't in the family models, so it
+   lives in one place). **v1 intent = ADC streams only** — a converter's ADC is
+   universally DMA-driven; comms (tx/rx) DMA is genuinely optional and stays a
+   future opt-in, not presumed. Picks one conflict-free, distinct real channel
+   per ADC from a controller its `dma_routes` allow. Codegen emits a
+   `{function}_dma: peripherals::{CHANNEL}` bundle field. Verified on C531:
+   `Adc1{ …, stream_dma: peripherals::LPDMA1_CH0 }`.
+
+**Future DMA work:** comms tx/rx DMA (add `(USART1,tx)`/`(rx)` intent — same
+machinery); the whole-lineup asset's channel names (mirror the chip-JSON read in
+`gen_descriptors`/`desc_asset`).
+
 Related: [[project-peri-planner]], [[project-save-compat-not-required]],
 [[user-role]].
