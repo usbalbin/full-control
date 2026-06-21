@@ -63,6 +63,11 @@ struct Project {
     mcu: Mcu,
     package: Package,
     variant: ChipVariant,
+    /// The Part-finder "declare-once" spec — per project so each design keeps its
+    /// own peripheral wishlist. (`DemandInput`'s `&'static` keys can't serialize
+    /// directly, so it round-trips via `select::demand_serde`.)
+    #[serde(with = "crate::select::demand_serde", default = "crate::select::default_demands")]
+    catalog_demands: Vec<crate::select::DemandInput>,
 }
 
 impl Project {
@@ -75,6 +80,7 @@ impl Project {
             mcu: Mcu::G474,
             package: Package::G474R,
             variant: ChipVariant::G474R,
+            catalog_demands: crate::select::default_demands(),
         }
     }
 
@@ -141,8 +147,6 @@ pub struct PeriPlannerApp {
     af_filter: crate::af_view::AfFilter,
     /// Part-finder query state (whole-lineup catalog search). Ephemeral.
     catalog_query: crate::catalog::SearchQuery,
-    /// Part-finder constraint rows (verified per-part via Tier-2 solve). Ephemeral.
-    catalog_demands: Vec<crate::select::DemandInput>,
     /// Memoized Part-finder evaluation (recomputed only when query/demands change).
     catalog_eval_cache: crate::select::EvalCache,
     /// Part-finder results sort (column + direction). Ephemeral.
@@ -176,10 +180,6 @@ impl Default for PeriPlannerApp {
             picked: None,
             af_filter: Default::default(),
             catalog_query: Default::default(),
-            catalog_demands: ["SERIAL", "SPI", "I2C", "ADC", "UCPD", "OCP", "COMP_PWM"]
-                .into_iter()
-                .map(crate::select::DemandInput::new)
-                .collect(),
             catalog_eval_cache: Default::default(),
             catalog_sort: Default::default(),
             pending_open: None,
@@ -289,6 +289,20 @@ impl PeriPlannerApp {
         let mut np = Project::new(format!("Untitled {}", self.others.len() + 2));
         std::mem::swap(&mut self.active, &mut np);
         self.others.push(np);
+        self.history.clear();
+        self.redo.clear();
+        self.asset_part = None;
+        self.land_on_active_view();
+    }
+
+    /// Duplicate the active project: the copy (same design, distinct name) becomes
+    /// active so you can diverge it; the original joins `others`. Undo clears (the
+    /// copy is a fresh editing context).
+    fn duplicate_active(&mut self) {
+        let mut copy = self.active.clone();
+        copy.name = format!("{} copy", self.active.name);
+        std::mem::swap(&mut self.active, &mut copy);
+        self.others.push(copy);
         self.history.clear();
         self.redo.clear();
         self.asset_part = None;
@@ -453,7 +467,7 @@ impl PeriPlannerApp {
     /// ("find parts that fit what I've sketched").
     fn summarize_to_demands(&mut self) {
         let counts = self.design_demand_counts();
-        for d in &mut self.catalog_demands {
+        for d in &mut self.active.catalog_demands {
             d.count = counts.get(d.kind).copied().unwrap_or(0);
         }
         self.view = ViewMode::Catalog;
@@ -465,7 +479,7 @@ impl PeriPlannerApp {
     /// (see docs/declare-once-seed-mappings.md).
     fn seed_from_demands(&mut self) {
         let demands: Vec<crate::select::DemandInput> =
-            self.catalog_demands.iter().filter(|d| d.count > 0).cloned().collect();
+            self.active.catalog_demands.iter().filter(|d| d.count > 0).cloned().collect();
         let have = self.design_demand_counts();
         match self.active.mcu {
             Mcu::G474 => self.mutate(|d| seed_g474_into(d, &demands, &have)),
@@ -566,6 +580,7 @@ impl PeriPlannerApp {
             if !browsing {
                 let mut switch_to: Option<usize> = None;
                 let mut do_new = false;
+                let mut do_dup = false;
                 let mut do_delete = false;
                 ui.horizontal(|ui| {
                     ui.label("Project:");
@@ -590,6 +605,13 @@ impl PeriPlannerApp {
                         do_new = true;
                     }
                     if ui
+                        .button("⎘ Duplicate")
+                        .on_hover_text("copy the active design into a new project")
+                        .clicked()
+                    {
+                        do_dup = true;
+                    }
+                    if ui
                         .add_enabled(!self.others.is_empty(), egui::Button::new("🗑 Delete"))
                         .on_hover_text("delete the active project")
                         .clicked()
@@ -607,6 +629,9 @@ impl PeriPlannerApp {
                 }
                 if do_new {
                     self.new_project();
+                }
+                if do_dup {
+                    self.duplicate_active();
                 }
                 if do_delete {
                     self.delete_active();
@@ -763,6 +788,7 @@ impl PeriPlannerApp {
             // finder) are summarized here and actionable from every planner view —
             // the lightweight "declare once" link between the finder and allocator.
             let active: Vec<String> = self
+                .active
                 .catalog_demands
                 .iter()
                 .filter(|d| d.count > 0)
@@ -914,7 +940,7 @@ impl eframe::App for PeriPlannerApp {
             let view = self.view;
             let af_filter = &mut self.af_filter;
             let catalog_query = &mut self.catalog_query;
-            let catalog_demands = &mut self.catalog_demands;
+            let catalog_demands = &mut self.active.catalog_demands;
             let catalog_cache = &mut self.catalog_eval_cache;
             let catalog_sort = &mut self.catalog_sort;
             let mut open: Option<String> = None;
@@ -961,7 +987,7 @@ impl eframe::App for PeriPlannerApp {
             let h523 = self.active.h523_designs.entry(self.active.mcu).or_default();
             let c531 = &self.active.c531_design;
             let catalog_query = &mut self.catalog_query;
-            let catalog_demands = &mut self.catalog_demands;
+            let catalog_demands = &mut self.active.catalog_demands;
             let catalog_cache = &mut self.catalog_eval_cache;
             let catalog_sort = &mut self.catalog_sort;
             let mcu = self.active.mcu;
@@ -1723,7 +1749,7 @@ impl eframe::App for PeriPlannerApp {
                     self.pending_open = crate::catalog_view::show(
                         ui,
                         &mut self.catalog_query,
-                        &mut self.catalog_demands,
+                        &mut self.active.catalog_demands,
                         &mut self.catalog_eval_cache,
                         &mut self.catalog_sort,
                     );
@@ -2284,5 +2310,36 @@ mod seed_tests {
         assert_eq!(back.active.h523_designs[&Mcu::C5A3].uses[0].peripheral, "LPUART1");
         assert_eq!(back.others.len(), 1);
         assert_eq!(back.others[0].name, "scratch");
+    }
+
+    #[test]
+    fn per_project_demands_are_independent_and_round_trip() {
+        let mut app = PeriPlannerApp::default();
+        // The active project's Part-finder spec is its own.
+        app.active.catalog_demands.iter_mut().find(|d| d.kind == "SERIAL").unwrap().count = 3;
+        app.new_project();
+        assert!(
+            app.active.catalog_demands.iter().all(|d| d.count == 0),
+            "a new project starts with a fresh (zero) demand spec",
+        );
+        app.switch_project(0);
+        assert_eq!(
+            app.active.catalog_demands.iter().find(|d| d.kind == "SERIAL").unwrap().count,
+            3,
+            "switching back restores the original project's spec",
+        );
+
+        // The serde projection round-trips counts, the DMA flag, and options.
+        let mut p = Project::new("buck");
+        let serial = p.catalog_demands.iter_mut().find(|d| d.kind == "SERIAL").unwrap();
+        serial.count = 2;
+        serial.with_dma = true;
+        serial.set_option("flow control", true);
+        let blob = Persisted { active: p, others: vec![] };
+        let back: Persisted =
+            ron::from_str(&ron::ser::to_string(&blob).unwrap()).unwrap();
+        let bs = back.active.catalog_demands.iter().find(|d| d.kind == "SERIAL").unwrap();
+        assert_eq!((bs.count, bs.with_dma), (2, true));
+        assert!(bs.has_option("flow control"), "option survived the &'static projection");
     }
 }

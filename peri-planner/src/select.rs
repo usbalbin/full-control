@@ -604,6 +604,67 @@ impl DemandInput {
             options: self.options.clone(),
         }
     }
+
+    fn to_state(&self) -> DemandState {
+        DemandState {
+            kind: self.kind.to_string(),
+            count: self.count,
+            with_dma: self.with_dma,
+            options: self.options.iter().map(|o| o.to_string()).collect(),
+        }
+    }
+
+    fn from_state(s: &DemandState) -> Option<Self> {
+        let kind = DEMAND_KINDS.iter().copied().find(|k| *k == s.kind)?;
+        let mut d = DemandInput::new(kind);
+        d.count = s.count;
+        d.with_dma = s.with_dma;
+        for opt in d.available_options() {
+            if s.options.iter().any(|o| o == opt) {
+                d.set_option(opt, true);
+            }
+        }
+        Some(d)
+    }
+}
+
+/// The Part-finder demand kinds, in display order. The single source for the
+/// `&'static` kind keys (also used to reconstruct them on load — see [`demand_serde`]).
+pub const DEMAND_KINDS: &[&str] = &["SERIAL", "SPI", "I2C", "ADC", "UCPD", "OCP", "COMP_PWM"];
+
+/// A fresh demand row per kind (all counts zero) — the default Part-finder spec.
+pub fn default_demands() -> Vec<DemandInput> {
+    DEMAND_KINDS.iter().copied().map(DemandInput::new).collect()
+}
+
+/// Owned, serializable mirror of [`DemandInput`] (whose `&'static` kind/option
+/// keys can't `Deserialize` directly).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DemandState {
+    kind: String,
+    count: u8,
+    with_dma: bool,
+    options: Vec<String>,
+}
+
+/// serde adapter so a `Vec<DemandInput>` round-trips through owned [`DemandState`]s
+/// — used by the per-project `catalog_demands` so each project keeps its own
+/// Part-finder spec across save/load. Unknown kinds (dropped from the catalogue)
+/// are silently skipped on load.
+pub mod demand_serde {
+    use super::{DemandInput, DemandState};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[DemandInput], s: S) -> Result<S::Ok, S::Error> {
+        v.iter().map(DemandInput::to_state).collect::<Vec<_>>().serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<DemandInput>, D::Error> {
+        Ok(Vec::<DemandState>::deserialize(d)?
+            .iter()
+            .filter_map(DemandInput::from_state)
+            .collect())
+    }
 }
 
 /// Total DMA channels a demand set needs — the Tier-1 capacity lower bound.
