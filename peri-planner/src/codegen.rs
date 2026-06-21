@@ -442,13 +442,15 @@ mod tests {
 
     #[test]
     fn generated_board_references_only_real_singletons() {
-        // SOUNDNESS GUARD: every `peripherals::IDENT` the scaffold emits must be a
-        // real metapac entity in the descriptor — a peripheral instance, a GPIO
-        // pin, or a DMA channel. embassy's `Peripherals` mirrors the metapac
-        // peripheral list, so "real metapac name" == "compiles against embassy".
-        // Catches any future name synthesis (fabric instances, DMA channels) or
-        // data change that would emit a bogus singleton. Exercised on the richest
-        // family (G474 default: HRTIM/ADC/DAC/COMP + ADC-stream DMA).
+        // NAME-VALIDITY guard (not exactly-once — that's the next test): every
+        // `peripherals::IDENT` the scaffold emits must be a real metapac entity in
+        // the descriptor — a peripheral instance, a GPIO pin, or a DMA channel.
+        // embassy's `Peripherals` mirrors the metapac peripheral list, so "real
+        // metapac name" == "compiles against embassy". Catches any future name
+        // synthesis (fabric instances, DMA channels) or data change that would emit
+        // a bogus singleton. (Double-move prevention lives in the lowerers' `taken`
+        // sets + `assign_dma`'s `used` set, and is checked by the next test.)
+        // Exercised on the richest family (G474 default: HRTIM/ADC/DAC/COMP + stream DMA).
         use crate::pin_plan::{assign_dma, Target};
         use std::collections::BTreeSet;
 
@@ -475,6 +477,43 @@ mod tests {
         for id in &idents {
             let ok = peris.contains(id.as_str()) || pins.contains(id) || chans.contains(id.as_str());
             assert!(ok, "generated `peripherals::{id}` is not a real descriptor peripheral/pin/DMA channel");
+        }
+    }
+
+    #[test]
+    fn generated_board_moves_each_singleton_exactly_once() {
+        // The real soundness property: `take(p: Peripherals)` may move each
+        // `Peripherals` field AT MOST ONCE — a double-move wouldn't compile. Count
+        // the `p.IDENT` moves (uppercase = a metapac singleton) and assert none
+        // repeats. Guards the lowerers'/assign_dma's de-dup end-to-end.
+        use crate::pin_plan::{assign_dma, Target};
+        use std::collections::BTreeMap;
+
+        let desc = crate::mcu::Package::G474R.descriptor();
+        let mut plan = crate::requirements::Design::default()
+            .to_pin_plan(Target { package: "G474RE".into(), family: "G4".into() });
+        assign_dma(&mut plan, desc);
+        let code = generate(&plan);
+
+        let mut moves: BTreeMap<String, u32> = BTreeMap::new();
+        for (i, _) in code.match_indices("p.") {
+            // `p` must be a standalone token (a `Peripherals` move), not the tail
+            // of a longer identifier like `tmp.`.
+            if code[..i].chars().last().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            let id: String = code[i + 2..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            // Peripherals fields are uppercase metapac names (USART1, PA9, DMA1_CH3).
+            if id.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                *moves.entry(id).or_default() += 1;
+            }
+        }
+        assert!(moves.len() > 5, "expected several singleton moves, got {moves:?}");
+        for (id, n) in &moves {
+            assert_eq!(*n, 1, "Peripherals field p.{id} is moved {n}× (must be exactly once)");
         }
     }
 
