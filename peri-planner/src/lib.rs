@@ -4,6 +4,7 @@ pub mod c531_design;
 pub mod c531_view;
 pub mod catalog;
 pub mod catalog_view;
+pub mod codegen;
 pub mod comms_view;
 pub mod constraint;
 pub mod desc_asset;

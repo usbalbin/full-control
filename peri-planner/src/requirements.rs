@@ -2037,12 +2037,12 @@ impl Design {
     /// pinless `routes` + HRTIM compare/capture `slot_claims`. Behavioral values
     /// (phase-shift angle, dead-time ns, thresholds) are never stored — codegen
     /// holes. The fake `phase_shift_q15` is dropped.
-    pub fn to_pin_plan(&self) -> crate::pin_plan::PinPlan {
+    pub fn to_pin_plan(&self, target: crate::pin_plan::Target) -> crate::pin_plan::PinPlan {
         use crate::c531_design::{comp_num, dac_inst_ch};
         use crate::mcu_pinout::{af_rows, PinId};
         use crate::pin_plan::{
             EdgeKind, EevRole, FabricNode, Placement, PinOrigin, PinPlan, RoleKind, RouteEdge,
-            SlotClaim, SlotPurpose, Target,
+            SlotClaim, SlotPurpose,
         };
         use crate::pinout::{pins_for, signal_to_owned, Signal};
         use std::collections::HashSet;
@@ -2132,7 +2132,7 @@ impl Design {
             }
         };
 
-        let mut plan = PinPlan::empty(Target { package: format!("{variant:?}"), family: "G4".into() });
+        let mut plan = PinPlan::empty(target);
         // Seed taken-set with locked pins so Solver picks never collide with them.
         let mut taken: HashSet<PinId> = self.pin_assignments.values().copied().collect();
 
@@ -2497,8 +2497,9 @@ mod tests {
     /// placements — exercising the G474 routes layer end to end.
     #[test]
     fn to_pin_plan_lowers_default_g474_fabric() {
-        use crate::pin_plan::{EdgeKind, EevRole, RoleKind, SlotPurpose};
-        let plan = Design::default().to_pin_plan();
+        use crate::pin_plan::{EdgeKind, EevRole, RoleKind, SlotPurpose, Target};
+        let plan = Design::default()
+            .to_pin_plan(Target { package: "G474R".into(), family: "G4".into() });
 
         assert_eq!(plan.target.family, "G4");
         assert!(plan.target.package.starts_with("G474"), "got {}", plan.target.package);

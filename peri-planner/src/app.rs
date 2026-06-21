@@ -77,6 +77,37 @@ impl Project {
             variant: ChipVariant::G474R,
         }
     }
+
+    /// Coarse, open family tag for the active MCU (gates fabric topology /
+    /// codegen tier in the lowered plan). A string, not a closed enum, so a new
+    /// line is data — see `docs/firmware-codegen-design.md` §8.
+    fn family_tag(&self) -> &'static str {
+        match self.mcu {
+            Mcu::G474 => "G4",
+            Mcu::H523 => "H5",
+            Mcu::C5A3 | Mcu::C531 => "C5",
+        }
+    }
+
+    /// Lower the ACTIVE family's design model into the unified
+    /// [`PinPlan`](crate::pin_plan::PinPlan) — the single dispatch point that
+    /// picks the right per-family lowerer. One-way / derived (the family models
+    /// stay authoritative); this is the input the firmware codegen reads.
+    pub(crate) fn to_pin_plan(&self) -> crate::pin_plan::PinPlan {
+        let target = crate::pin_plan::Target {
+            package: self.package.name().to_string(),
+            family: self.family_tag().to_string(),
+        };
+        match self.mcu {
+            Mcu::G474 => self.design.to_pin_plan(target),
+            Mcu::H523 | Mcu::C5A3 => {
+                let empty = H523Design::default();
+                let d = self.h523_designs.get(&self.mcu).unwrap_or(&empty);
+                d.to_pin_plan(target, self.package.raw())
+            }
+            Mcu::C531 => self.c531_design.to_pin_plan(self.package, target),
+        }
+    }
 }
 
 /// The whole persisted project set (one RON blob). Save-compat with the
@@ -710,6 +741,17 @@ impl PeriPlannerApp {
                             }
                         };
                         ui.ctx().copy_text(text);
+                    }
+                    if ui
+                        .button("Gen firmware")
+                        .on_hover_text(
+                            "Copy a generated embassy-stm32 board scaffold (Tier-1 \
+                             instances + pins) for this design",
+                        )
+                        .clicked()
+                    {
+                        let plan = self.active.to_pin_plan();
+                        ui.ctx().copy_text(crate::codegen::generate_board(&plan));
                     }
                 }
             });
@@ -2059,6 +2101,37 @@ mod seed_tests {
 
     fn dem(kind: &'static str, count: u8) -> DemandInput {
         DemandInput { kind, count, with_dma: false, options: vec![] }
+    }
+
+    #[test]
+    fn to_pin_plan_dispatches_per_active_family() {
+        use crate::c531_design::ConverterLeg;
+        use crate::g474::TimId;
+
+        // G474: the default fabric design -> family "G4", analog routes present.
+        let g4 = Project::new("g4").to_pin_plan();
+        assert_eq!(g4.target.family, "G4");
+        assert!(!g4.routes.is_empty(), "G474 default carries analog fabric");
+
+        // C531: a bare PWM leg -> family "C5", a materialized TIM1 CH1, no fabric.
+        let mut c5 = Project::new("c5");
+        c5.mcu = Mcu::C531;
+        c5.package = Package::C531R;
+        c5.c531_design.add_leg(ConverterLeg::pwm(TimId::Tim1));
+        let plan = c5.to_pin_plan();
+        assert_eq!(plan.target.family, "C5");
+        assert!(plan.placements.iter().any(|p| p.signal.peripheral == "TIM1" && p.signal.role == "CH1"));
+        assert!(plan.routes.is_empty(), "a bare PWM leg has no fabric routes");
+
+        // H523: a declared use -> family "H5"; the per-MCU map is read for the active chip.
+        let mut h5 = Project::new("h5");
+        h5.mcu = Mcu::H523;
+        h5.package = Package::H523R;
+        h5.h523_designs.entry(Mcu::H523).or_default().add_use("USART1", &["TX"]);
+        let plan = h5.to_pin_plan();
+        assert_eq!(plan.target.family, "H5");
+        assert!(plan.routes.is_empty());
+        assert!(plan.placements.iter().any(|p| p.signal.peripheral == "USART1"));
     }
 
     #[test]
