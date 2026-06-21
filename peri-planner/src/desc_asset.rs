@@ -93,7 +93,9 @@ fn leak_raw(p: AssetPart) -> &'static RawMcuData {
     let dma_pools: Vec<DmaPoolDef> = p
         .pools
         .into_iter()
-        .map(|(name, channels)| DmaPoolDef { name: leak_str(name), channels })
+        // The whole-lineup asset doesn't carry channel NAMES yet (only counts);
+        // firmware codegen runs on the compiled planner descriptors, which do.
+        .map(|(name, channels)| DmaPoolDef { name: leak_str(name), channels, chans: &[] })
         .collect();
     Box::leak(Box::new(RawMcuData {
         name: leak_str(p.name),

@@ -1094,7 +1094,7 @@ pub static RAW: RawMcuData = RawMcuData {
         ] },
     ],
     dma_pools: &[
-        DmaPoolDef { name: "LPDMA1", channels: 8 },
-        DmaPoolDef { name: "LPDMA2", channels: 8 },
+        DmaPoolDef { name: "LPDMA1", channels: 8, chans: &["LPDMA1_CH0", "LPDMA1_CH1", "LPDMA1_CH2", "LPDMA1_CH3", "LPDMA1_CH4", "LPDMA1_CH5", "LPDMA1_CH6", "LPDMA1_CH7"] },
+        DmaPoolDef { name: "LPDMA2", channels: 8, chans: &["LPDMA2_CH0", "LPDMA2_CH1", "LPDMA2_CH2", "LPDMA2_CH3", "LPDMA2_CH4", "LPDMA2_CH5", "LPDMA2_CH6", "LPDMA2_CH7"] },
     ],
 };

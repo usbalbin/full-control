@@ -13,9 +13,9 @@ use serde_json::Value;
 
 /// DMA extracted from one chip's JSON.
 pub struct ChipDma {
-    /// Controller pool → channel count (summed across cores, matching the
-    /// catalog's supply side).
-    pub pools: BTreeMap<String, u32>,
+    /// Controller pool → its channel singleton names (e.g. `LPDMA1` →
+    /// `{LPDMA1_CH0, …}`), deduped across cores. The count is `.len()`.
+    pub pools: BTreeMap<String, BTreeSet<String>>,
     /// Peripheral name → (signal → allowed controller pools), DMAMUX fan-out
     /// already resolved. First occurrence of a peripheral name wins (dual-core
     /// parts list a peripheral under each core). Empty-pool signals are retained;
@@ -26,12 +26,14 @@ pub struct ChipDma {
 /// Parse the DMA model out of one chip's stm32-data JSON.
 pub fn extract(v: &Value) -> ChipDma {
     // Supply: controller channel counts + the DMAMUX → {controllers} fan-out.
-    let mut pools: BTreeMap<String, u32> = BTreeMap::new();
+    let mut pools: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut mux_to_ctrls: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for core in v["cores"].as_array().into_iter().flatten() {
         for ch in core["dma_channels"].as_array().into_iter().flatten() {
             if let Some(dma) = ch["dma"].as_str() {
-                *pools.entry(dma.to_string()).or_default() += 1;
+                if let Some(name) = ch["name"].as_str() {
+                    pools.entry(dma.to_string()).or_default().insert(name.to_string());
+                }
                 if let Some(mux) = ch["dmamux"].as_str() {
                     mux_to_ctrls.entry(mux.to_string()).or_default().insert(dma.to_string());
                 }

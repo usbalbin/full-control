@@ -41,10 +41,10 @@ fn main() {
     // can come from metapac or, for families metapac omits DMA for (STM32C5),
     // the chip JSON named via the optional 2nd arg.
     use std::collections::{BTreeMap, BTreeSet};
-    let mut pools: BTreeMap<String, u32> = BTreeMap::new();
+    let mut pools: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut mux_to_ctrls: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     for ch in m.dma_channels {
-        *pools.entry(ch.dma.to_string()).or_default() += 1;
+        pools.entry(ch.dma.to_string()).or_default().insert(ch.name.to_string());
         if let Some(mux) = ch.dmamux {
             mux_to_ctrls.entry(mux.to_string()).or_default().insert(ch.dma.to_string());
         }
@@ -174,10 +174,13 @@ fn main() {
     }
     out.push_str("    ],\n");
     out.push_str("    dma_pools: &[\n");
-    for (name, count) in &pools {
+    for (name, chans) in &pools {
+        let chan_names = chans.iter().map(|c| format!("{c:?}")).collect::<Vec<_>>().join(", ");
         out.push_str(&format!(
-            "        DmaPoolDef {{ name: {:?}, channels: {} }},\n",
-            name, count,
+            "        DmaPoolDef {{ name: {:?}, channels: {}, chans: &[{}] }},\n",
+            name,
+            chans.len(),
+            chan_names,
         ));
     }
     out.push_str("    ],\n");

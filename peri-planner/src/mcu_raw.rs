@@ -16,6 +16,11 @@ pub struct RawMcuData {
 pub struct DmaPoolDef {
     pub name: &'static str,
     pub channels: u8,
+    /// The controller's channel singleton names, e.g. `["DMA1_CH1", …]` (classic
+    /// DMA, 1-based) or `["GPDMA1_CH0", …]` / `["LPDMA1_CH0", …]` (GPDMA/LPDMA,
+    /// 0-based). Carried verbatim from metapac / stm32-data so firmware codegen
+    /// can name a concrete `peripherals::DMA1_CH3` rather than guess the base.
+    pub chans: &'static [&'static str],
 }
 
 pub struct RawPeripheral {
