@@ -11,7 +11,7 @@
 //! itself does not depend on embassy, so codegen is string generation, not
 //! compilation.
 
-use crate::pin_plan::{Placement, PinPlan};
+use crate::pin_plan::{FabricNode, Placement, PinPlan};
 
 /// Peripheral classes whose embassy singleton we bind as a `Board` field.
 /// Their pins are bound regardless; analog peripherals (COMP/OPAMP) get pin
@@ -28,6 +28,19 @@ fn class_of(instance: &str) -> &str {
 
 fn is_tier1_instance(instance: &str) -> bool {
     TIER1_INSTANCE_CLASSES.contains(&class_of(instance))
+}
+
+/// If a fabric-route endpoint is a standalone embassy peripheral singleton,
+/// its singleton name (`COMP1`, `DAC3`, `ADC1`, `TIM8`). Used to bundle pinless
+/// instances the design uses internally (an OCP comparator, a PCM threshold
+/// DAC) so the user still gets `p.COMP1`/`p.DAC3` for raw fabric config.
+/// `EEV`/`FLT`/`MASTER`/`HRTIM_TIM` are NOT standalone singletons — they live
+/// inside `HRTIM1`, which is already bundled via its channel pins.
+fn fabric_instance_singleton(node: &FabricNode) -> Option<String> {
+    match node.class.as_str() {
+        "COMP" | "DAC" | "ADC" | "TIM" => Some(format!("{}{}", node.class, node.instance)),
+        _ => None,
+    }
 }
 
 /// Sanitize a metapac name into a snake_case Rust identifier fragment.
@@ -78,6 +91,19 @@ pub fn generate_board(plan: &PinPlan) -> String {
         groups.entry(inst).or_default().push(p);
     }
 
+    // Pinless fabric-route endpoints that are real embassy singletons (an OCP
+    // comparator, a PCM threshold DAC) — the design uses them internally and
+    // the user needs the singleton for raw fabric config, even with no pin.
+    let mut fabric_only: Vec<String> = Vec::new();
+    for e in &plan.routes {
+        for node in [&e.from, &e.to] {
+            let Some(inst) = fabric_instance_singleton(node) else { continue };
+            if !order.contains(&inst.as_str()) && !fabric_only.contains(&inst) {
+                fabric_only.push(inst);
+            }
+        }
+    }
+
     let mut s = String::new();
     let _ = writeln!(
         s,
@@ -118,10 +144,23 @@ pub fn generate_board(plan: &PinPlan) -> String {
         let _ = writeln!(s);
     }
 
+    // Instance-only bundles for the pinless fabric endpoints.
+    for inst in &fabric_only {
+        let ty = type_name(inst);
+        let _ = writeln!(s, "/// Resources for {inst} — internal fabric instance (no pins on this design).");
+        let _ = writeln!(s, "pub struct {ty} {{");
+        let _ = writeln!(s, "    pub instance: peripherals::{inst},");
+        let _ = writeln!(s, "}}");
+        let _ = writeln!(s);
+    }
+
     // Board aggregates the per-peripheral bundles.
     let _ = writeln!(s, "/// Every peripheral this design uses, grouped into per-instance bundles.");
     let _ = writeln!(s, "pub struct Board {{");
     for inst in &order {
+        let _ = writeln!(s, "    pub {}: {},", ident(inst), type_name(inst));
+    }
+    for inst in &fabric_only {
         let _ = writeln!(s, "    pub {}: {},", ident(inst), type_name(inst));
     }
     let _ = writeln!(s, "}}");
@@ -143,6 +182,9 @@ pub fn generate_board(plan: &PinPlan) -> String {
             }
         }
         let _ = writeln!(s, "            {}: {} {{ {} }},", ident(inst), type_name(inst), parts.join(", "));
+    }
+    for inst in &fabric_only {
+        let _ = writeln!(s, "            {}: {} {{ instance: p.{inst} }},", ident(inst), type_name(inst));
     }
     let _ = writeln!(s, "        }}");
     let _ = writeln!(s, "    }}");
@@ -334,6 +376,41 @@ mod tests {
         assert!(code.contains("pub struct Board {"));
         // No behavioral VALUE ever leaks into the board layer.
         assert!(!code.contains("115_200,\n    pub usart1: peripherals"));
+    }
+
+    #[test]
+    fn c531_converter_bundles_pins_and_pinless_fabric_instances() {
+        // A real C531 buck leg lowered end-to-end: TIM1 CH1+CH1N pins materialized,
+        // ADC1 sense pin, and an OCP (COMP1->break, DAC1 threshold) that claims NO
+        // pins. The pinless COMP1/DAC1 must still appear as instance bundles.
+        use crate::c531_design::{C531Design, ConverterLeg, Ocp};
+        use crate::g474::{AdcInstance, CompId, DacId, TimId};
+        use crate::mcu::Package;
+
+        let mut d = C531Design::new();
+        d.add_leg(ConverterLeg {
+            tim: TimId::Tim1, channels_mask: 0b0001, complementary: true, dead_time: true, bkin: false,
+            ocp: Some(Ocp { comp: CompId::Comp1, break_input: 1, threshold_dac: Some(DacId::Dac1Ch1) }),
+            adc_sense: Some((AdcInstance::Adc1, 1)),
+        });
+        let plan = d.to_pin_plan(Package::C531R, Target { package: "C531R".into(), family: "C5".into() });
+        let code = generate(&plan);
+
+        // Pin-bearing bundles: TIM1 (HS/LS) + ADC1 sense, with instance fields.
+        assert!(code.contains("pub struct Tim1 {"));
+        assert!(code.contains("    pub instance: peripherals::TIM1,"));
+        assert!(code.contains("    pub ch1: peripherals::"));
+        assert!(code.contains("    pub ch1n: peripherals::"));
+        assert!(code.contains("pub struct Adc1 {"));
+
+        // Pinless fabric instances the OCP uses -> instance-only bundles.
+        assert!(code.contains("pub struct Comp1 {"));
+        assert!(code.contains("comp1: Comp1 { instance: p.COMP1 },"));
+        assert!(code.contains("pub struct Dac1 {"));
+        assert!(code.contains("dac1: Dac1 { instance: p.DAC1 },"));
+        // Behavior carries the PWM holes.
+        assert!(code.contains("pub tim1_freq_hz: u32,"));
+        assert!(code.contains("pub tim1_dead_time_ns: u16,"));
     }
 
     #[test]

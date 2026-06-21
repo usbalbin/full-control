@@ -427,6 +427,9 @@ All behind `serde(default)`, so filling them later won't reshape the type.
     with `Board::take(p)` destructuring embassy `Peripherals`. Instance field only
     for Tier-1 classes (USART/UART/LPUART/SPI/I2C/TIM/ADC/DAC/FDCAN/HRTIM); analog
     COMP/OPAMP bundle pins only. Unplaced signals → comment, never a bogus field.
+    Pinless fabric-route endpoints that are real singletons (an OCP comparator, a
+    PCM threshold DAC) get an **instance-only bundle** so the user still gets
+    `p.COMP1`/`p.DAC3` for raw fabric config.
   - **Behavior contract** (`write_behavior`): the §4 holes — `Behavior` struct +
     `Default`, one field per value the plan can't know (baud / freq / bitrate /
     PWM freq + dead-time), derived from each instance's class + role kinds.
