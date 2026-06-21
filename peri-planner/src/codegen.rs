@@ -441,6 +441,44 @@ mod tests {
     }
 
     #[test]
+    fn generated_board_references_only_real_singletons() {
+        // SOUNDNESS GUARD: every `peripherals::IDENT` the scaffold emits must be a
+        // real metapac entity in the descriptor — a peripheral instance, a GPIO
+        // pin, or a DMA channel. embassy's `Peripherals` mirrors the metapac
+        // peripheral list, so "real metapac name" == "compiles against embassy".
+        // Catches any future name synthesis (fabric instances, DMA channels) or
+        // data change that would emit a bogus singleton. Exercised on the richest
+        // family (G474 default: HRTIM/ADC/DAC/COMP + ADC-stream DMA).
+        use crate::pin_plan::{assign_dma, Target};
+        use std::collections::BTreeSet;
+
+        let desc = crate::mcu::Package::G474R.descriptor();
+        let mut plan = crate::requirements::Design::default()
+            .to_pin_plan(Target { package: "G474RE".into(), family: "G4".into() });
+        assign_dma(&mut plan, desc);
+        let code = generate(&plan);
+
+        // Every `peripherals::IDENT` referenced by the generated module.
+        let mut idents: BTreeSet<String> = BTreeSet::new();
+        for (i, _) in code.match_indices("peripherals::") {
+            let rest = &code[i + "peripherals::".len()..];
+            let id: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+            if !id.is_empty() {
+                idents.insert(id);
+            }
+        }
+        assert!(idents.len() > 5, "expected several peripheral singletons, got {idents:?}");
+
+        let peris: BTreeSet<&str> = desc.raw.peripherals.iter().map(|p| p.name).collect();
+        let pins: BTreeSet<String> = crate::mcu_pinout::af_rows(desc.raw).map(|r| r.pin.name()).collect();
+        let chans: BTreeSet<&str> = desc.dma_pools().iter().flat_map(|p| p.chans.iter().copied()).collect();
+        for id in &idents {
+            let ok = peris.contains(id.as_str()) || pins.contains(id) || chans.contains(id.as_str());
+            assert!(ok, "generated `peripherals::{id}` is not a real descriptor peripheral/pin/DMA channel");
+        }
+    }
+
+    #[test]
     fn class_of_strips_instance_digits() {
         assert_eq!(class_of("USART2"), "USART");
         assert_eq!(class_of("I2C1"), "I2C");
