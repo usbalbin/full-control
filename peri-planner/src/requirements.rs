@@ -2025,6 +2025,258 @@ impl Design {
         })
     }
 
+    /// Lower this (HRTIM-rich) G474 design into the unified
+    /// [`PinPlan`](crate::pin_plan::PinPlan). One-way / derived (see
+    /// `docs/firmware-codegen-design.md` §8).
+    ///
+    /// Placements reuse the existing [`assignment_signals`] extraction, then
+    /// resolve each signal to a pin (a `pin_assignments` lock → `Locked`, a
+    /// single package candidate → `Forced`, else first conflict-free →
+    /// `Solver`). The analog fabric — HRTIM PCM/DEM, COMP→TIM capture/break,
+    /// short-circuit fault, phase-shift coupling, ADC triggers — lowers to
+    /// pinless `routes` + HRTIM compare/capture `slot_claims`. Behavioral values
+    /// (phase-shift angle, dead-time ns, thresholds) are never stored — codegen
+    /// holes. The fake `phase_shift_q15` is dropped.
+    pub fn to_pin_plan(&self) -> crate::pin_plan::PinPlan {
+        use crate::c531_design::{comp_num, dac_inst_ch};
+        use crate::mcu_pinout::{af_rows, PinId};
+        use crate::pin_plan::{
+            EdgeKind, EevRole, FabricNode, Placement, PinOrigin, PinPlan, RoleKind, RouteEdge,
+            SlotClaim, SlotPurpose, Target,
+        };
+        use crate::pinout::{pins_for, signal_to_owned, Signal};
+        use std::collections::HashSet;
+
+        let variant = self.variant;
+        let package = crate::mcu::Package::from_g474_variant(variant);
+        let raw = package.raw();
+
+        // --- fabric node constructors (no captured state) ---
+        let comp_node = |c: CompId| FabricNode {
+            class: "COMP".into(), instance: comp_num(c), channel: None, event: None,
+        };
+        let dac_node = |d: DacId| {
+            let (i, ch) = dac_inst_ch(d);
+            FabricNode { class: "DAC".into(), instance: i, channel: Some(ch), event: None }
+        };
+        // EEV instance number is inlined (CrossbarSource has no `number()`); the
+        // raw Debug name is preserved in `event` for non-EEV sources too.
+        let eev_node = |e: CrossbarSource| {
+            let n = match e {
+                CrossbarSource::Eev1 => 1, CrossbarSource::Eev2 => 2, CrossbarSource::Eev3 => 3,
+                CrossbarSource::Eev4 => 4, CrossbarSource::Eev5 => 5, CrossbarSource::Eev6 => 6,
+                CrossbarSource::Eev7 => 7, CrossbarSource::Eev8 => 8, CrossbarSource::Eev9 => 9,
+                CrossbarSource::Eev10 => 10, _ => 0,
+            };
+            FabricNode { class: "EEV".into(), instance: n, channel: None, event: Some(format!("{e:?}")) }
+        };
+        let tim_node = |t: HrtimId| {
+            let n = match t {
+                HrtimId::TimA => 1, HrtimId::TimB => 2, HrtimId::TimC => 3,
+                HrtimId::TimD => 4, HrtimId::TimE => 5, HrtimId::TimF => 6,
+            };
+            FabricNode { class: "HRTIM_TIM".into(), instance: n, channel: None, event: None }
+        };
+
+        // --- per-signal constructor-shaping role_kind, from (assignment, signal) ---
+        let role_kind = |a: &Assignment, sig: Signal| -> RoleKind {
+            match sig {
+                Signal::TimCh(..) | Signal::TimChN(..) => {
+                    if let Assignment::Tim { complementary, etr, .. } = a {
+                        RoleKind::PwmOut { complementary: *complementary, dead_time: *complementary, etr: *etr }
+                    } else {
+                        RoleKind::PwmOut { complementary: false, dead_time: false, etr: false }
+                    }
+                }
+                Signal::HrtimChannel { .. } => {
+                    let complementary = matches!(a, Assignment::HrtimSub { outputs: OutputMode::Ch1AndCh2, .. });
+                    RoleKind::PwmOut { complementary, dead_time: true, etr: false }
+                }
+                Signal::TimBkin(..) | Signal::TimBkin2(..) | Signal::HrtimFlt(..) => RoleKind::FaultIn,
+                Signal::AdcIn { adc, channel } => {
+                    let purpose = if let Assignment::AdcConversion { purpose, .. } = a {
+                        format!("{purpose:?}")
+                    } else {
+                        String::new()
+                    };
+                    RoleKind::AdcInput { adc: format!("ADC{}", adc.number()), channel, purpose, sequencer_group: None }
+                }
+                Signal::OpampVinp(..) | Signal::OpampVinm(..) | Signal::OpampVout(..) => RoleKind::OpampIo,
+                Signal::SpiMosi(..) | Signal::SpiMiso(..) | Signal::SpiSck(..) | Signal::SpiNss(..) => {
+                    let nss = matches!(a, Assignment::Spi { needs_nss: true, .. });
+                    RoleKind::Comms { flow_control: false, synchronous: true, nss, smba: false }
+                }
+                Signal::I2cSda(..) | Signal::I2cScl(..) | Signal::I2cSmba(..) => {
+                    let smba = matches!(a, Assignment::I2c { needs_smba: true, .. });
+                    RoleKind::Comms { flow_control: false, synchronous: false, nss: false, smba }
+                }
+                Signal::UsartTx(..) | Signal::UsartRx(..) | Signal::UsartCts(..)
+                | Signal::UsartRts(..) | Signal::UsartCk(..) => {
+                    let (fc, sync) = if let Assignment::Usart { flow_control, synchronous, .. } = a {
+                        (*flow_control, *synchronous)
+                    } else {
+                        (false, false)
+                    };
+                    RoleKind::Comms { flow_control: fc, synchronous: sync, nss: false, smba: false }
+                }
+                Signal::UartTx(..) | Signal::UartRx(..) | Signal::UartCts(..) | Signal::UartRts(..)
+                | Signal::LpuartTx(..) | Signal::LpuartRx(..) | Signal::LpuartCts(..)
+                | Signal::LpuartRts(..) => {
+                    let fc = matches!(a,
+                        Assignment::Uart { flow_control: true, .. }
+                        | Assignment::Lpuart { flow_control: true, .. });
+                    RoleKind::Comms { flow_control: fc, synchronous: false, nss: false, smba: false }
+                }
+                // DacOut, CompIn*/Out, HrtimEev/Scin/Scout, Can, Usb, Ucpd, TimEtr.
+                _ => RoleKind::Gpio,
+            }
+        };
+
+        let mut plan = PinPlan::empty(Target { package: format!("{variant:?}"), family: "G4".into() });
+        // Seed taken-set with locked pins so Solver picks never collide with them.
+        let mut taken: HashSet<PinId> = self.pin_assignments.values().copied().collect();
+
+        // ---- LAYER 1: placements ----
+        for a in self.assignments.iter().flatten() {
+            for sig in assignment_signals(a) {
+                let Some(signal) = signal_to_owned(sig) else { continue };
+                let (pin, origin) = if let Some(p) = self.pin_assignments.get(&signal) {
+                    (Some(*p), PinOrigin::Locked)
+                } else {
+                    let cands: Vec<PinId> = pins_for(sig, variant)
+                        .into_iter()
+                        .map(|p| PinId { port: p.port, num: p.num })
+                        .collect();
+                    match cands.as_slice() {
+                        [] => (None, PinOrigin::Solver),
+                        [only] => (Some(*only), PinOrigin::Forced),
+                        many => {
+                            let c = many.iter().copied().find(|p| !taken.contains(p)).unwrap_or(many[0]);
+                            (Some(c), PinOrigin::Solver)
+                        }
+                    }
+                };
+                if let Some(p) = pin {
+                    taken.insert(p);
+                }
+                let af = pin.and_then(|p| {
+                    af_rows(raw)
+                        .find(|r| {
+                            r.pin == p
+                                && r.signal.peripheral == signal.peripheral
+                                && r.signal.role == signal.role
+                        })
+                        .and_then(|r| r.af)
+                });
+                plan.placements.push(Placement {
+                    signal, pin, origin, af, role_kind: role_kind(a, sig),
+                    dma: None, irqs: Vec::new(), package_pin: None, net: None,
+                });
+            }
+        }
+
+        // ---- LAYER 2: analog fabric routes + HRTIM slot claims ----
+        for a in self.assignments.iter().flatten() {
+            match a {
+                Assignment::ShortCircuitFault(f) => {
+                    plan.routes.push(RouteEdge {
+                        from: dac_node(f.dac), to: comp_node(f.comp), kind: EdgeKind::DacToComp, group: None,
+                    });
+                    let flt = match f.flt {
+                        HrtimFltId::Flt1 => 1, HrtimFltId::Flt2 => 2, HrtimFltId::Flt3 => 3,
+                        HrtimFltId::Flt4 => 4, HrtimFltId::Flt5 => 5, HrtimFltId::Flt6 => 6,
+                    };
+                    plan.routes.push(RouteEdge {
+                        from: comp_node(f.comp),
+                        to: FabricNode { class: "FLT".into(), instance: flt, channel: None, event: None },
+                        kind: EdgeKind::CompToFlt, group: None,
+                    });
+                }
+                Assignment::Tim { instance, capture_comp, bkin_comp, .. } => {
+                    let tim = FabricNode {
+                        class: "TIM".into(), instance: instance.number(), channel: None, event: None,
+                    };
+                    // The leg model doesn't record which capture channel / break input;
+                    // codegen treats 0/1 as "unspecified" and resolves at config time.
+                    if let Some(c) = capture_comp {
+                        plan.routes.push(RouteEdge {
+                            from: comp_node(*c), to: tim.clone(),
+                            kind: EdgeKind::CompToTimCapture { channel: 0 }, group: None,
+                        });
+                    }
+                    if let Some(c) = bkin_comp {
+                        plan.routes.push(RouteEdge {
+                            from: comp_node(*c), to: tim,
+                            kind: EdgeKind::CompToTimBreak { break_input: 1 }, group: None,
+                        });
+                    }
+                }
+                Assignment::HrtimSub { sub_timer, resolved, .. } => {
+                    let t = *sub_timer;
+                    let tname = format!("{t:?}");
+                    match resolved {
+                        HrtimResolved::PcmInternal { dac, comp, eev, zcd_eev, dem } => {
+                            plan.routes.push(RouteEdge { from: dac_node(*dac), to: comp_node(*comp), kind: EdgeKind::DacToComp, group: None });
+                            plan.routes.push(RouteEdge { from: comp_node(*comp), to: eev_node(*eev), kind: EdgeKind::CompToEev { role: EevRole::Peak }, group: None });
+                            plan.routes.push(RouteEdge { from: eev_node(*eev), to: tim_node(t), kind: EdgeKind::EevToHrtimTimer, group: None });
+                            plan.slot_claims.push(SlotClaim { timer: tname.clone(), slot: "Cr2".into(), purpose: SlotPurpose::PcmStep, group: None });
+                            if let Some(z) = zcd_eev {
+                                plan.routes.push(RouteEdge { from: comp_node(*comp), to: eev_node(*z), kind: EdgeKind::CompToEev { role: EevRole::ZeroCrossDetect }, group: None });
+                                plan.routes.push(RouteEdge { from: eev_node(*z), to: tim_node(t), kind: EdgeKind::EevToHrtimTimer, group: None });
+                            }
+                            if *dem {
+                                plan.slot_claims.push(SlotClaim { timer: tname.clone(), slot: "Cr4".into(), purpose: SlotPurpose::DemCompare, group: None });
+                                plan.slot_claims.push(SlotClaim { timer: tname.clone(), slot: "Cpt2".into(), purpose: SlotPurpose::DemCapture, group: None });
+                            }
+                        }
+                        HrtimResolved::PcmExternal { peak_eev, zcd_eev, dem, .. } => {
+                            plan.routes.push(RouteEdge { from: eev_node(*peak_eev), to: tim_node(t), kind: EdgeKind::EevToHrtimTimer, group: None });
+                            if let Some(z) = zcd_eev {
+                                plan.routes.push(RouteEdge { from: eev_node(*z), to: tim_node(t), kind: EdgeKind::EevToHrtimTimer, group: None });
+                            }
+                            if *dem {
+                                plan.slot_claims.push(SlotClaim { timer: tname.clone(), slot: "Cr4".into(), purpose: SlotPurpose::DemCompare, group: None });
+                                plan.slot_claims.push(SlotClaim { timer: tname.clone(), slot: "Cpt2".into(), purpose: SlotPurpose::DemCapture, group: None });
+                            }
+                        }
+                        HrtimResolved::PhaseShift { peer, .. } => {
+                            plan.routes.push(RouteEdge { from: tim_node(t), to: tim_node(*peer), kind: EdgeKind::HrtimPhaseShiftPeer, group: None });
+                        }
+                        HrtimResolved::VoltageModePwm | HrtimResolved::External => {}
+                    }
+                }
+                Assignment::AdcSequencer { adc, kind, trigger, trig_slot } => {
+                    if let (TriggerSource::Event(ev), Some(slot)) = (trigger, trig_slot) {
+                        let ev_name = format!("{ev:?}");
+                        let class = if ev_name.starts_with("Eev") {
+                            "EEV"
+                        } else if ev_name.starts_with('M') {
+                            "MASTER"
+                        } else {
+                            "HRTIM_TIM"
+                        };
+                        let trig = match slot {
+                            AdcTriggerId::Trig1 => 1, AdcTriggerId::Trig2 => 2, AdcTriggerId::Trig3 => 3,
+                            AdcTriggerId::Trig4 => 4, AdcTriggerId::Trig5 => 5, AdcTriggerId::Trig6 => 6,
+                            AdcTriggerId::Trig7 => 7, AdcTriggerId::Trig8 => 8, AdcTriggerId::Trig9 => 9,
+                            AdcTriggerId::Trig10 => 10,
+                        };
+                        plan.routes.push(RouteEdge {
+                            from: FabricNode { class: class.into(), instance: 0, channel: None, event: Some(ev_name) },
+                            to: FabricNode { class: "ADC".into(), instance: adc.number(), channel: None, event: None },
+                            kind: EdgeKind::EventToAdcTrigger { trig_slot: trig, sequencer_kind: format!("{kind:?}") },
+                            group: None,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        plan.sort_placements();
+        plan
+    }
+
     pub fn used_signals(&self) -> Vec<crate::pinout::Signal> {
         self.assignments
             .iter()
@@ -2237,6 +2489,47 @@ impl Design {
 mod tests {
     use super::*;
     use crate::pinout::Signal;
+
+    /// Lowering the canonical `Design::default()` (4 PCM-internal sub-timers +
+    /// short-circuit fault + share-bus drive + Mcr1-triggered dual-regular ADC
+    /// sequencer + 3 conversions) into the unified PinPlan must produce the
+    /// expected analog-fabric edges, PCM compare-slot claims, and pin-bearing
+    /// placements — exercising the G474 routes layer end to end.
+    #[test]
+    fn to_pin_plan_lowers_default_g474_fabric() {
+        use crate::pin_plan::{EdgeKind, EevRole, RoleKind, SlotPurpose};
+        let plan = Design::default().to_pin_plan();
+
+        assert_eq!(plan.target.family, "G4");
+        assert!(plan.target.package.starts_with("G474"), "got {}", plan.target.package);
+
+        // At least one HRTIM PWM output placed on a real pin.
+        assert!(plan.placements.iter().any(|p| {
+            matches!(p.role_kind, RoleKind::PwmOut { .. }) && p.pin.is_some()
+        }), "expected a placed PWM output");
+        // The 3 ADC conversions lower to AdcInput placements.
+        assert!(
+            plan.placements.iter().filter(|p| matches!(p.role_kind, RoleKind::AdcInput { .. })).count() >= 3,
+            "expected >=3 ADC input placements"
+        );
+
+        // PCM-internal fabric: DAC->COMP, COMP->EEV(peak), EEV->sub-timer.
+        let has = |k: &dyn Fn(&EdgeKind) -> bool| plan.routes.iter().any(|r| k(&r.kind));
+        assert!(has(&|k| matches!(k, EdgeKind::DacToComp)), "DacToComp edge");
+        assert!(has(&|k| matches!(k, EdgeKind::CompToEev { role: EevRole::Peak })), "CompToEev(peak) edge");
+        assert!(has(&|k| matches!(k, EdgeKind::EevToHrtimTimer)), "EevToHrtimTimer edge");
+        // Short-circuit fault: COMP->FLT.
+        assert!(has(&|k| matches!(k, EdgeKind::CompToFlt)), "CompToFlt edge");
+        // Mcr1-triggered sequencer: COMP/MASTER event -> ADC trigger.
+        assert!(has(&|k| matches!(k, EdgeKind::EventToAdcTrigger { .. })), "EventToAdcTrigger edge");
+
+        // PCM step compare slot (Cr2) claimed; no DEM slots (default dem = false).
+        assert!(plan.slot_claims.iter().any(|s| matches!(s.purpose, SlotPurpose::PcmStep)), "PcmStep slot");
+        assert!(!plan.slot_claims.iter().any(|s| matches!(s.purpose, SlotPurpose::DemCompare)), "no DEM slots by default");
+
+        // EevToHrtimTimer is slot-less (the red-team fix): no compare register welded onto the edge.
+        // (Compare slots live in slot_claims; verified above.)
+    }
 
     /// Golden: the canonical `Design::default()` analog-fabric allocation, pinned
     /// EXACTLY. This is the Inc-9 safety net — any change to G474 routing (notably
