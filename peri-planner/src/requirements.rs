@@ -2238,6 +2238,47 @@ mod tests {
     use super::*;
     use crate::pinout::Signal;
 
+    /// Golden: the canonical `Design::default()` analog-fabric allocation, pinned
+    /// EXACTLY. This is the Inc-9 safety net — any change to G474 routing (notably
+    /// data-driving the `g474.rs` query fns from `G4_FABRIC`) must reproduce these
+    /// byte-identically. Selections follow the DAC→COMP→EEV / COMP→FLT fabric in
+    /// CLAUDE.md (e.g. DAC3CH1→COMP1→EEV4). If `normalize`'s greedy candidate
+    /// order changes, this test's expected values must be re-pinned deliberately.
+    #[test]
+    fn golden_default_design_fabric_allocation() {
+        let d = Design::default();
+
+        let phases: Vec<String> = d
+            .phases()
+            .iter()
+            .map(|p| format!("{:?}|{:?}|{:?}", p.dac, p.comp, p.eev))
+            .collect();
+        assert_eq!(
+            phases,
+            [
+                "Dac3Ch1|Comp1|Eev4",
+                "Dac3Ch2|Comp2|Eev1",
+                "Dac4Ch1|Comp5|Eev9",
+                "Dac4Ch2|Comp6|Eev3",
+            ],
+            "PCM phase (dac|comp|eev) selections drifted",
+        );
+
+        let fault = d.assignments.iter().flatten().find_map(|a| match a {
+            Assignment::ShortCircuitFault(f) => {
+                Some(format!("{:?}|{:?}|{:?}", f.dac, f.comp, f.flt))
+            }
+            _ => None,
+        });
+        assert_eq!(fault.as_deref(), Some("Dac1Ch1|Comp3|Flt5"), "fault route drifted");
+
+        let drive = d.assignments.iter().flatten().find_map(|a| match a {
+            Assignment::ShareBusDrive(dr) => Some(format!("{:?}", dr.dac)),
+            _ => None,
+        });
+        assert_eq!(drive.as_deref(), Some("Dac1Ch2"), "share-bus drive DAC drifted");
+    }
+
     #[test]
     fn opamp_allocates_and_claims_signals() {
         let mut d = Design {
