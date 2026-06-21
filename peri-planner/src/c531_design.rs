@@ -257,6 +257,136 @@ impl C531Design {
         self.validate(package).is_empty()
     }
 
+    /// Lower this converter plan into the unified
+    /// [`PinPlan`](crate::pin_plan::PinPlan). One-way / derived (see
+    /// `docs/firmware-codegen-design.md` §8).
+    ///
+    /// Unlike H5/C5A3, this model stores **no pins** — they are derived on
+    /// demand. The lowerer therefore *materializes* one pin per signal,
+    /// conflict-avoiding across the whole plan, and stores it **by value**
+    /// (never a `pins_for_pkg` candidate index — data order can shift on
+    /// regeneration). The OCP path (`leg.ocp`) is internal silicon routing that
+    /// claims no pin, so it lowers to pinless fabric `routes`
+    /// (`CompToTimBreak`, plus `DacToComp` for the threshold).
+    ///
+    /// Known unlowered gaps (the leg model can't express them): `TimEtr`,
+    /// `TimBkin2`. Dead-time is structural (`PwmOut.dead_time`); the ns is a
+    /// codegen hole.
+    pub fn to_pin_plan(
+        &self,
+        package: Package,
+        target: crate::pin_plan::Target,
+    ) -> crate::pin_plan::PinPlan {
+        use crate::mcu_pinout::{af_rows, PinId};
+        use crate::pin_plan::{
+            EdgeKind, FabricNode, Placement, PinOrigin, PinPlan, RoleKind, RouteEdge,
+        };
+        use crate::pinout::{pins_for_pkg, signal_to_owned, Signal};
+        use std::collections::HashSet;
+
+        let raw = package.raw();
+
+        // Materialize one pin for a typed signal: pick the first conflict-free
+        // candidate (single candidate => Forced, else Solver), store BY VALUE.
+        type Materialized = (crate::mcu_pinout::OwnedSignal, Option<PinId>, PinOrigin, Option<u8>);
+        let materialize = |signal: Signal, taken: &mut HashSet<PinId>| -> Option<Materialized> {
+            let owned = signal_to_owned(signal)?;
+            let cands: Vec<PinId> = pins_for_pkg(signal, package)
+                .into_iter()
+                .map(|p| PinId { port: p.port, num: p.num })
+                .collect();
+            let (pin, origin) = match cands.as_slice() {
+                [] => (None, PinOrigin::Solver), // unreachable on this package
+                [only] => (Some(*only), PinOrigin::Forced),
+                many => {
+                    let chosen = many.iter().copied().find(|p| !taken.contains(p)).unwrap_or(many[0]);
+                    (Some(chosen), PinOrigin::Solver)
+                }
+            };
+            if let Some(p) = pin {
+                taken.insert(p);
+            }
+            let af = pin.and_then(|p| {
+                af_rows(raw)
+                    .find(|r| {
+                        r.pin == p
+                            && r.signal.peripheral == owned.peripheral
+                            && r.signal.role == owned.role
+                    })
+                    .and_then(|r| r.af)
+            });
+            Some((owned, pin, origin, af))
+        };
+
+        let mut plan = PinPlan::empty(target);
+        let mut taken: HashSet<PinId> = HashSet::new();
+
+        for (i, leg) in self.legs.iter().enumerate() {
+            let group = Some(i as u32);
+
+            // Pin-bearing signals: PWM channels (+ complementary) and the
+            // external break-input pin when `bkin`.
+            for sig in leg.signals() {
+                let Some((signal, pin, origin, af)) = materialize(sig, &mut taken) else { continue };
+                let role_kind = match sig {
+                    Signal::TimCh(..) | Signal::TimChN(..) => RoleKind::PwmOut {
+                        complementary: leg.complementary,
+                        dead_time: leg.dead_time,
+                        etr: false,
+                    },
+                    Signal::TimBkin(..) => RoleKind::FaultIn,
+                    _ => RoleKind::Gpio,
+                };
+                plan.placements.push(Placement {
+                    signal, pin, origin, af, role_kind,
+                    dma: None, irqs: Vec::new(), package_pin: None, net: None,
+                });
+            }
+
+            // ADC sense: `signals()` drops it, so synthesize the AdcIn signal.
+            if let Some((adc, channel)) = leg.adc_sense {
+                let sig = Signal::AdcIn { adc, channel };
+                if let Some((signal, pin, origin, af)) = materialize(sig, &mut taken) {
+                    let adc_name = signal.peripheral.clone();
+                    plan.placements.push(Placement {
+                        signal, pin, origin, af,
+                        role_kind: RoleKind::AdcInput {
+                            adc: adc_name, channel, purpose: "sense".into(), sequencer_group: None,
+                        },
+                        dma: None, irqs: Vec::new(), package_pin: None, net: None,
+                    });
+                }
+            }
+
+            // OCP: internal silicon route, no pins. COMP -> timer break input,
+            // plus DAC -> COMP when a threshold DAC is set.
+            if let Some(ocp) = &leg.ocp {
+                let comp = FabricNode {
+                    class: "COMP".into(), instance: comp_num(ocp.comp), channel: None, event: None,
+                };
+                let tim = FabricNode {
+                    class: "TIM".into(), instance: leg.tim.number(), channel: None, event: None,
+                };
+                plan.routes.push(RouteEdge {
+                    from: comp.clone(), to: tim,
+                    kind: EdgeKind::CompToTimBreak { break_input: ocp.break_input }, group,
+                });
+                if let Some(dac) = ocp.threshold_dac {
+                    let (di, dc) = dac_inst_ch(dac);
+                    plan.routes.push(RouteEdge {
+                        from: FabricNode {
+                            class: "DAC".into(), instance: di, channel: Some(dc), event: None,
+                        },
+                        to: comp, kind: EdgeKind::DacToComp, group,
+                    });
+                }
+            }
+        }
+
+        plan.sort_placements();
+        plan
+    }
+
     /// A copy-paste converter-plan summary for `part_name`.
     pub fn export_summary(&self, part_name: &str) -> String {
         use std::fmt::Write as _;
@@ -324,6 +454,56 @@ mod tests {
             .find(|(s, _)| matches!(s, Signal::TimCh(TimId::Tim1, TimCh::Ch1)))
             .expect("CH1 signal present");
         assert!(!ch1.1.is_empty(), "TIM1 CH1 should resolve to a C531 pin");
+    }
+
+    #[test]
+    fn to_pin_plan_materializes_pins_and_lifts_ocp_to_routes() {
+        use crate::pin_plan::{EdgeKind, PinOrigin, RoleKind, Target};
+        let mut d = C531Design::new();
+        d.add_leg(ConverterLeg {
+            tim: TimId::Tim1,
+            channels_mask: 0b0001,
+            complementary: true,
+            dead_time: true,
+            bkin: false,
+            ocp: Some(Ocp { comp: CompId::Comp1, break_input: 1, threshold_dac: Some(DacId::Dac1Ch1) }),
+            adc_sense: Some((AdcInstance::Adc1, 1)),
+        });
+
+        let plan = d.to_pin_plan(
+            Package::C531R,
+            Target { package: "C531R".into(), family: "C5".into() },
+        );
+
+        // HS (CH1) and LS (CH1N) both materialized to DISTINCT real pins.
+        let ch1 = plan.placements.iter().find(|p| p.signal.role == "CH1").expect("CH1");
+        let ch1n = plan.placements.iter().find(|p| p.signal.role == "CH1N").expect("CH1N");
+        assert!(ch1.pin.is_some() && ch1n.pin.is_some());
+        assert_ne!(ch1.pin, ch1n.pin, "HS and LS must land on distinct pins");
+        assert!(matches!(
+            ch1.role_kind,
+            RoleKind::PwmOut { complementary: true, dead_time: true, etr: false }
+        ));
+        assert!(matches!(ch1.origin, PinOrigin::Solver | PinOrigin::Forced));
+        // (af is looked up but data-dependent — C5 descriptor data carries no AF
+        // number for timer channels; the H523 test covers the af-present path.)
+
+        // ADC sense materialized; analog pin so af is None; AdcInput role.
+        let sense = plan
+            .placements
+            .iter()
+            .find(|p| matches!(p.role_kind, RoleKind::AdcInput { .. }))
+            .expect("adc sense placement");
+        assert!(sense.pin.is_some());
+        assert_eq!(sense.af, None, "an ADC input is a dedicated analog pin");
+
+        // OCP lowers to pinless fabric routes: COMP1 -> TIM1 break, DAC1 -> COMP1.
+        assert!(plan.routes.iter().any(|r| matches!(r.kind, EdgeKind::CompToTimBreak { break_input: 1 })
+            && r.from.class == "COMP" && r.from.instance == 1
+            && r.to.class == "TIM" && r.to.instance == 1));
+        assert!(plan.routes.iter().any(|r| matches!(r.kind, EdgeKind::DacToComp)
+            && r.from.class == "DAC" && r.to.class == "COMP" && r.to.instance == 1));
+        assert_eq!(plan.target.family, "C5");
     }
 
     #[test]
