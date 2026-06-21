@@ -393,5 +393,55 @@ fixed above:
    want a shared format/parse module + golden round-trip test pinned to
    `crossbar_from_name`.
 
+### 8.6 Implementation status (2026-06-21)
+
+**Type + all three lowerers built and tested** (`src/pin_plan.rs` + a one-way
+`to_pin_plan` on each family model; never edited back). `target.family` shipped as
+an open `String`, not a closed enum, per the scalability requirement. 111 lib tests
+green, clippy unchanged (0 net-new), native + wasm clean.
+
+- **`H523Design::to_pin_plan`** — the *generic* lowerer (touches nothing
+  family-specific): locks → placed `Placement`s, declared-but-unplaced uses →
+  `pin: None`, empty fabric. Serves H5, C5A3, and any future descriptor-only family
+  unchanged.
+- **`C531Design::to_pin_plan`** — *materializes* pins (the model stores none),
+  conflict-avoiding, stored **by value**; `ocp` → pinless `CompToTimBreak`
+  (+ `DacToComp`).
+- **`Design::to_pin_plan`** (G474) — reuses `assignment_signals()` for placements;
+  full HRTIM/fault/phase-shift/ADC-trigger fabric → `routes` + `slot_claims`;
+  `EevToHrtimTimer` slot-less (the red-team fix), compare registers in `slot_claims`.
+
+**Deferred (documented in code):** `AdcConversion → AdcSequencer` group linking
+(`sequencer_group: None` for now — needs the parallel `requirements`/`ids` walk);
+G474 capture-channel / break-input specifics and C531 `ETR`/`BKIN2` (the leg model
+doesn't record them); `dma`/`irqs`/`package_pin`/`net` have homes but no producer.
+All behind `serde(default)`, so filling them later won't reshape the type.
+
+**Dispatch + Tier-1 codegen built (2026-06-21):**
+- `Project::to_pin_plan` — the single dispatch point; picks the per-family lowerer
+  by active MCU and builds one consistent `Target` (family = open string). (G474's
+  lowerer was refactored to take a `Target` too, for uniformity.)
+- `src/codegen.rs` `generate(&PinPlan) -> String` — the Tier-1 firmware scaffold:
+  - **Board layer** (`generate_board`): a `Board` struct naming every peripheral
+    instance + pin, destructured from embassy `Peripherals` via `Board::take(p)`.
+    Pure structural. Instance fields only for Tier-1 classes (USART/UART/LPUART/
+    SPI/I2C/TIM/ADC/DAC/FDCAN/HRTIM); analog COMP/OPAMP bind pins only. Unplaced
+    signals → comment, never a bogus field.
+  - **Behavior contract** (`write_behavior`): the §4 holes — `Behavior` struct +
+    `Default`, one field per value the plan can't know (baud / freq / bitrate /
+    PWM freq + dead-time), derived from each instance's class + role kinds.
+  - Wired to a **"Gen firmware"** button (copies the scaffold to clipboard).
+  - Verified on the real default-G474 design (HRTIM channel/fault pins, ADC/DAC
+    instances, `Behavior{hrtim1_freq_hz, hrtim1_dead_time_ns}`).
+
+**Next (frontier — diminishing confidence without a compile target):** driver
+*constructor* emission (`SimplePwm::new` / `Uart::new` / …). The exact embassy
+constructor shapes are version-sensitive and peri-planner has no embassy dependency
+to compile against, so this is best developed in the firmware crate (`hard-rt`)
+where it builds. Also blocked on the deferred `dma`/`irqs` producers (async
+constructors + `bind_interrupts!` need them). The Board (named resources) +
+`Behavior` (the holes) deliberately do the mechanical, error-prone part and leave
+idiomatic driver construction to the expert.
+
 Related: [[project-peri-planner]], [[project-save-compat-not-required]],
 [[user-role]].
