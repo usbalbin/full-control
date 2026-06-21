@@ -14,25 +14,32 @@
 //! instance would itself be an unsound false negative. It stays SOUND (an
 //! `Allocated` witness is always a real, conflict-free allocation).
 //!
-//! DMA channels are still grabbed greedily within an instance's *allowed pools*.
-//! That is complete whenever those pools are interchangeable — true for every
-//! in-scope family (G4 DMAMUX fans every request to {DMA1,DMA2}; C5 LPDMA legs
-//! reach both controllers). A chip whose instances reach *disjoint* controllers
-//! would need channel-distribution backtracking too; none in scope does, so it's
-//! a documented residual rather than a live gap.
+//! Increment 6 adds PIN contention: a placed instance also claims a physical pin
+//! (`Res::Pin`) for each of its required signals (SERIAL → TX/RX, SPI →
+//! SCK/MOSI/MISO, I2C → SCL/SDA, UCPD → CC1/CC2; ADC is analog and claims none),
+//! so two peripherals can't be routed to the same pad. Instance choice stays
+//! fully backtracked (complete); pins, like DMA channels, are grabbed greedily
+//! per role — which catches every FORCED collision (a single-candidate pin
+//! already taken) and pin exhaustion, but can be pessimistic (never optimistic)
+//! when a role has several candidate pads and a different choice would have fit.
+//! That one-sided error keeps the selector sound; full pin-choice backtracking is
+//! a later refinement. Classes outside the modeled kinds get no pin contention.
 
 use crate::mcu::McuDescriptor;
+use crate::mcu_pinout::{pins_for, PinId, SignalId};
 
 use super::engine::Ledger;
 use super::requirement::{ReqKind, Requirement};
 use super::tokens::{Class, Res};
 
-/// One satisfied requirement: the instance it took and the DMA channels it holds.
+/// One satisfied requirement: the instance, the pins, and the DMA channels it holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Placed {
     pub req_id: u32,
     pub class: Class,
     pub instance: u8,
+    /// `(role, pin)` pairs claimed for this use's required signals.
+    pub pins: Vec<(&'static str, PinId)>,
     /// `(controller pool, channel)` pairs claimed for this use.
     pub dma: Vec<(&'static str, u8)>,
 }
@@ -89,28 +96,82 @@ fn free_channels(led: &Ledger, desc: &McuDescriptor, class: Class, i: u8) -> u8 
         .sum()
 }
 
-/// Whether instance `(class, i)` can host a use needing `dma` channels right now:
-/// the instance is free and enough channels remain in its pools.
-fn can_place(led: &Ledger, desc: &McuDescriptor, class: Class, i: u8, dma: u8) -> bool {
-    !led.held().contains(&Res::Inst(class, i))
-        && (dma == 0 || free_channels(led, desc, class, i) >= dma)
+/// The GPIO signal roles an instance of `class` must place on pins (its minimal
+/// functional config). Empty for analog (ADC) and for classes outside the
+/// modeled kinds — those get no pin contention.
+fn required_roles(class: Class) -> Vec<&'static str> {
+    match crate::select::kind_of(class) {
+        Some(kind) => crate::select::required_signals(kind, &[]),
+        None => Vec::new(),
+    }
 }
 
-/// What a successful [`commit`] claimed: the tokens (to release on backtrack)
-/// and the `(pool, channel)` DMA witness.
-type Committed = (Vec<Res>, Vec<(&'static str, u8)>);
+/// The descriptor's `&'static` peripheral name for `(class, i)` (e.g. "USART2"),
+/// needed to key `SignalId` for pin lookup. `None` if not on the chip.
+fn static_inst_name(desc: &McuDescriptor, class: Class, i: u8) -> Option<&'static str> {
+    let target = format!("{class}{i}");
+    desc.raw.peripherals.iter().find(|p| p.name == target).map(|p| p.name)
+}
+
+/// Whether instance `(class, i)` can host a use needing `dma` channels right now:
+/// the instance is free, enough DMA channels remain, and each required role has
+/// at least one free candidate pin (a necessary check for MRV ordering; `commit`
+/// enforces the full per-role distinctness).
+fn can_place(led: &Ledger, desc: &McuDescriptor, class: Class, i: u8, dma: u8) -> bool {
+    if led.held().contains(&Res::Inst(class, i)) {
+        return false;
+    }
+    if dma > 0 && free_channels(led, desc, class, i) < dma {
+        return false;
+    }
+    let Some(pname) = static_inst_name(desc, class, i) else {
+        return true; // not on the chip via name lookup — instance check above suffices
+    };
+    required_roles(class).into_iter().all(|role| {
+        pins_for(desc.raw, SignalId { peripheral: pname, role })
+            .iter()
+            .any(|p| !led.held().contains(&Res::Pin(*p)))
+    })
+}
+
+/// What a successful [`commit`] claimed.
+struct Commit {
+    /// Every token claimed (to release on backtrack): `Inst` + `Pin`s + `Pool`s.
+    tokens: Vec<Res>,
+    /// `(role, pin)` witness for the placed signals.
+    pins: Vec<(&'static str, PinId)>,
+    /// `(pool, channel)` witness for the placed DMA channels.
+    dma: Vec<(&'static str, u8)>,
+}
 
 /// Commit instance `(class, i)` with `dma` channels into `led`: claim the `Inst`
-/// token + `dma` lowest-free `Pool` tokens from its allowed pools. Returns the
-/// claimed tokens (to release on backtrack) + the `(pool, channel)` witness, or
-/// `None` if it no longer fits.
-fn commit(led: &mut Ledger, desc: &McuDescriptor, class: Class, i: u8, dma: u8) -> Option<Committed> {
+/// token, one free `Pin` token per required role, and `dma` lowest-free `Pool`
+/// tokens. Returns the [`Commit`] (whose `tokens` are released on backtrack), or
+/// `None` if any required pin / channel can't be supplied.
+fn commit(led: &mut Ledger, desc: &McuDescriptor, class: Class, i: u8, dma: u8) -> Option<Commit> {
     let inst = Res::Inst(class, i);
     if led.held().contains(&inst) {
         return None;
     }
-    let mut claim = vec![inst];
-    let mut chans = Vec::new();
+    let mut tokens = vec![inst];
+    // Pins: one free, distinct pad per required role.
+    let mut pins = Vec::new();
+    if let Some(pname) = static_inst_name(desc, class, i) {
+        for role in required_roles(class) {
+            let pin = pins_for(desc.raw, SignalId { peripheral: pname, role })
+                .into_iter()
+                .find(|p| !led.held().contains(&Res::Pin(*p)) && !tokens.contains(&Res::Pin(*p)));
+            match pin {
+                Some(p) => {
+                    tokens.push(Res::Pin(p));
+                    pins.push((role, p));
+                }
+                None => return None, // a required role has no free pad
+            }
+        }
+    }
+    // DMA: `dma` lowest-free channels from the instance's (interchangeable) pools.
+    let mut dma_w = Vec::new();
     let mut taken = 0u8;
     'pools: for (pool, cap) in allowed_pools(desc, class, i) {
         for ch in 0..cap {
@@ -118,9 +179,9 @@ fn commit(led: &mut Ledger, desc: &McuDescriptor, class: Class, i: u8, dma: u8) 
                 break 'pools;
             }
             let tok = Res::Pool(pool, ch);
-            if !led.held().contains(&tok) && !claim.contains(&tok) {
-                claim.push(tok);
-                chans.push((pool, ch));
+            if !led.held().contains(&tok) && !tokens.contains(&tok) {
+                tokens.push(tok);
+                dma_w.push((pool, ch));
                 taken += 1;
             }
         }
@@ -128,8 +189,8 @@ fn commit(led: &mut Ledger, desc: &McuDescriptor, class: Class, i: u8, dma: u8) 
     if taken < dma {
         return None;
     }
-    led.claim(&claim).ok()?;
-    Some((claim, chans))
+    led.claim(&tokens).ok()?;
+    Some(Commit { tokens, pins, dma: dma_w })
 }
 
 /// A requirement reduced to the instances it may use on this chip.
@@ -161,13 +222,19 @@ fn backtrack(
         return true; // every item placed
     };
     for &i in &it.insts {
-        if let Some((claim, chans)) = commit(led, desc, it.class, i, it.dma) {
-            witness.push(Placed { req_id: it.id, class: it.class, instance: i, dma: chans });
+        if let Some(c) = commit(led, desc, it.class, i, it.dma) {
+            witness.push(Placed {
+                req_id: it.id,
+                class: it.class,
+                instance: i,
+                pins: c.pins,
+                dma: c.dma,
+            });
             if backtrack(desc, items, led, witness) {
                 return true;
             }
             witness.pop();
-            led.release(&claim);
+            led.release(&c.tokens);
         }
     }
     false
@@ -347,5 +414,23 @@ mod tests {
             feasible(d, &[Requirement::use_peripheral_pinned(0, "USART", 0, bogus)]),
             Outcome::Infeasible { unmet } if unmet == vec![0],
         ));
+    }
+
+    #[test]
+    fn placed_uses_claim_distinct_pins_per_required_role() {
+        let d = g474();
+        // Two SPI uses: each places SCK/MOSI/MISO (3 pads). All 6 must be distinct
+        // — the pin-contention invariant (no two peripherals on the same pad).
+        let reqs = vec![req(0, "SPI", 0), req(1, "SPI", 0)];
+        match feasible(d, &reqs) {
+            Outcome::Allocated(p) => {
+                assert!(p.iter().all(|x| x.pins.len() == 3), "SPI claims SCK/MOSI/MISO");
+                let all: Vec<_> = p.iter().flat_map(|x| x.pins.iter().map(|(_, pin)| *pin)).collect();
+                let uniq: std::collections::BTreeSet<_> = all.iter().copied().collect();
+                assert_eq!(all.len(), 6);
+                assert_eq!(uniq.len(), 6, "no two placed uses may share a pad");
+            }
+            o => panic!("expected SPI allocation with distinct pins, got {o:?}"),
+        }
     }
 }
