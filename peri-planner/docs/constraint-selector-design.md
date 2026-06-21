@@ -1,13 +1,40 @@
 # peri-planner → Constraint-Based MCU Selector — Design
 
-> Status: **design, pre-implementation.** Produced by a multi-agent design workflow
-> (judge-panel of 3 architectures → synthesis → adversarial red-team), then
-> reconciled. Nothing here is built yet. The goal: user states high-level
+> Status: **BUILT — re-baselined 2026-06-21** (was: design, pre-implementation).
+> The kernel this doc designed is shipped. The goal — user states high-level
 > constraints (">=2 USART each with DMA RX+TX, >=1 ADC with DMA, hardware OCP via
 > COMP→timer-break") and the tool returns the parts that satisfy them *with a
-> feasible allocation*.
+> feasible allocation* — is realized in `src/constraint.rs` (the generic kernel),
+> `src/select.rs` (the descriptor→`Candidate` adapter + two-tier evaluation), and
+> `src/catalog_view.rs` (the Part-finder requirements panel + 3-state verdicts).
+> §1–§5 below describe the **as-built** architecture; §6 (the increment ladder) is
+> annotated with verified status; §0/§8 (reconciliation + red-team) record which
+> resolutions landed.
+>
+> **At a glance:**
+> - **Inc 0–8: DONE.** Two caveats: Inc 2 deferred the per-instance capability
+>   *vector* / `fabric_flags` (the count-style Tier-1 bounds shipped instead);
+>   Inc 8 deferred the minimal-unsat-core (C531 keeps its own rich diagnostics).
+> - **Inc 9: PARTIAL.** The analog routing IS data-driven from `G4_FABRIC`
+>   (`g474.rs` LazyLocks, commit c34a574). The rest — retiring the legacy G474
+>   `solver.rs` backtracker and folding `normalize()` onto the kernel — is **not
+>   done and is recommended deferred** (the doc itself keeps G474 on greedy
+>   `normalize`, §3; the dynamic-vs-static candidate mismatch makes the fold
+>   low-ROI/high-risk against a working planner).
+> - **§0 reconciliation:** all four fixes (B1 bridge, DMAMUX+NAMED scope, channel-
+>   count DMA demand, dual-core dedup) landed.
+> - **§8 red-team:** addressed; **A4 is partial** (DMA demand is a per-kind channel
+>   *count* — 2 serial / 1 ADC — not yet full signal-set cardinality, so a literal
+>   7-stream HRTIM workload would undercount); **D1/D2/D3 superseded** by the
+>   "save-compat not required" decision (clean break, no migration shims).
 
 ## 0. Reconciliation / decisions on top of the workflow output
+
+> **Status (2026-06-21): all four fixes landed.** 1) bridge built (`for_chip_name`);
+> 2) DMAMUX+NAMED in scope, FIXED/dual-core deferred; 3) DMA demand is a per-kind
+> channel count (partial vs full signal-set — see §8 A4); 4) dual-core dedup done in
+> `gen_catalog`. The "save-compat not required" lever (end of §0) was taken — the
+> persisted schema is a clean break with no migration shims.
 
 The synthesized plan (§2–§7 below) is sound in its **architecture**, but the
 red-team (§8) found four facts that are false against the current data and must
@@ -179,30 +206,52 @@ atomically.
 
 ## 6. Increment ladder (each green/shippable) — corrected for the red-team
 
-- **Inc 0** — `CatalogEntry.dma_pool_total` (gen_catalog sums controller channels,
-  **deduped by (controller,channel)** across cores) + `SearchQuery.min_dma_channels`
-  + one widget. Pure Tier-1, no solver. Ships "total DMA channels ≥ N" over 1600
-  parts. *(Depends on: nothing. Must include the dedup or A2 ships wrong.)*
-- **Inc 0.5** — the **part-name → package descriptor bridge** (red-team B1, do
-  before any Tier-2 value). Robust suffix-stripping map + the 3rd label state.
-- **Inc 1** — DMA data into RAW + descriptor: `RawPeripheral.dma:
-  &[RawDmaLeg{signal, pools}]` (extractor normalizes A/B), `RawMcuData.dma_pools`,
-  `McuDescriptor::dma_pools()`/`dma_routes()`. Regen 13 mcu_data files. *(NB:
-  RawPeripheral has NO dma field today — this is new, ~the block/triggers pattern.)*
-- **Inc 2** — per-instance capability vector + `fabric_flags` into catalog. (Skip
-  the dead `min_with_dma` predicate.)
-- **Inc 3** — generic kernel skeleton (`tokens.rs`/`engine.rs`): `Res`, `Consume`,
-  `used_excluding`, greedy `normalize` lifted over generic tokens. Library-only.
-- **Inc 4** — DMA-first end-to-end (USART): `UsePeripheral{Usart,dma}` +
-  enumerator. Standalone on G474 (16) / C531 (8); 9th C531 leg unmet.
-- **Inc 5** — backtracking completeness (selector path), problem-size bounded.
-- **Inc 6** — generalize classes + generic pin contention via `mcu_pinout`
-  (pulls signal-refactor Steps 0–3 forward).
-- **Inc 7** — two-tier wiring + `catalog_view` requirements panel + 3-state labels.
-- **Inc 8** — `HardwareOcp` via fabric routes; fold C531 (keep its rich diagnostic
-  pass; don't force minimal-unsat-core yet).
-- **Inc 9** — retire forks (re-point HRTIM enumerators at `G4_FABRIC`; delete
-  `g474.rs` routing + legacy `solver.rs`; G474 `normalize` delegates to the kernel).
+Status verified against the code 2026-06-21 (✅ done · 🟡 partial · ⬜ todo). The
+real homes: kernel = `src/constraint.rs`; adapter + two-tier eval = `src/select.rs`;
+UI = `src/catalog_view.rs`; data = `src/catalog.rs`/`tools/gen_catalog.rs`/
+`src/phys_pinout.rs`/`src/mcu_raw.rs`/`src/mcu.rs`/`tools/{extract,gen_descriptors,
+json_dma}.rs`.
+
+- ✅ **Inc 0** *(0382354)* — `CatalogEntry.dma_pool_total` (deduped by
+  (controller,channel) across cores in `gen_catalog`) + `SearchQuery.min_dma_channels`
+  + the "Min DMA ch" widget. Test pins G474=16, H745=40-deduped.
+- ✅ **Inc 0.5** *(c6f948e)* — `Package::for_chip_name` suffix-stripping bridge
+  (exact → 10-char prefix) + `desc_asset::descriptor_for`. (The 3rd "BoundsOnly"
+  label state actually shipped with Inc 7.)
+- ✅ **Inc 1** *(a62ad46; C5 path b9b47be)* — `RawPeripheral.dma: &[RawDmaLeg{signal,
+  pools}]` + `RawMcuData.dma_pools` + `McuDescriptor::dma_pools()`/`dma_routes()`;
+  extractor normalizes DMAMUX/named/fixed. metapac drops C5 DMA, so C5 descriptors
+  source it from chip JSON via `tools/json_dma.rs`.
+- 🟡 **Inc 2** *(d6f31c7)* — Tier-1 capability filters shipped: `comp_pwm_ch`,
+  `gpio_pins`, `min_tim_adv`, `require_ocp_capable`. **Deferred:** the per-instance
+  capability *vector* (`Vec<InstanceCap{class,index,has_dma}>`) + `fabric_flags`
+  fields on `CatalogEntry` (§4 still promises them; never added — Tier-2 covers the
+  precise check, so they're low-value).
+- ✅ **Inc 3** *(95771b7)* — generic kernel `src/constraint.rs`: `Res{Inst,Pool,Pin,
+  Sub,Route}` (interned-str classes), `Candidate`, `Requirement`, `assign_greedy`.
+  (Built as `constraint`, not `tokens`/`engine`.)
+- ✅ **Inc 4** *(a76964d)* — DMA-first end-to-end in `select.rs`: `Demand` →
+  candidates from `dma_routes()`/`dma_pools()` → `solve`/`allocate` + witness.
+- ✅ **Inc 5** *(b835f99)* — `assign_backtracking`: most-constrained-first, bounded
+  by a node budget (not wall-clock), `indeterminate` on budget exhaustion.
+- ✅ **Inc 6** — generic pin contention: `select.rs` emits `Res::Pin` candidates
+  from `mcu_pinout::pins_for` for the logical kinds (SERIAL/SPI/I2C/UCPD/ADC).
+- ✅ **Inc 7** *(7ab100c)* — two-tier `evaluate` → `Verdict{Verified,BoundsOnly,
+  Infeasible}` + `Witness`; `catalog_view` requirements panel + verdict column +
+  3-state labels.
+- ✅ **Inc 8** — `HardwareOcp` via fabric: `select.rs::ocp_candidates` claims
+  COMP+TIM tokens; C531 folded into the lineup eval. **Deferred (by design):**
+  minimal-unsat-core (C531 keeps its own rich pairwise diagnostics, per §0/C3).
+- 🟡 **Inc 9** — retire forks. ✅ analog routing data-driven from `G4_FABRIC`
+  (`g474.rs` LazyLocks, c34a574). ⬜ **Not done / recommended deferred:** delete
+  `g474.rs` routing fns, retire the legacy `src/solver.rs` backtracker, and make
+  G474 `normalize()` delegate to `constraint.rs`. `solver.rs` is still imported by
+  `requirements.rs`/`app.rs`/`fabric_view.rs`, and `normalize()` is still its own
+  greedy fixpoint with **dynamic** cross-reference candidate re-enumeration — which
+  doesn't map onto `constraint.rs`'s **static** `Candidate` lists. The doc itself
+  keeps the live G474 UI on greedy `normalize` (§3); folding it is low-ROI against
+  a working planner, so it's parked. Golden test `golden_default_design_fabric_
+  allocation` (fac0df5) pins the current G474 allocation if it's ever revisited.
 
 ## 7. Open decisions for the maintainer
 
@@ -218,6 +267,13 @@ atomically.
 ---
 
 ## 8. Red-team findings (verified against stm32-data, 1616 parts)
+
+> **Status (2026-06-21): addressed.** A2 (dedup) ✅, B1 (bridge) ✅, B4 (`min_with_dma`
+> cut) ✅, C3 (C531 keeps its own diagnostics) ✅. **A4 partial** — DMA demand is a
+> per-kind channel count (2 serial / 1 ADC), not yet full signal-set cardinality, so
+> a literal 7-stream HRTIM/TIM workload would undercount. **D1/D2/D3 superseded** by
+> "save-compat not required" (clean break; the typed-`Pin`/`Serialize`/module-clash
+> migration concerns no longer apply).
 
 | # | Finding | Severity | Resolution (see §0) |
 |---|---|---|---|
