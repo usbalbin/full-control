@@ -751,7 +751,7 @@ impl PeriPlannerApp {
                         .clicked()
                     {
                         let plan = self.active.to_pin_plan();
-                        ui.ctx().copy_text(crate::codegen::generate_board(&plan));
+                        ui.ctx().copy_text(crate::codegen::generate(&plan));
                     }
                 }
             });

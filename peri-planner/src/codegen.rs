@@ -114,6 +114,108 @@ pub fn generate_board(plan: &PinPlan) -> String {
     s
 }
 
+/// One behavioral parameter the pin plan cannot know — a generated `Behavior`
+/// field. Adding a routed peripheral adds a hole, so the design and its config
+/// can't silently drift (docs/firmware-codegen-design.md §4).
+struct Hole {
+    name: String,
+    ty: &'static str,
+    default: &'static str,
+    doc: &'static str,
+}
+
+/// The behavioral holes implied by the plan's Tier-1 peripherals, in instance
+/// order. Derived from the peripheral class + its placements' role kinds.
+fn behavior_holes(plan: &PinPlan) -> Vec<Hole> {
+    use crate::pin_plan::RoleKind;
+    let mut instances: Vec<&str> = Vec::new();
+    for p in &plan.placements {
+        let inst = p.signal.peripheral.as_str();
+        if is_tier1_instance(inst) && !instances.contains(&inst) {
+            instances.push(inst);
+        }
+    }
+
+    let mut holes = Vec::new();
+    for inst in instances {
+        let id = ident(inst);
+        match class_of(inst) {
+            "USART" | "UART" | "LPUART" => holes.push(Hole {
+                name: format!("{id}_baud"), ty: "u32", default: "115_200", doc: "baud rate",
+            }),
+            "SPI" => holes.push(Hole {
+                name: format!("{id}_freq_hz"), ty: "u32", default: "1_000_000", doc: "SCK frequency (Hz)",
+            }),
+            "I2C" => holes.push(Hole {
+                name: format!("{id}_freq_hz"), ty: "u32", default: "100_000", doc: "bus frequency (Hz)",
+            }),
+            "FDCAN" => holes.push(Hole {
+                name: format!("{id}_bitrate"), ty: "u32", default: "500_000", doc: "nominal bitrate (bps)",
+            }),
+            "TIM" | "HRTIM" => {
+                let pwm = plan.placements.iter().any(|p| {
+                    p.signal.peripheral == inst && matches!(p.role_kind, RoleKind::PwmOut { .. })
+                });
+                if pwm {
+                    holes.push(Hole {
+                        name: format!("{id}_freq_hz"), ty: "u32", default: "100_000",
+                        doc: "PWM switching frequency (Hz)",
+                    });
+                    let dead_time = plan.placements.iter().any(|p| {
+                        p.signal.peripheral == inst
+                            && matches!(p.role_kind, RoleKind::PwmOut { dead_time: true, .. })
+                    });
+                    if dead_time {
+                        holes.push(Hole {
+                            name: format!("{id}_dead_time_ns"), ty: "u16", default: "0",
+                            doc: "complementary dead-time (ns)",
+                        });
+                    }
+                }
+            }
+            _ => {} // ADC/DAC: no required scalar in v1.
+        }
+    }
+    holes
+}
+
+/// Append the behavioral-config contract (`Behavior` struct + `Default`) — the
+/// set of holes the user fills, structurally separate from the plan.
+fn write_behavior(s: &mut String, plan: &PinPlan) {
+    use std::fmt::Write as _;
+    let holes = behavior_holes(plan);
+    let _ = writeln!(s);
+    let _ = writeln!(s, "/// Behavioral configuration you must supply — one field per value the pin");
+    let _ = writeln!(s, "/// plan cannot know (it carries no behavioral values by design). Adjust the");
+    let _ = writeln!(s, "/// defaults to your converter. Adding a routed peripheral adds a field here,");
+    let _ = writeln!(s, "/// so the design and its config can't silently drift.");
+    let _ = writeln!(s, "#[derive(Clone, Copy, Debug)]");
+    let _ = writeln!(s, "pub struct Behavior {{");
+    for h in &holes {
+        let _ = writeln!(s, "    /// {}", h.doc);
+        let _ = writeln!(s, "    pub {}: {},", h.name, h.ty);
+    }
+    let _ = writeln!(s, "}}");
+    let _ = writeln!(s);
+    let _ = writeln!(s, "impl Default for Behavior {{");
+    let _ = writeln!(s, "    fn default() -> Self {{");
+    let _ = writeln!(s, "        Self {{");
+    for h in &holes {
+        let _ = writeln!(s, "            {}: {},", h.name, h.default);
+    }
+    let _ = writeln!(s, "        }}");
+    let _ = writeln!(s, "    }}");
+    let _ = writeln!(s, "}}");
+}
+
+/// Generate the full Tier-1 firmware scaffold module: the board-support layer
+/// (every instance + pin) followed by the behavioral-config contract.
+pub fn generate(plan: &PinPlan) -> String {
+    let mut s = generate_board(plan);
+    write_behavior(&mut s, plan);
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,6 +266,33 @@ mod tests {
         assert!(!code.contains("pub comp1: peripherals::COMP1,"), "COMP instance NOT bound (Tier-2/3)");
         assert!(code.contains("pub adc1: peripherals::ADC1,"), "ADC instance bound (Tier-1)");
         assert!(code.contains("pub adc1_in2: peripherals::PA2,"));
+    }
+
+    #[test]
+    fn generate_emits_behavior_contract_holes() {
+        let mut plan = PinPlan::empty(Target { package: "G474R".into(), family: "G4".into() });
+        plan.placements.push(placement("USART1", "TX", Some(PinId { port: 'A', num: 9 })));
+        plan.placements.push(placement("SPI1", "SCK", Some(PinId { port: 'A', num: 5 })));
+        // A complementary PWM channel with dead-time -> freq + dead-time holes.
+        plan.placements.push(Placement {
+            role_kind: RoleKind::PwmOut { complementary: true, dead_time: true, etr: false },
+            ..placement("TIM1", "CH1", Some(PinId { port: 'A', num: 8 }))
+        });
+        let code = generate(&plan);
+
+        // One hole per behavioral value the plan can't know.
+        assert!(code.contains("pub usart1_baud: u32,"));
+        assert!(code.contains("pub spi1_freq_hz: u32,"));
+        assert!(code.contains("pub tim1_freq_hz: u32,"));
+        assert!(code.contains("pub tim1_dead_time_ns: u16,"));
+        // Defaults wired up.
+        assert!(code.contains("usart1_baud: 115_200,"));
+        assert!(code.contains("tim1_dead_time_ns: 0,"));
+        // Behavior struct present; board layer still emitted above it.
+        assert!(code.contains("pub struct Behavior {"));
+        assert!(code.contains("pub struct Board {"));
+        // No behavioral VALUE ever leaks into the board layer.
+        assert!(!code.contains("115_200,\n    pub usart1: peripherals"));
     }
 
     #[test]
