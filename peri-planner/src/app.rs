@@ -172,6 +172,10 @@ pub struct PeriPlannerApp {
     dropin_cache: crate::dropin::DropinCache,
     /// Candidate whose per-pin diff is expanded in the drop-in finder. Ephemeral.
     dropin_focus: Option<String>,
+    /// Set at startup when the persisted project blob existed but failed to parse:
+    /// the raw bytes, so the first `save` writes them to a recovery key instead of
+    /// silently letting the new blob overwrite the unparseable one. Ephemeral.
+    corrupt_blob: Option<String>,
 }
 
 impl Default for PeriPlannerApp {
@@ -193,6 +197,7 @@ impl Default for PeriPlannerApp {
             dropin_query: Default::default(),
             dropin_cache: Default::default(),
             dropin_focus: None,
+            corrupt_blob: None,
         }
     }
 }
@@ -205,10 +210,20 @@ impl PeriPlannerApp {
             if let Some(v) = eframe::get_value::<ViewMode>(storage, "peri_planner_view_v1") {
                 slf.view = v;
             }
+            // `get_value` returns None on a PARSE error too, not just absence — so
+            // distinguish via the raw string before deciding what to do.
+            let blob_raw = storage.get_string(PROJECTS_KEY);
             if let Some(p) = eframe::get_value::<Persisted>(storage, PROJECTS_KEY) {
                 // Multi-project blob (post-spine). The source of truth.
                 slf.active = p.active;
                 slf.others = p.others;
+            } else if let Some(raw) = blob_raw {
+                // The blob EXISTS but didn't parse (e.g. a Package/Mcu variant
+                // dropped since it was saved). Do NOT reseed from the legacy keys
+                // (that would load stale pre-spine data), and do NOT let the next
+                // save silently clobber it: stash the raw bytes so `save` can write
+                // them to a recovery key. Start with a fresh default project.
+                slf.corrupt_blob = Some(raw);
             } else {
                 // No project blob yet: seed the single active project from the
                 // pre-spine per-key save so the user's current design survives
@@ -908,6 +923,12 @@ impl PeriPlannerApp {
 
 impl eframe::App for PeriPlannerApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        // Preserve an unparseable prior blob (if any) under a recovery key BEFORE
+        // we overwrite the main key — so a load failure never means silent data
+        // loss. Done once (the take() clears it).
+        if let Some(raw) = self.corrupt_blob.take() {
+            storage.set_string(&format!("{PROJECTS_KEY}_recovered"), raw);
+        }
         // One blob for all projects (RON handles the enum-keyed h523 map).
         let blob = Persisted {
             active: self.active.clone(),
@@ -2353,6 +2374,42 @@ mod seed_tests {
         let bs = back.active.catalog_demands.iter().find(|d| d.kind == "SERIAL").unwrap();
         assert_eq!((bs.count, bs.with_dma), (2, true));
         assert!(bs.has_option("flow control"), "option survived the &'static projection");
+    }
+
+    #[derive(Default)]
+    struct MemStorage(std::collections::HashMap<String, String>);
+    impl eframe::Storage for MemStorage {
+        fn get_string(&self, k: &str) -> Option<String> {
+            self.0.get(k).cloned()
+        }
+        fn set_string(&mut self, k: &str, v: String) {
+            self.0.insert(k.to_string(), v);
+        }
+        fn flush(&mut self) {}
+    }
+
+    #[test]
+    fn corrupt_project_blob_is_preserved_not_silently_lost() {
+        use eframe::{App as _, Storage as _};
+
+        let mut store = MemStorage::default();
+        store.set_string(PROJECTS_KEY, "this is not valid RON".to_string());
+        // The fix's basis: a present-but-unparseable blob yields None from
+        // get_value yet IS visible via get_string — so "corrupt" ≠ "absent".
+        assert!(eframe::get_value::<Persisted>(&store, PROJECTS_KEY).is_none());
+        assert!(store.get_string(PROJECTS_KEY).is_some());
+
+        // save() preserves the unparseable bytes under a recovery key (no silent
+        // loss) and still writes the fresh blob.
+        let mut app = PeriPlannerApp::default();
+        app.corrupt_blob = store.get_string(PROJECTS_KEY);
+        app.save(&mut store);
+        assert_eq!(
+            store.get_string(&format!("{PROJECTS_KEY}_recovered")).as_deref(),
+            Some("this is not valid RON"),
+        );
+        assert!(eframe::get_value::<Persisted>(&store, PROJECTS_KEY).is_some(), "fresh blob written");
+        assert!(app.corrupt_blob.is_none(), "backed up exactly once");
     }
 
     #[test]
