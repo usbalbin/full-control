@@ -77,7 +77,7 @@ fn type_name(instance: &str) -> String {
 /// TYPES change on regenerate, and embassy constructors are generic over the
 /// pin, so the user's init is unaffected. Never hand-edited.
 pub fn generate_board(plan: &PinPlan) -> String {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fmt::Write as _;
 
     // Group placements by peripheral instance, preserving first-seen order.
@@ -104,6 +104,30 @@ pub fn generate_board(plan: &PinPlan) -> String {
         }
     }
 
+    // Defensive dedup: an over-constrained PinPlan (two converter legs on one
+    // timer → duplicate (peripheral, role); a pin-exhausted design that
+    // double-booked a pad → one pad on two signals) would otherwise emit a
+    // duplicate struct field or move a `Peripherals` singleton twice — uncompilable
+    // Rust. Keep the FIRST placement per (instance, role) and per physical pin; the
+    // rest are conflicts, dropped here and counted for a header warning. Both the
+    // struct-field and `take()` loops read this deduped `groups`, so they agree.
+    let mut seen_role: HashSet<(&str, &str)> = HashSet::new();
+    let mut seen_pin: HashSet<String> = HashSet::new();
+    let mut conflicts = 0u32;
+    for inst in &order {
+        if let Some(v) = groups.get_mut(*inst) {
+            v.retain(|p| {
+                let role_new = seen_role.insert((*inst, p.signal.role.as_str()));
+                let pin_new = p.pin.is_none_or(|pin| seen_pin.insert(pin.name()));
+                let keep = role_new && pin_new;
+                if !keep {
+                    conflicts += 1;
+                }
+                keep
+            });
+        }
+    }
+
     // DMA channel fields for an instance's bundle: `{function}_dma:
     // peripherals::{CHANNEL}` (e.g. `stream_dma: peripherals::DMA1_CH3`).
     let dma_fields = |inst: &str| -> Vec<(String, &str)> {
@@ -127,6 +151,14 @@ pub fn generate_board(plan: &PinPlan) -> String {
     let _ = writeln!(s, "// constructors are generic over the pin, so your init is unaffected. e.g.:");
     let _ = writeln!(s, "//   let b = Board::take(embassy_stm32::init(Default::default()));");
     let _ = writeln!(s, "//   let uart = Uart::new(b.usart1.instance, b.usart1.rx, b.usart1.tx, Irqs, dma, cfg)?;");
+    if conflicts > 0 {
+        let _ = writeln!(
+            s,
+            "// ⚠ {conflicts} signal(s) dropped — this design has pin/resource conflicts (e.g. two \
+             uses competing for one pad or instance). Resolve them in the planner; the firmware \
+             below covers only the conflict-free subset.",
+        );
+    }
     let _ = writeln!(s, "#![allow(dead_code)]");
     let _ = writeln!(s);
     let _ = writeln!(s, "use embassy_stm32::{{peripherals, Peripherals}};");
@@ -524,5 +556,43 @@ mod tests {
         assert_eq!(class_of("HRTIM1"), "HRTIM");
         assert!(is_tier1_instance("LPUART1"));
         assert!(!is_tier1_instance("COMP1"));
+    }
+
+    #[test]
+    fn over_constrained_design_yields_compilable_code() {
+        // Two converter legs on the SAME timer (TIM1) — a conflicting design (and
+        // pin-pressure case). The lowerer produces duplicate (TIM1, CH1) placements;
+        // codegen MUST still emit compilable Rust: no duplicate struct field, no
+        // Peripherals singleton moved twice, and a conflict warning.
+        use crate::c531_design::{C531Design, ConverterLeg};
+        use crate::g474::TimId;
+        use crate::mcu::Package;
+        use crate::pin_plan::{assign_dma, Target};
+
+        let mut d = C531Design::new();
+        d.add_leg(ConverterLeg::pwm(TimId::Tim1));
+        d.add_leg(ConverterLeg::pwm(TimId::Tim1));
+        let mut plan =
+            d.to_pin_plan(Package::C531R, Target { package: "C531R".into(), family: "C5".into() });
+        assign_dma(&mut plan, Package::C531R.descriptor());
+        let code = generate(&plan);
+
+        assert_eq!(code.matches("    pub ch1:").count(), 1, "the ch1 field must appear exactly once");
+
+        let mut moves: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
+        for (i, _) in code.match_indices("p.") {
+            if code[..i].chars().last().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            let id: String = code[i + 2..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if id.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                *moves.entry(id).or_default() += 1;
+            }
+        }
+        assert!(moves.values().all(|&n| n == 1), "no singleton moved twice: {moves:?}");
+        assert!(code.contains("signal(s) dropped"), "the conflict warning must be emitted");
     }
 }
