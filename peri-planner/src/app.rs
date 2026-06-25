@@ -140,6 +140,11 @@ pub struct PeriPlannerApp {
     view: ViewMode,
     history: Vec<DesignSnapshot>,
     redo: Vec<DesignSnapshot>,
+    /// Bumped on every project/MCU switch. The non-G474 frame bracket captures it
+    /// before rendering and only records an undo step if it's unchanged — so an
+    /// in-frame project switch (which clears history) never lets the OLD project's
+    /// snapshot land on the NEW project's stack. Ephemeral.
+    nav_epoch: u64,
     /// Role "picked up" in the package view, waiting to be dropped on a
     /// candidate pin. Not persisted — ephemeral interaction state.
     picked: Option<crate::picker::PickedRole>,
@@ -177,6 +182,7 @@ impl Default for PeriPlannerApp {
             view: ViewMode::Fabric,
             history: Vec::new(),
             redo: Vec::new(),
+            nav_epoch: 0,
             picked: None,
             af_filter: Default::default(),
             catalog_query: Default::default(),
@@ -259,14 +265,22 @@ impl PeriPlannerApp {
         self.active.h523_designs.get(&self.active.mcu).unwrap_or(empty)
     }
 
+    /// Clear undo/redo for a navigation change (project or MCU switch) and bump
+    /// `nav_epoch`. The bump is what stops the in-flight non-G474 frame bracket
+    /// from recording a stale step against whatever became active mid-frame.
+    fn clear_undo_for_nav(&mut self) {
+        self.history.clear();
+        self.redo.clear();
+        self.nav_epoch = self.nav_epoch.wrapping_add(1);
+    }
+
     /// Switch the active MCU, clearing undo/redo history. Each MCU has its own
     /// design state, so a snapshot of one MCU must never restore into another's
     /// live view — that invariant is what makes per-MCU undo coherent. No-op if
     /// already active. A package switch within an MCU keeps history (same design).
     fn set_active_mcu(&mut self, m: Mcu) {
         if m != self.active.mcu {
-            self.history.clear();
-            self.redo.clear();
+            self.clear_undo_for_nav();
             self.active.mcu = m;
         }
     }
@@ -277,8 +291,7 @@ impl PeriPlannerApp {
     fn switch_project(&mut self, i: usize) {
         if i < self.others.len() {
             std::mem::swap(&mut self.active, &mut self.others[i]);
-            self.history.clear();
-            self.redo.clear();
+            self.clear_undo_for_nav();
             self.asset_part = None;
             self.land_on_active_view();
         }
@@ -289,8 +302,7 @@ impl PeriPlannerApp {
         let mut np = Project::new(format!("Untitled {}", self.others.len() + 2));
         std::mem::swap(&mut self.active, &mut np);
         self.others.push(np);
-        self.history.clear();
-        self.redo.clear();
+        self.clear_undo_for_nav();
         self.asset_part = None;
         self.land_on_active_view();
     }
@@ -303,8 +315,7 @@ impl PeriPlannerApp {
         copy.name = format!("{} copy", self.active.name);
         std::mem::swap(&mut self.active, &mut copy);
         self.others.push(copy);
-        self.history.clear();
-        self.redo.clear();
+        self.clear_undo_for_nav();
         self.asset_part = None;
         self.land_on_active_view();
     }
@@ -314,8 +325,7 @@ impl PeriPlannerApp {
     fn delete_active(&mut self) {
         if !self.others.is_empty() {
             self.active = self.others.remove(0);
-            self.history.clear();
-            self.redo.clear();
+            self.clear_undo_for_nav();
             self.asset_part = None;
             self.land_on_active_view();
         }
@@ -973,7 +983,7 @@ impl eframe::App for PeriPlannerApp {
             // Bracket the whole non-G474 frame to record edits (a Seed in the top
             // bar, or a view action) as ONE undo step. These models don't go
             // through `mutate`; the deferred-action views apply ≤1 edit per frame.
-            let mcu_before = self.active.mcu;
+            let nav_before = self.nav_epoch;
             let before = self.snapshot_active();
             self.render_top_bar(ctx, can_undo, can_redo);
             self.render_status_line(ctx);
@@ -1029,9 +1039,11 @@ impl eframe::App for PeriPlannerApp {
             });
             self.pending_open = jump;
             self.apply_converter_action(conv_action);
-            // Record the frame's edit unless the frame switched MCU (history was
-            // cleared) or only a note changed.
-            if self.active.mcu == mcu_before && self.non_g474_changed(&before) {
+            // Record the frame's edit — UNLESS navigation changed the active
+            // project or MCU mid-frame (nav_epoch bumped, history already cleared),
+            // which would otherwise push THIS project's pre-snapshot onto the OTHER
+            // project's freshly-cleared stack. Also skips note-only changes.
+            if self.nav_epoch == nav_before && self.non_g474_changed(&before) {
                 self.push_history(before);
             }
             return;
@@ -2341,5 +2353,32 @@ mod seed_tests {
         let bs = back.active.catalog_demands.iter().find(|d| d.kind == "SERIAL").unwrap();
         assert_eq!((bs.count, bs.with_dma), (2, true));
         assert!(bs.has_option("flow control"), "option survived the &'static projection");
+    }
+
+    #[test]
+    fn project_switch_mid_frame_does_not_leak_undo_across_projects() {
+        // Regression: the non-G474 frame bracket captures `before` + `nav_before`,
+        // then a project switch can happen mid-frame (the switcher is inside
+        // render_top_bar). The post-render diff must NOT push the OLD project's
+        // snapshot onto the NEW (same-MCU) project's freshly-cleared stack.
+        let mut app = PeriPlannerApp::default();
+        app.set_active_mcu(Mcu::H523);
+        app.active.h523_designs.entry(Mcu::H523).or_default().add_use("USART1", &["TX"]);
+        let mut b = Project::new("B");
+        b.mcu = Mcu::H523;
+        b.h523_designs.entry(Mcu::H523).or_default().add_use("SPI1", &["SCK"]);
+        app.others.push(b);
+
+        // Mirror the frame bracket around an in-frame switch.
+        let nav_before = app.nav_epoch;
+        let before = app.snapshot_active(); // project A's design
+        app.switch_project(0); // mid-frame → clears history, bumps nav_epoch
+        if app.nav_epoch == nav_before && app.non_g474_changed(&before) {
+            app.push_history(before);
+        }
+
+        assert!(app.history.is_empty(), "no stale cross-project undo step after an in-frame switch");
+        // B is active and intact — an undo can't restore A's design into it.
+        assert_eq!(app.active.h523_designs[&Mcu::H523].uses[0].peripheral, "SPI1");
     }
 }
