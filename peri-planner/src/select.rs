@@ -704,7 +704,10 @@ pub fn evaluate(
     // exhaustion (it would permute pin combinations of the placeable instances).
     let mut kind_demand: BTreeMap<&str, u8> = BTreeMap::new();
     for d in demands {
-        *kind_demand.entry(d.kind).or_default() += d.count;
+        let e = kind_demand.entry(d.kind).or_default();
+        // saturating: a duplicate-kind demand set (e.g. from a hand-edited blob)
+        // could sum past 255 and panic in debug.
+        *e = e.saturating_add(d.count);
     }
 
     // Tier-1: fold the DMA-capacity and pin-capacity necessary bounds into the
