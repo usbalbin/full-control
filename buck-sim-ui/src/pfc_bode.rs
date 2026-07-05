@@ -78,10 +78,11 @@ fn inner_compensator(omega: f64, ds: &PfcDesignSummary) -> C {
     c_mul(integrator, c_div(zero, pole))
 }
 
-/// Half-period transport delay for PWM: e^{-jω × T_sw/2}
-fn pwm_delay(omega: f64, f_sw: f64) -> C {
-    let delay = 0.5 / f_sw;
-    let phi = -omega * delay;
+/// Loop transport-delay term e^{-jω·τ}, using the delay the design actually
+/// reserved (`PfcDesignSummary::inner_loop_delay_s`) so the Bode plot's phase
+/// margin matches the design intent. `τ = 0` (ideal profile) ⇒ no delay term.
+fn transport_delay(omega: f64, delay_s: f64) -> C {
+    let phi = -omega * delay_s;
     (phi.cos(), phi.sin())
 }
 
@@ -136,7 +137,7 @@ impl PfcBodeData {
             let hp_i = inner_plant(omega, ds);
             let hc_i = inner_compensator(omega, ds);
             let h_sense: C = (ds.r_sense, 0.0);
-            let h_delay = pwm_delay(omega, ds.f_sw);
+            let h_delay = transport_delay(omega, ds.inner_loop_delay_s);
             let ht_i = c_mul(c_mul(c_mul(hp_i, hc_i), h_sense), h_delay);
 
             inner_plant_mag.push(20.0 * c_mag(c_mul(hp_i, h_sense)).log10());
@@ -232,11 +233,25 @@ fn find_margins(
         }
     }
 
-    // Find gain margin: magnitude at -180° phase crossing
+    // Find gain margin: magnitude at -180° phase crossing. loop_phase is
+    // atan2-wrapped to (-180, 180], so a raw scan for a downward -180 crossing
+    // never fires (the value jumps to +180 at the wrap). Unwrap first.
+    let mut unwrapped = loop_phase.to_vec();
+    for i in 1..unwrapped.len() {
+        let mut d = unwrapped[i] - unwrapped[i - 1];
+        while d > 180.0 {
+            unwrapped[i] -= 360.0;
+            d -= 360.0;
+        }
+        while d < -180.0 {
+            unwrapped[i] += 360.0;
+            d += 360.0;
+        }
+    }
     let mut gain_margin_db = f64::INFINITY;
     for i in 1..freq.len() {
-        if loop_phase[i - 1] > -180.0 && loop_phase[i] <= -180.0 {
-            let frac = (loop_phase[i - 1] + 180.0) / (loop_phase[i - 1] - loop_phase[i]);
+        if unwrapped[i - 1] > -180.0 && unwrapped[i] <= -180.0 {
+            let frac = (unwrapped[i - 1] + 180.0) / (unwrapped[i - 1] - unwrapped[i]);
             let mag_at_cross = loop_mag[i - 1] + frac * (loop_mag[i] - loop_mag[i - 1]);
             gain_margin_db = -mag_at_cross;
             break;

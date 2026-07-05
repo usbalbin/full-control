@@ -3,6 +3,7 @@ use electronics_sim::active_bridge::ActiveBridgeSim;
 use electronics_sim::pfc_boost::PfcBoostSim;
 use electronics_sim::vienna::ViennaRectifierSim;
 use electronics_sim::CurrentConduction;
+use full_control::control_2p2z::PhaseMargin;
 use full_control::control_pfc::{PfcDesignSummary, PfcParameters};
 use full_control::dq_controller::DqCurrentController;
 use full_control::pll::SrfPll;
@@ -78,6 +79,31 @@ pub struct PfcSimParams {
 
     // Cap bank (empty = use scalar c_out_uf/r_esr_mohm)
     pub output_caps: Vec<CapTypeUi>,
+
+    /// FET current rise/fall time [ns] for hard-switching V×I overlap loss
+    /// (0 ⇒ omitted). This is the dominant loss in a hard-switched bridged
+    /// boost.
+    #[serde(default)]
+    pub fet_t_rise_ns: f64,
+    #[serde(default)]
+    pub fet_t_fall_ns: f64,
+    /// FET output capacitance [pF] for hard-switched Eoss (0 ⇒ omitted).
+    #[serde(default)]
+    pub fet_coss_pf: f64,
+    /// Boost/rectifier diode reverse-recovery charge [nC]. ~0 for SiC/GaN —
+    /// eliminating Q_rr is the whole point of totem-pole / SiC PFC.
+    #[serde(default)]
+    pub diode_qrr_nc: f64,
+    /// Inductor core-loss (iGSE) parameters (disabled by default).
+    #[serde(default)]
+    pub magnetics: crate::sim::MagneticsConfig,
+
+    /// MCU / DAC transport-delay profile — shared with the buck sim so a G4
+    /// config reserves the same loop delay in both. Ideal (default) reserves
+    /// none, preserving prior behavior. The container `#[serde(default)]` fills
+    /// these from `PfcSimParams::default()` for older saved data.
+    pub mcu: crate::sim::McuProfile,
+    pub dac: crate::sim::DacProfile,
 }
 
 impl Default for PfcSimParams {
@@ -106,6 +132,13 @@ impl Default for PfcSimParams {
             slope_overcomp: 1.5,
             ac_phases: 1,
             output_caps: Vec::new(),
+            fet_t_rise_ns: 0.0,
+            fet_t_fall_ns: 0.0,
+            fet_coss_pf: 0.0,
+            diode_qrr_nc: 0.0,
+            magnetics: crate::sim::MagneticsConfig::default(),
+            mcu: crate::sim::McuProfile::ideal(),
+            dac: crate::sim::DacProfile::ideal(),
         }
     }
 }
@@ -179,10 +212,33 @@ pub struct PfcMetrics {
     pub p_loss_diode_w: f64,
     pub p_loss_dcr_w: f64,
     pub p_loss_esr_w: f64,
+    /// FET V×I overlap + Eoss hard-switching loss [W].
+    pub p_loss_switching_w: f64,
+    /// Diode reverse-recovery loss [W].
+    pub p_loss_qrr_w: f64,
+    /// Magnetic core loss (iGSE) [W].
+    pub p_loss_core_w: f64,
     pub p_loss_total_w: f64,
 }
 
 // ── Simulation runner ──────────────────────────────────────────────────────
+
+/// Inner-current-loop phase-margin target, reserving the MCU/DAC transport
+/// delay (shared with the buck) when the profile isn't ideal. Targets a
+/// realized 60° after the delay erosion, exactly like the buck's design.
+fn pfc_current_pm(p: &PfcSimParams) -> PhaseMargin {
+    let base = 60.0_f64.to_radians();
+    if p.mcu.t_adc_us != 0.0 || p.mcu.t_processing_us != 0.0 || p.dac.t_dac_us != 0.0 {
+        PhaseMargin::Calculated {
+            base_pm_rad: base,
+            t_adc: p.mcu.t_adc_us * 1e-6,
+            t_processing: p.mcu.t_processing_us * 1e-6,
+            t_dac: p.dac.t_dac_us * 1e-6,
+        }
+    } else {
+        PhaseMargin::Manual { phase_margin: base }
+    }
+}
 
 /// Build PFC compensator design parameters from UI params.
 pub fn build_pfc_design(p: &PfcSimParams) -> PfcParameters {
@@ -198,8 +254,8 @@ pub fn build_pfc_design(p: &PfcSimParams) -> PfcParameters {
         r_sense: p.r_sense_mohm * 1e-3,
         current_crossover_hz: p.current_crossover_khz * 1e3,
         voltage_crossover_hz: p.voltage_crossover_hz,
-        phase_margin_current: 60.0_f64.to_radians(),
-        phase_margin_voltage: 60.0_f64.to_radians(),
+        phase_margin_current: pfc_current_pm(p),
+        phase_margin_voltage: PhaseMargin::Manual { phase_margin: 60.0_f64.to_radians() },
     }
 }
 
@@ -364,6 +420,11 @@ pub fn run_pfc_simulation(
         let mut primary_v_in_rect = 0.0_f64;
         let mut primary_i_ref = 0.0_f32;
 
+        // Common bus voltage at the start of this step — all AC phases were
+        // synchronized to it at the end of the previous step. Needed to sum
+        // the per-AC-phase charge deltas onto the shared bus below.
+        let v_cap_start = sims_per_ac[0][0].v_cap;
+
         for ac_idx in 0..ac_phases {
             let v_in_rect = ac.v_phase_rect(ac_idx, t);
             let sin_theta = v_in_rect / v_in_pk;
@@ -466,9 +527,18 @@ pub fn run_pfc_simulation(
             }
         }
 
-        // Synchronize v_cap across all AC phases (shared DC bus)
+        // Shared DC bus: every AC phase started this step from the same v_cap
+        // and charged its OWN copy from a 1/N share of the load. The physical
+        // bus sees the SUM of all phases' charge contributions, so accumulate
+        // each phase's delta onto the common start voltage. (The old code kept
+        // only the LAST AC phase's copy, discarding phases 0..N−2's charge and
+        // N−1/N of the load current.)
         if ac_phases > 1 {
-            let v_out_final = sims_per_ac.last().unwrap().last().unwrap().v_cap;
+            let mut v_out_final = v_cap_start;
+            for ac_sims in &sims_per_ac {
+                let v_phase = ac_sims.last().unwrap().v_cap;
+                v_out_final += v_phase - v_cap_start;
+            }
             for ac_sims in &mut sims_per_ac {
                 for sim in ac_sims.iter_mut() {
                     sim.v_cap = v_out_final;
@@ -498,7 +568,17 @@ pub fn run_pfc_simulation(
         });
 
         t += if p.control_mode == PfcControlMode::CrCm {
-            actual_t_sw_out.max(t_sw * 0.01)
+            // CrCM period varies over the line cycle. When the current command
+            // collapses (k≈0, on-time→0) the period degenerates toward 0; the
+            // old `t_sw·0.01` floor then produced tens of thousands of sub-cycle
+            // steps per line cycle. Floor active CrCM at a physical
+            // max-frequency limit (≈5× nominal); when the stage is effectively
+            // idle, advance by the nominal period instead.
+            if actual_t_sw_out > t_sw * 0.05 {
+                actual_t_sw_out.max(t_sw * 0.2)
+            } else {
+                t_sw
+            }
         } else {
             t_sw
         };
@@ -679,6 +759,9 @@ fn compute_metrics(
         p_loss_diode_w: 0.0,
         p_loss_dcr_w: 0.0,
         p_loss_esr_w: 0.0,
+        p_loss_switching_w: 0.0,
+        p_loss_qrr_w: 0.0,
+        p_loss_core_w: 0.0,
         p_loss_total_w: 0.0,
     };
 
@@ -736,6 +819,17 @@ fn compute_metrics(
     let mut loss_diode_energy = 0.0_f64;
     let mut loss_dcr_energy = 0.0_f64;
     let mut loss_esr_energy = 0.0_f64;
+    let mut loss_switching_energy = 0.0_f64;
+    let mut loss_qrr_energy = 0.0_f64;
+    let mut loss_core_energy = 0.0_f64;
+    // Switching / reverse-recovery / core-loss parameters (SI).
+    let t_rise = p.fet_t_rise_ns * 1e-9;
+    let t_fall = p.fet_t_fall_ns * 1e-9;
+    let coss = p.fet_coss_pf * 1e-12;
+    let qrr = p.diode_qrr_nc * 1e-9;
+    let l_boost = p.l_uh * 1e-6;
+    let core_profile = p.magnetics.to_profile();
+    let core_ki = core_profile.as_ref().map(|m| m.ki());
 
     for pt in last_cycle {
         let dt = pt.t_sw_us as f64 * 1e-6;
@@ -813,6 +907,24 @@ fn compute_metrics(
             let i_cap_on = i_load_phase;
             let i_cap_off = (i_avg_off - i_load_phase).abs();
             loss_esr_energy += r_esr * (i_cap_on * i_cap_on * t_on + i_cap_off * i_cap_off * t_conduct);
+
+            // Hard-switching V×I overlap (the FET blocks V_out): turn-on at the
+            // valley current, turn-off at the peak; plus Eoss = ½·Coss·V_out².
+            // (CrCM valley/ZVS turn-on is not yet credited — set t_rise small
+            // for those designs.)
+            loss_switching_energy +=
+                0.5 * p.v_out * (i_start * t_rise + i_peak * t_fall) + 0.5 * coss * p.v_out * p.v_out;
+            // Boost-diode reverse recovery: Q_rr swept through the FET at V_out.
+            loss_qrr_energy += qrr * p.v_out;
+            // Magnetic core loss (iGSE) for this cycle's triangular flux ripple,
+            // integrated over the line cycle as the ripple envelope varies.
+            if let (Some(m), Some(ki)) = (core_profile.as_ref(), core_ki) {
+                let di_pp = (i_peak - i_start).abs();
+                let f_sw_cycle = if cycle_t_sw > 0.0 { 1.0 / cycle_t_sw } else { 0.0 };
+                loss_core_energy += m.core_loss_pv_with_ki(ki, l_boost, duty, di_pp, f_sw_cycle)
+                    * m.v_e_m3
+                    * cycle_t_sw;
+            }
         }
     }
 
@@ -861,11 +973,22 @@ fn compute_metrics(
     let p_loss_diode = if total_dt > 0.0 { loss_diode_energy / total_dt } else { 0.0 };
     let p_loss_dcr = if total_dt > 0.0 { loss_dcr_energy / total_dt } else { 0.0 };
     let p_loss_esr = if total_dt > 0.0 { loss_esr_energy / total_dt } else { 0.0 };
-    let p_loss_total = p_loss_fet + p_loss_diode + p_loss_dcr + p_loss_esr;
+    let p_loss_switching = if total_dt > 0.0 { loss_switching_energy / total_dt } else { 0.0 };
+    let p_loss_qrr = if total_dt > 0.0 { loss_qrr_energy / total_dt } else { 0.0 };
+    let p_loss_core = if total_dt > 0.0 { loss_core_energy / total_dt } else { 0.0 };
+    let p_loss_total = p_loss_fet + p_loss_diode + p_loss_dcr + p_loss_esr
+        + p_loss_switching + p_loss_qrr + p_loss_core;
 
-    // Efficiency
-    let efficiency = if p_in_avg > 0.0 {
-        (p.p_load_w() / p_in_avg * 100.0).min(100.0)
+    // Efficiency from the complete loss budget: η = P_out / (P_out + P_loss).
+    // Conduction/DCR/ESR losses appear in the simulated input current, but
+    // switching / reverse-recovery / core losses are not in the circuit sim, so
+    // a loss-based definition is the complete one. The loss loop sums all
+    // AC-phase stages, so P_loss is already on the same total basis as the total
+    // load power — no per-phase scaling needed (this also fixes the old
+    // phase-A-only ~3× inflation for 3-phase).
+    let p_out = p.p_load_w();
+    let efficiency = if p_out + p_loss_total > 0.0 {
+        (p_out / (p_out + p_loss_total) * 100.0).min(100.0)
     } else {
         0.0
     };
@@ -881,6 +1004,9 @@ fn compute_metrics(
         p_loss_diode_w: p_loss_diode,
         p_loss_dcr_w: p_loss_dcr,
         p_loss_esr_w: p_loss_esr,
+        p_loss_switching_w: p_loss_switching,
+        p_loss_qrr_w: p_loss_qrr,
+        p_loss_core_w: p_loss_core,
         p_loss_total_w: p_loss_total,
     }
 }
@@ -900,7 +1026,6 @@ fn run_active_bridge_simulation(
         return Err("Load power must be positive".into());
     }
 
-    let v_in_pk = p.v_in_rms * 2.0_f64.sqrt();
     let f_sw = p.f_sw_khz * 1e3;
     let t_sw = 1.0 / f_sw;
     let l = p.l_uh * 1e-6;
@@ -923,8 +1048,9 @@ fn run_active_bridge_simulation(
     let tau = std::f64::consts::TAU;
     let omega_n_pll = tau * 30.0;
     let zeta = 0.707;
-    let kp_pll = 2.0 * zeta * omega_n_pll / v_in_pk;
-    let ki_pll = omega_n_pll * omega_n_pll / v_in_pk;
+    // Amplitude-normalized PLL: gains no longer divide by V_pk.
+    let kp_pll = 2.0 * zeta * omega_n_pll;
+    let ki_pll = omega_n_pll * omega_n_pll;
     let pll = SrfPll::<f64>::new(p.f_line_hz, kp_pll, ki_pll, 5.0);
 
     // ── d-q current controller ───────────────────────────────
@@ -1044,6 +1170,7 @@ fn run_active_bridge_simulation(
         inner_omega_cp1: 0.0,
         inner_omega_x: tau * p.current_crossover_khz * 1e3,
         inner_phase_margin: 60.0_f64.to_radians(),
+        inner_loop_delay_s: 0.0,
         outer_plant_gain: 0.0,
         c_out: p.c_out_uf * 1e-6,
         r_esr_out: p.r_esr_mohm * 1e-3,
@@ -1101,8 +1228,8 @@ fn run_vienna_simulation(
         r_sense,
         current_crossover_hz: p.current_crossover_khz * 1e3,
         voltage_crossover_hz: p.voltage_crossover_hz,
-        phase_margin_current: 60.0_f64.to_radians(),
-        phase_margin_voltage: 60.0_f64.to_radians(),
+        phase_margin_current: pfc_current_pm(p),
+        phase_margin_voltage: PhaseMargin::Manual { phase_margin: 60.0_f64.to_radians() },
     };
     let design = vienna_pfc_params
         .design()
@@ -1272,6 +1399,42 @@ mod tests {
         let (points, metrics, _) = result.unwrap();
         assert!(!points.is_empty());
         assert!(metrics.v_out_avg > 0.0);
+    }
+
+    #[test]
+    fn switching_qrr_core_losses_lower_efficiency() {
+        let base = run_pfc_simulation(&PfcSimParams::default()).unwrap().1;
+        assert_eq!(base.p_loss_switching_w, 0.0);
+        assert_eq!(base.p_loss_qrr_w, 0.0);
+        assert_eq!(base.p_loss_core_w, 0.0);
+
+        let m = run_pfc_simulation(&PfcSimParams {
+            fet_t_rise_ns: 20.0,
+            fet_t_fall_ns: 20.0,
+            fet_coss_pf: 100.0,
+            diode_qrr_nc: 50.0,
+            magnetics: crate::sim::MagneticsConfig {
+                enabled: true,
+                k: 3.0,
+                alpha: 1.5,
+                beta: 2.5,
+                n_turns: 40.0,
+                a_e_mm2: 100.0,
+                v_e_mm3: 20000.0,
+            },
+            ..Default::default()
+        })
+        .unwrap()
+        .1;
+        assert!(m.p_loss_switching_w > 0.0, "switching loss should be > 0");
+        assert!(m.p_loss_qrr_w > 0.0, "reverse-recovery loss should be > 0");
+        assert!(m.p_loss_core_w > 0.0, "core loss should be > 0");
+        assert!(
+            m.efficiency_pct < base.efficiency_pct,
+            "extra losses must reduce efficiency: {} vs {}",
+            m.efficiency_pct,
+            base.efficiency_pct,
+        );
     }
 
     #[test]

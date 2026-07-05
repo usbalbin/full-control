@@ -6,7 +6,7 @@ use electronics_sim::{
 pub use electronics_sim::CurrentConduction;
 use full_control::{
     buck_boost::Mode,
-    control_2p2z::{Parameters, PhaseMargin, Topology as ControlTopology},
+    control_2p2z::{Parameters, PhaseMargin, Topology as ControlTopology, TwoPoleTwoZeroParams},
 };
 
 // ── Hardware profiles ────────────────────────────────────────────────────────
@@ -331,6 +331,16 @@ pub struct SimParams {
     /// includes coefficient-quantisation limit cycles.
     #[serde(default)]
     pub controller_flavor: crate::inner_ctrl::InnerCtrlFlavor,
+
+    /// Inductor magnetic core-loss (iGSE) parameters. Disabled by default
+    /// (⇒ zero core loss, numerically identical to before).
+    #[serde(default)]
+    pub magnetics: MagneticsConfig,
+
+    /// Electro-thermal self-heating parameters. Disabled by default
+    /// (⇒ isothermal 25 °C, numerically identical to before).
+    #[serde(default)]
+    pub thermal: ThermalParams,
 }
 
 /// UI-friendly capacitor type with user-facing units.
@@ -359,6 +369,99 @@ impl CapTypeUi {
 /// Convert a slice of UI cap types to SI cap types.
 pub fn to_cap_types(ui: &[CapTypeUi]) -> Vec<CapType> {
     ui.iter().map(CapTypeUi::to_cap_type).collect()
+}
+
+/// UI-friendly inductor core-loss (iGSE) inputs. Steinmetz coefficients are SI
+/// (`Pv = k·fᵅ·B̂ᵝ`, W/m³, f in Hz, B in T) — obtained by fitting the core
+/// material's datasheet loss curves. Geometry is entered in mm² / mm³.
+/// `enabled = false` (default) ⇒ no core loss.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct MagneticsConfig {
+    pub enabled: bool,
+    pub k: f64,
+    pub alpha: f64,
+    pub beta: f64,
+    pub n_turns: f64,
+    pub a_e_mm2: f64, // effective core area [mm²]
+    pub v_e_mm3: f64, // effective core volume [mm³]
+}
+
+impl Default for MagneticsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            k: 0.0,
+            alpha: 1.5,
+            beta: 2.5,
+            n_turns: 0.0,
+            a_e_mm2: 0.0,
+            v_e_mm3: 0.0,
+        }
+    }
+}
+
+impl MagneticsConfig {
+    /// Build the solver-side [`electronics_sim::core_loss::MagneticsProfile`],
+    /// or `None` if disabled / underspecified (⇒ zero core loss).
+    pub fn to_profile(&self) -> Option<electronics_sim::core_loss::MagneticsProfile> {
+        if !self.enabled
+            || self.k <= 0.0
+            || self.n_turns <= 0.0
+            || self.a_e_mm2 <= 0.0
+            || self.v_e_mm3 <= 0.0
+        {
+            return None;
+        }
+        Some(electronics_sim::core_loss::MagneticsProfile {
+            steinmetz: electronics_sim::core_loss::SteinmetzParams {
+                k: self.k,
+                alpha: self.alpha,
+                beta: self.beta,
+            },
+            n_turns: self.n_turns,
+            a_e_m2: self.a_e_mm2 * 1e-6,
+            v_e_m3: self.v_e_mm3 * 1e-9,
+            l_e_m: 0.0,
+            b_sat_t: 0.0,
+        })
+    }
+}
+
+/// Electro-thermal self-heating inputs. When `enabled`, `compute_losses`
+/// solves junction/inductor temperatures via a fixed-point iteration and makes
+/// `R_ds(on)` and inductor DCR temperature-dependent. All-zero R_th (or
+/// `enabled = false`) ⇒ isothermal 25 °C, identical to the previous model.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+pub struct ThermalParams {
+    pub enabled: bool,
+    /// Ambient temperature [°C].
+    pub t_ambient_c: f64,
+    /// HS / LS FET junction-to-ambient thermal resistance [°C/W]
+    /// (R_th_jc + heatsink/board R_th_ca).
+    pub r_th_ja_hs: f64,
+    pub r_th_ja_ls: f64,
+    /// Inductor-to-ambient thermal resistance [°C/W].
+    pub r_th_ja_ind: f64,
+    /// R_ds(on) temperature coefficient [1/°C]: ~0.004–0.006 (Si),
+    /// ~0.006–0.010 (GaN). Applied about 25 °C: `Rds(T)=Rds25·(1+tc·(T−25))`.
+    pub rds_tempco_hs: f64,
+    pub rds_tempco_ls: f64,
+}
+
+impl Default for ThermalParams {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            t_ambient_c: 25.0,
+            r_th_ja_hs: 0.0,
+            r_th_ja_ls: 0.0,
+            r_th_ja_ind: 0.0,
+            rds_tempco_hs: 0.0,
+            rds_tempco_ls: 0.0,
+        }
+    }
 }
 
 impl Default for SimParams {
@@ -396,6 +499,8 @@ impl Default for SimParams {
             output_caps: Vec::new(),
             num_phases: 1,
             controller_flavor: crate::inner_ctrl::InnerCtrlFlavor::HostF32,
+            magnetics: MagneticsConfig::default(),
+            thermal: ThermalParams::default(),
         }
     }
 }
@@ -475,6 +580,7 @@ pub fn build_ctrl_params(p: &SimParams) -> Option<Parameters> {
     };
     let phase_margin = if has_transport_delays(&p.mcu, &p.dac) {
         PhaseMargin::Calculated {
+            base_pm_rad: 50.0_f64.to_radians(),
             t_adc: p.mcu.t_adc_us * 1e-6,
             t_processing: p.mcu.t_processing_us * 1e-6,
             t_dac: p.dac.t_dac_us * 1e-6,
@@ -542,11 +648,79 @@ impl Battery {
     }
 }
 
-/// Run soft-start → steady-state → load-step (or battery charging) simulation.
+/// Design the code-domain 2P2Z compensator coefficients for `p` — exactly the
+/// controller `run_simulation` builds internally.
+///
+/// Exposed so callers (e.g. Monte-Carlo tolerance sweeps) can design the
+/// controller ONCE from the nominal design, then simulate perturbed plants
+/// against those FIXED coefficients via [`run_simulation_with_ctrl`]. That is
+/// the only way to observe whether the *shipped* controller keeps its stability
+/// margins across tolerances — re-designing the compensator for every perturbed
+/// plant (which `run_simulation` does by default) hides exactly that failure.
+pub fn design_weights_code(p: &SimParams) -> Result<TwoPoleTwoZeroParams<f32>, String> {
+    let f_sw = p.f_sw_khz * 1e3;
+    let l_inductor = p.l_uh * 1e-6;
+    let (c_out, r_esr) = if !p.output_caps.is_empty() {
+        let si_caps = to_cap_types(&p.output_caps);
+        (
+            CapBank::total_capacitance(&si_caps),
+            CapBank::effective_esr(&si_caps, f_sw),
+        )
+    } else {
+        (p.c_out_uf * 1e-6, p.r_esr_mohm * 1e-3)
+    };
+    let divider_ratio = (V_REF * 0.75) / p.v_out_target;
+    let ctrl_params =
+        build_ctrl_params(p).ok_or("Invalid operating point for controller design")?;
+    let ctrl_params_multi =
+        build_ctrl_params_multi(p).ok_or("Invalid operating point for controller design")?;
+    let (_, dac) = ctrl_params.to_transfer_function(p.v_in, ControlTopology::Buck);
+    let (tf, _) = ctrl_params_multi.to_transfer_function(p.v_in, ControlTopology::Buck);
+    let weights_phys = tf.to_2p2z().ok_or_else(|| {
+        format!(
+            "Compensator infeasible: transport delays erode too much phase at this \
+             crossover frequency. Max feasible: {:.1} kHz.",
+            ctrl_params_multi.max_feasible_crossover_hz(p.v_in, ControlTopology::Buck) / 1e3
+        )
+    })?;
+    // Ripple / limit-cycling guard: b0 × ΔV_ripple must fit inside vpp / safety_factor.
+    let d = p.v_out_target / p.v_in;
+    let v_l_on = p.v_in - p.v_out_target;
+    let di_l = v_l_on * d / (f_sw * l_inductor);
+    let dv_out = di_l * (r_esr + 1.0 / (8.0 * f_sw * c_out));
+    let b0_dv = (weights_phys.b0 as f64).abs() * dv_out;
+    let vpp_sf = dac.vpp() / ctrl_params_multi.safety_factor;
+    if b0_dv > vpp_sf {
+        return Err(format!(
+            "Crossover too high: b0 \u{00d7} \u{0394}V_ripple ({:.2}) exceeds vpp/SF ({:.2}), \
+             limit cycling likely.",
+            b0_dv, vpp_sf
+        ));
+    }
+    let weights_code = weights_phys.to_code_domain(divider_ratio);
+    if !weights_code.b0.is_finite() || weights_code.b0.abs() > 1e6 {
+        return Err("Controller coefficients out of range (b0 non-finite or > 1e6)".into());
+    }
+    Ok(weights_code)
+}
+
+/// Run soft-start → steady-state → load-step (or battery charging) simulation,
+/// designing the compensator from `p`.
 ///
 /// Returns `Err(reason)` when parameters are invalid or the compensator design
 /// is infeasible, so the UI can display the specific cause.
 pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
+    run_simulation_with_ctrl(p, None)
+}
+
+/// As [`run_simulation`], but if `weights_override` is `Some`, use those FIXED
+/// code-domain compensator coefficients instead of designing a fresh
+/// controller for `p`. Used by Monte-Carlo to hold the shipped controller
+/// constant while the plant varies.
+pub fn run_simulation_with_ctrl(
+    p: &SimParams,
+    weights_override: Option<TwoPoleTwoZeroParams<f32>>,
+) -> Result<Vec<SimPoint>, String> {
     if p.v_out_target >= p.v_in * 0.99 {
         return Err("V_out must be less than V_in".into());
     }
@@ -602,16 +776,14 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
     let ctrl_params = build_ctrl_params(p)
         .ok_or("Invalid operating point for controller design")?;
 
-    // Multi-phase parameters: used for compensator TF design.
-    // With N phases responding to the same trip current, the effective plant
-    // gain is N× higher.  Dividing current_sense_gain by N makes the
-    // compensator design produce correspondingly less loop gain.
-    let ctrl_params_multi = build_ctrl_params_multi(p)
-        .ok_or("Invalid operating point for controller design")?;
-
     // Slope comp and DAC settings use per-phase parameters
     let (_, dac) = ctrl_params.to_transfer_function(p.v_in, ControlTopology::Buck);
-    let slope_amp_per_sec = dac.dac_slope / cs_gain;
+    // Scale the ACTUAL simulated slope-compensation ramp by the
+    // over-compensation factor, so `slope_overcomp` affects the converter's
+    // trip dynamics and subharmonic stability — not just the anti-windup clamp
+    // and DAC-quantization step. (`dac.dac_slope` is the exact overcomp=1.0
+    // design slope; the firmware runs at `slope_overcomp`×.)
+    let slope_amp_per_sec = dac.dac_slope / cs_gain * p.slope_overcomp;
 
     let slope_step_size_a = if p.mcu.min_slope_steps_on_time > 0 {
         let d_nom = p.v_out_target / p.v_in;
@@ -621,42 +793,12 @@ pub fn run_simulation(p: &SimParams) -> Result<Vec<SimPoint>, String> {
         0.0
     };
 
-    // Compensator design uses multi-phase-aware parameters
-    let (tf, _) = ctrl_params_multi.to_transfer_function(p.v_in, ControlTopology::Buck);
-
-    let weights_phys = tf.to_2p2z().ok_or_else(|| {
-        format!(
-            "Compensator infeasible: transport delays erode too much phase \
-             at this crossover frequency. Max feasible: {:.1} kHz. \
-             Reduce f_x, lower cycles/tick, or reduce ADC/processing/DAC delays.",
-            ctrl_params_multi.max_feasible_crossover_hz(p.v_in, ControlTopology::Buck) / 1e3
-        )
-    })?;
-
-
-    // Ripple / limit-cycling check: b0 × ΔV_ripple must fit inside vpp / safety_factor
-    {
-        let d = p.v_out_target / p.v_in;
-        let v_l_on = p.v_in - p.v_out_target;
-        let di_l = v_l_on * d / (f_sw * l_inductor);
-        let dv_out = di_l * (r_esr + 1.0 / (8.0 * f_sw * c_out));
-        let b0_dv = (weights_phys.b0 as f64).abs() * dv_out;
-        let vpp_sf = dac.vpp() / ctrl_params_multi.safety_factor;
-        if b0_dv > vpp_sf {
-            return Err(format!(
-                "Crossover too high: b0 \u{00d7} \u{0394}V_ripple ({:.2}) exceeds vpp/SF ({:.2}), \
-                 limit cycling likely. Max feasible: {:.1} kHz",
-                b0_dv,
-                vpp_sf,
-                ctrl_params_multi.max_feasible_crossover_hz(p.v_in, ControlTopology::Buck) / 1e3
-            ));
-        }
-    }
-    let weights_code = weights_phys.to_code_domain(divider_ratio);
-
-    if !weights_code.b0.is_finite() || weights_code.b0.abs() > 1e6 {
-        return Err("Controller coefficients out of range (b0 non-finite or > 1e6)".into());
-    }
+    // Compensator: either the fixed override (Monte-Carlo shipped-controller
+    // mode) or a fresh design for this plant.
+    let weights_code = match weights_override {
+        Some(w) => w,
+        None => design_weights_code(p)?,
+    };
 
     let mut ctrl =
         crate::inner_ctrl::InnerCtrl::build(weights_code, 0.0_f32, 4096.0_f32, p.controller_flavor);
@@ -1324,6 +1466,8 @@ pub struct LossBreakdown {
     pub hs_conduction_w: f64,
     pub ls_conduction_w: f64,
     pub inductor_dcr_w: f64,
+    /// Magnetic core loss (iGSE). Zero unless `SimParams.magnetics` is enabled.
+    pub core_loss_w: f64,
     pub hs_switching_w: f64,
     pub ls_switching_w: f64,
     pub hs_eoss_w: f64,
@@ -1340,6 +1484,13 @@ pub struct LossBreakdown {
     pub total_loss_w: f64,
     pub p_out_w: f64,
     pub efficiency_pct: f64,
+    /// Steady-state HS/LS junction and inductor temperatures [°C]. Equal to
+    /// 25 °C (or ambient) when thermal modelling is disabled.
+    pub t_j_hs_c: f64,
+    pub t_j_ls_c: f64,
+    pub t_inductor_c: f64,
+    /// The self-heating fixed-point failed to converge (thermal runaway).
+    pub thermal_runaway: bool,
 }
 
 /// Compute power losses from simulation data and parameters.
@@ -1417,10 +1568,21 @@ pub fn compute_losses(
     // Per-phase I²_rms (divide total sum by N to get per-phase)
     let per_phase_i_rms2 = avg_i_rms2 / n_phases;
 
-    // Conduction losses (summed over all N phases)
-    let hs_conduction = p.hs_fet.rds_on_mohm * 1e-3 * avg_d * per_phase_i_rms2 * n_phases;
-    let ls_conduction = p.ls_fet.rds_on_mohm * 1e-3 * (1.0 - avg_d) * per_phase_i_rms2 * n_phases;
-    let inductor_dcr = p.dcr_mohm * 1e-3 * per_phase_i_rms2 * n_phases;
+    // Resistance-independent current factors. Conduction and DCR losses depend
+    // on temperature-dependent R_ds(on)/DCR and are solved in the electro-
+    // thermal fixed-point below.
+    let hs_cond_factor = avg_d * per_phase_i_rms2 * n_phases;
+    let ls_cond_factor = (1.0 - avg_d) * per_phase_i_rms2 * n_phases;
+    let dcr_factor = per_phase_i_rms2 * n_phases;
+
+    // Magnetic core loss (iGSE) for the triangular flux ripple. Zero unless a
+    // magnetics model is configured. Uses per-phase duty and peak-to-peak
+    // ripple; summed over N phases.
+    let core_loss = p.magnetics.to_profile().map_or(0.0, |m| {
+        let l = p.l_uh * 1e-6;
+        let di_pp = avg_i_max - avg_i_min;
+        m.core_loss_triangular(l, avg_d, di_pp, f_sw) * n_phases
+    });
 
     // Switching losses (per phase, summed over N phases)
     let t_rise = p.hs_fet.t_rise_ns * 1e-9;
@@ -1432,9 +1594,12 @@ pub fn compute_losses(
     let t_fall_ls = p.ls_fet.t_fall_ns * 1e-9;
     let ls_switching = 0.5 * v_in * (avg_i_max * t_rise_ls + avg_i_min * t_fall_ls) * f_sw * n_phases;
 
-    // Eoss: LS Coss charged/discharged each cycle (hard-switched by HS turn-on)
-    let coss_ls = p.ls_fet.coss_pf * 1e-12;
-    let hs_eoss = 0.5 * coss_ls * v_in * v_in * f_sw * n_phases;
+    // Eoss: the switch-node capacitance is charged/discharged each cycle when
+    // HS turns on hard. BOTH FETs' Coss sit on the switch node (HS drain→SW,
+    // LS SW→GND), so the node energy is ½·(C_oss,HS + C_oss,LS)·V_in². Using
+    // only the LS Coss under-counts this loss.
+    let coss_node = (p.hs_fet.coss_pf + p.ls_fet.coss_pf) * 1e-12;
+    let hs_eoss = 0.5 * coss_node * v_in * v_in * f_sw * n_phases;
 
     // Gate drive loss: both FETs per phase
     let qg_total = (p.hs_fet.qg_nc + p.ls_fet.qg_nc) * 1e-9;
@@ -1450,7 +1615,55 @@ pub fn compute_losses(
         _ => 0.0,
     };
 
-    let total_loss = hs_conduction + ls_conduction + inductor_dcr
+    // ── Electro-thermal self-heating ───────────────────────────────────────
+    // Solve junction/inductor temperatures and the temperature-dependent
+    // conduction & DCR losses by fixed-point iteration:
+    //     T = T_amb + R_th · P(T),   R_ds(on)(T) = Rds25·(1+tc·(T−25)),
+    //     DCR(T) = DCR25·(1 + 0.00393·(T−25)).
+    // Disabled (or R_th = 0) ⇒ stays at 25 °C ⇒ identical to the isothermal
+    // model. Non-convergence ⇒ thermal runaway (flagged, not silently capped).
+    let th = &p.thermal;
+    let t_amb = if th.enabled { th.t_ambient_c } else { 25.0 };
+    let mut t_j_hs = t_amb;
+    let mut t_j_ls = t_amb;
+    let mut t_ind = t_amb;
+    let mut hs_conduction = 0.0;
+    let mut ls_conduction = 0.0;
+    let mut inductor_dcr = 0.0;
+    let mut thermal_converged = false;
+    for _ in 0..24 {
+        let rds_hs =
+            p.hs_fet.rds_on_mohm * 1e-3 * (1.0 + th.rds_tempco_hs * (t_j_hs - 25.0)).max(0.05);
+        let rds_ls =
+            p.ls_fet.rds_on_mohm * 1e-3 * (1.0 + th.rds_tempco_ls * (t_j_ls - 25.0)).max(0.05);
+        let dcr = p.dcr_mohm * 1e-3 * (1.0 + 0.00393 * (t_ind - 25.0)).max(0.05);
+        hs_conduction = rds_hs * hs_cond_factor;
+        ls_conduction = rds_ls * ls_cond_factor;
+        inductor_dcr = dcr * dcr_factor;
+        if !th.enabled {
+            thermal_converged = true;
+            break;
+        }
+        // Per-device dissipation: conduction + that device's switching share.
+        let p_hs = (hs_conduction + hs_switching + hs_eoss) / n_phases;
+        let p_ls = (ls_conduction + ls_switching) / n_phases;
+        let p_ind = (inductor_dcr + core_loss) / n_phases;
+        let n_hs = (t_amb + th.r_th_ja_hs * p_hs).min(500.0);
+        let n_ls = (t_amb + th.r_th_ja_ls * p_ls).min(500.0);
+        let n_ind = (t_amb + th.r_th_ja_ind * p_ind).min(500.0);
+        let delta = (n_hs - t_j_hs).abs().max((n_ls - t_j_ls).abs()).max((n_ind - t_ind).abs());
+        t_j_hs = n_hs;
+        t_j_ls = n_ls;
+        t_ind = n_ind;
+        if delta < 0.1 {
+            thermal_converged = true;
+            break;
+        }
+    }
+    let thermal_runaway =
+        th.enabled && (!thermal_converged || t_j_hs >= 500.0 || t_j_ls >= 500.0 || t_ind >= 500.0);
+
+    let total_loss = hs_conduction + ls_conduction + inductor_dcr + core_loss
         + hs_switching + ls_switching + hs_eoss + gate_drive + commutation_ringing;
     let p_out = avg_v_out * avg_i_total;
     let efficiency = if p_out + total_loss > 0.0 {
@@ -1463,6 +1676,7 @@ pub fn compute_losses(
         hs_conduction_w: hs_conduction,
         ls_conduction_w: ls_conduction,
         inductor_dcr_w: inductor_dcr,
+        core_loss_w: core_loss,
         hs_switching_w: hs_switching,
         ls_switching_w: ls_switching,
         hs_eoss_w: hs_eoss,
@@ -1471,6 +1685,10 @@ pub fn compute_losses(
         total_loss_w: total_loss,
         p_out_w: p_out,
         efficiency_pct: efficiency,
+        t_j_hs_c: t_j_hs,
+        t_j_ls_c: t_j_ls,
+        t_inductor_c: t_ind,
+        thermal_runaway,
     })
 }
 
@@ -1520,6 +1738,8 @@ mod tests {
             output_caps: Vec::new(),
             num_phases: 1,
             controller_flavor: crate::inner_ctrl::InnerCtrlFlavor::HostF32,
+            magnetics: MagneticsConfig::default(),
+            thermal: ThermalParams::default(),
         }
     }
 
@@ -1558,7 +1778,132 @@ mod tests {
             output_caps: Vec::new(),
             num_phases: 1,
             controller_flavor: crate::inner_ctrl::InnerCtrlFlavor::HostF32,
+            magnetics: MagneticsConfig::default(),
+            thermal: ThermalParams::default(),
         }
+    }
+
+    #[test]
+    fn slope_overcomp_changes_the_simulated_dynamics() {
+        // Before the fix, slope_overcomp only touched the anti-windup clamp; now
+        // it scales the actual slope-compensation ramp in the trip dynamics, so
+        // two runs differing ONLY in slope_overcomp must produce different
+        // inductor-current waveforms.
+        let run = |oc: f64| {
+            let mut p = test_params();
+            p.slope_overcomp = oc;
+            run_simulation(&p).unwrap()
+        };
+        let a = run(1.0);
+        let b = run(1.5); // 1.5 = firmware default, known to run
+        let n = a.len().min(b.len());
+        let differ = (0..n).any(|i| (a[i].i_total_max - b[i].i_total_max).abs() > 1e-4);
+        assert!(differ, "slope_overcomp should change the simulated inductor current");
+    }
+
+    #[test]
+    fn magnetics_config_adds_core_loss() {
+        // Synthetic steady-state stream long enough for the Steps loss window.
+        let make = || SimPoint {
+            t_ms: 0.0,
+            v_out: 12.0,
+            phases: vec![PhasePoint { t_on: 1e-6, duty_pct: 50.0, i_l_min: 4.0, i_l_max: 6.0 }],
+            i_total_min: 4.0,
+            i_total_max: 6.0,
+            v_out_min: 12.0,
+            v_out_max: 12.0,
+            v_bat: 0.0,
+            v_in_cap: 0.0,
+        };
+        let data: Vec<SimPoint> =
+            (0..(SOFT_START_CYCLES + STEADY_STATE_CYCLES)).map(|_| make()).collect();
+
+        let mut p = test_params();
+        p.load_kind = LoadKind::Steps;
+        let base = compute_losses(&p, &data, None).unwrap();
+        assert_eq!(base.core_loss_w, 0.0, "core loss must be 0 when magnetics disabled");
+
+        p.magnetics = MagneticsConfig {
+            enabled: true,
+            k: 3.0,
+            alpha: 1.5,
+            beta: 2.5,
+            n_turns: 10.0,
+            a_e_mm2: 50.0,
+            v_e_mm3: 3000.0,
+        };
+        let with = compute_losses(&p, &data, None).unwrap();
+        assert!(with.core_loss_w > 0.0, "core loss should be > 0 when enabled");
+        // The total must increase by exactly the core-loss term.
+        assert!(
+            (with.total_loss_w - base.total_loss_w - with.core_loss_w).abs() < 1e-9,
+            "total must grow by exactly the core loss",
+        );
+    }
+
+    fn steady_stream() -> Vec<SimPoint> {
+        let make = || SimPoint {
+            t_ms: 0.0,
+            v_out: 12.0,
+            phases: vec![PhasePoint { t_on: 1e-6, duty_pct: 50.0, i_l_min: 4.0, i_l_max: 6.0 }],
+            i_total_min: 4.0,
+            i_total_max: 6.0,
+            v_out_min: 12.0,
+            v_out_max: 12.0,
+            v_bat: 0.0,
+            v_in_cap: 0.0,
+        };
+        (0..(SOFT_START_CYCLES + STEADY_STATE_CYCLES)).map(|_| make()).collect()
+    }
+
+    #[test]
+    fn thermal_self_heating_raises_tj_and_conduction() {
+        let data = steady_stream();
+        let mut p = test_params();
+        p.load_kind = LoadKind::Steps;
+        p.hs_fet.rds_on_mohm = 10.0;
+        p.ls_fet.rds_on_mohm = 10.0;
+
+        let base = compute_losses(&p, &data, None).unwrap();
+        assert_eq!(base.t_j_hs_c, 25.0, "isothermal 25 °C by default");
+        assert!(!base.thermal_runaway);
+
+        p.thermal = ThermalParams {
+            enabled: true,
+            t_ambient_c: 25.0,
+            r_th_ja_hs: 20.0,
+            r_th_ja_ls: 20.0,
+            r_th_ja_ind: 20.0,
+            rds_tempco_hs: 0.005,
+            rds_tempco_ls: 0.005,
+        };
+        let hot = compute_losses(&p, &data, None).unwrap();
+        assert!(hot.t_j_hs_c > 25.0, "HS junction should heat above ambient");
+        assert!(
+            hot.hs_conduction_w > base.hs_conduction_w,
+            "hot R_ds(on) ⇒ more conduction loss",
+        );
+        assert!(!hot.thermal_runaway, "reasonable R_th should converge");
+    }
+
+    #[test]
+    fn thermal_runaway_is_flagged() {
+        let data = steady_stream();
+        let mut p = test_params();
+        p.load_kind = LoadKind::Steps;
+        p.hs_fet.rds_on_mohm = 50.0;
+        // Absurd R_th × tempco so dP/dTj·R_th ≫ 1 → the fixed-point diverges.
+        p.thermal = ThermalParams {
+            enabled: true,
+            t_ambient_c: 25.0,
+            r_th_ja_hs: 1000.0,
+            r_th_ja_ls: 1000.0,
+            r_th_ja_ind: 0.0,
+            rds_tempco_hs: 0.02,
+            rds_tempco_ls: 0.02,
+        };
+        let lb = compute_losses(&p, &data, None).unwrap();
+        assert!(lb.thermal_runaway, "extreme R_th × tempco should flag runaway");
     }
 
     /// Check that the last N cycles of a simulation are "settled":

@@ -307,6 +307,10 @@ impl PfcState {
             slope_overcomp: self.slope_overcomp,
             ac_phases: self.ac_phases,
             output_caps: self.output_caps.clone(),
+            // mcu/dac (transport-delay profile) are injected from the buck's
+            // shared selection in show_pfc_central; default (ideal) here.
+            // PFC switching / Q_rr / core-loss inputs use defaults for now.
+            ..Default::default()
         }
     }
 
@@ -603,6 +607,10 @@ impl BuckSimApp {
             output_caps: self.output_caps.clone(),
             num_phases: self.num_phases,
             controller_flavor: self.controller_flavor,
+            // Core-loss (iGSE) / electro-thermal UI wiring is a later
+            // increment; disabled here.
+            magnetics: crate::sim::MagneticsConfig::default(),
+            thermal: crate::sim::ThermalParams::default(),
         }
     }
 
@@ -1402,6 +1410,9 @@ impl BuckSimApp {
                             ui.label(egui::RichText::new(format!("  HS FET:    {}", fmt_mw(lb.hs_conduction_w))).small().monospace());
                             ui.label(egui::RichText::new(format!("  LS FET:    {}", fmt_mw(lb.ls_conduction_w))).small().monospace());
                             ui.label(egui::RichText::new(format!("  Inductor:  {}", fmt_mw(lb.inductor_dcr_w))).small().monospace());
+                            if lb.core_loss_w > 0.0 {
+                                ui.label(egui::RichText::new(format!("  Core loss: {}", fmt_mw(lb.core_loss_w))).small().monospace());
+                            }
                             ui.label("Switching:");
                             ui.label(egui::RichText::new(format!("  HS overlap: {}", fmt_mw(lb.hs_switching_w))).small().monospace());
                             ui.label(egui::RichText::new(format!("  LS overlap: {}", fmt_mw(lb.ls_switching_w))).small().monospace());
@@ -1423,6 +1434,18 @@ impl BuckSimApp {
                             ui.label(egui::RichText::new(format!("Total loss:   {}", fmt_mw(lb.total_loss_w))).monospace());
                             ui.label(egui::RichText::new(format!("P_out:        {:.2} W", lb.p_out_w)).monospace());
                             ui.label(egui::RichText::new(format!("Efficiency:   {:.1}%", lb.efficiency_pct)).monospace());
+                            // Junction/inductor temperatures (only meaningful
+                            // when electro-thermal self-heating is enabled).
+                            if lb.t_j_hs_c > 25.0 || lb.t_j_ls_c > 25.0 || lb.t_inductor_c > 25.0 {
+                                ui.label(egui::RichText::new(format!(
+                                    "T_j HS/LS:    {:.0} / {:.0} °C",
+                                    lb.t_j_hs_c, lb.t_j_ls_c
+                                )).small().monospace());
+                                ui.label(egui::RichText::new(format!("T_ind:        {:.0} °C", lb.t_inductor_c)).small().monospace());
+                            }
+                            if lb.thermal_runaway {
+                                ui.label(egui::RichText::new("⚠ THERMAL RUNAWAY (loss/temperature diverges)").small().color(Color32::RED));
+                            }
                         } else {
                             ui.label(egui::RichText::new("No data").small().color(Color32::GRAY));
                         }
@@ -1722,6 +1745,7 @@ impl BuckSimApp {
                     if ui.button("Clear").clicked() {
                         self.loaded_loop = None;
                         self.loop_load_status = None;
+                        self.refresh_loss_breakdown();
                     }
                 }
                 None => {
@@ -1789,7 +1813,22 @@ impl BuckSimApp {
             extraction.r_dc_ohm * 1e3,
         );
         self.loaded_loop = Some(extraction);
+        self.refresh_loss_breakdown();
         Ok(msg)
+    }
+
+    /// Recompute the cached loss breakdown from the current sim data and the
+    /// loaded commutation loop. Called when the LoopExtraction changes
+    /// (load/clear) so the Ringing-loss line isn't left stale until the next
+    /// parameter change happens to re-run the simulation.
+    fn refresh_loss_breakdown(&mut self) {
+        let l_loop_h = self.loaded_loop.as_ref().map(|l| l.l_self_henry);
+        let params = self.last_params.clone();
+        self.loss_breakdown = self
+            .sim_data
+            .as_ref()
+            .ok()
+            .and_then(|d| compute_losses(&params, d, l_loop_h));
     }
 
     /// Spectrum-export strip on the Simulation tab. Writes a
@@ -2193,6 +2232,15 @@ impl BuckSimApp {
                     ui.label(format!("Diode: {:.2} W", m.p_loss_diode_w));
                     ui.label(format!("DCR:   {:.2} W", m.p_loss_dcr_w));
                     ui.label(format!("ESR:   {:.2} W", m.p_loss_esr_w));
+                    if m.p_loss_switching_w > 0.0 {
+                        ui.label(format!("Switching: {:.2} W", m.p_loss_switching_w));
+                    }
+                    if m.p_loss_qrr_w > 0.0 {
+                        ui.label(format!("Q_rr:  {:.2} W", m.p_loss_qrr_w));
+                    }
+                    if m.p_loss_core_w > 0.0 {
+                        ui.label(format!("Core:  {:.2} W", m.p_loss_core_w));
+                    }
                     ui.label(format!("Total: {:.2} W", m.p_loss_total_w));
                 }
             }
@@ -2211,8 +2259,12 @@ impl BuckSimApp {
     }
 
     fn show_pfc_central(&mut self, ui: &mut egui::Ui) {
-        // Re-run PFC simulation when params changed
-        let params = self.pfc.current_params();
+        // Re-run PFC simulation when params changed. Inject the buck's shared
+        // MCU/DAC transport-delay profile so the PFC current-loop design
+        // reserves the same loop delay (a G4 config affects both sims).
+        let mut params = self.pfc.current_params();
+        params.mcu = self.mcu.clone();
+        params.dac = self.dac.clone();
         if params != self.pfc.last_params {
             match run_pfc_simulation(&params) {
                 Ok((points, metrics, ds)) => {
@@ -2417,7 +2469,13 @@ impl BuckSimApp {
                     // P = V_out × I_load, I_in_rms ≈ P / (V_in_rms × PF)
                     // I_1 ≈ I_in_rms (fundamental dominates)
                     let p_w = self.pfc.p_loads_w.first().copied().unwrap_or(300.0);
-                    let i_fund = p_w / (self.pfc.v_in_rms * metrics.power_factor.max(0.01));
+                    let n_ac = self.pfc.ac_phases.max(1) as f64;
+                    // Per-phase fundamental: the total power splits across the AC
+                    // phases, and the IEC absolute-mA limits (like the harmonic
+                    // bars) are per-phase. Omitting /n_ac makes the fundamental
+                    // n_ac× too large and the limit lines n_ac× too strict.
+                    let i_fund =
+                        p_w / (self.pfc.v_in_rms * metrics.power_factor.max(0.01) * n_ac);
                     i_fund * 1000.0 // mA
                 } else {
                     1000.0
