@@ -25,7 +25,7 @@
 //! Pure orchestration — no new physics. Builds on `run_simulation`
 //! with no changes to the simulator core.
 
-use crate::sim::{SimParams, SimPoint, run_simulation};
+use crate::sim::{SimParams, SimPoint, design_weights_code, run_simulation_with_ctrl};
 
 /// One-sigma multiplicative spreads for each parameter, expressed as
 /// a fractional offset around the nominal (e.g. 0.20 = ±20 % at 1σ).
@@ -194,15 +194,26 @@ pub fn extract_kpi(data: &[SimPoint], v_target: f64) -> McKpi {
     if data.is_empty() {
         return McKpi { converged: false, ..Default::default() };
     }
-    // Whole-waveform droop / overshoot vs target.
+    // Droop / overshoot are transient-response KPIs (load-step dips), NOT the
+    // startup rise from 0 V. Measuring over the whole waveform makes v_min ≈ 0
+    // during soft-start, so v_droop_max ≈ v_target for EVERY run and the
+    // distribution collapses to a meaningless spike. Skip the soft-start ramp:
+    // start once V_out has first reached within 10 % of target (regulation),
+    // then measure droop/overshoot from there on.
+    let vt = v_target as f32;
+    let start = data
+        .iter()
+        .position(|p| p.v_out_min >= 0.9 * vt)
+        .unwrap_or(0);
+    let active = &data[start..];
     let mut v_min = f32::INFINITY;
     let mut v_max = f32::NEG_INFINITY;
-    for p in data {
+    for p in active {
         if p.v_out_min < v_min { v_min = p.v_out_min; }
         if p.v_out_max > v_max { v_max = p.v_out_max; }
     }
-    let droop = (v_target as f32 - v_min).max(0.0) as f64;
-    let over  = (v_max - v_target as f32).max(0.0) as f64;
+    let droop = (vt - v_min).max(0.0) as f64;
+    let over  = (v_max - vt).max(0.0) as f64;
     // Steady state from the trailing 200 samples (or whatever's
     // available on a short sim). Ripple = max(v_out_max) -
     // min(v_out_min); avg = mean of (v_out_max + v_out_min)/2.
@@ -238,9 +249,16 @@ pub fn monte_carlo(
     let mut rng = Xorshift64::new(seed);
     let mut kpis: Vec<McKpi> = Vec::with_capacity(n);
     let mut n_converged = 0usize;
+    // Design the SHIPPED controller ONCE from the nominal plant and hold it
+    // fixed across every perturbed realization. This is what lets the sweep
+    // reveal the fixed controller losing phase margin / going unstable on a
+    // tolerance corner — re-designing the compensator per perturbed plant
+    // (the old behaviour) always produced a well-matched controller and so
+    // masked exactly that failure mode.
+    let fixed_weights = design_weights_code(nominal).ok();
     for _ in 0..n {
         let p = perturb_params(nominal, tol, &mut rng);
-        match run_simulation(&p) {
+        match run_simulation_with_ctrl(&p, fixed_weights) {
             Ok(data) => {
                 let k = extract_kpi(&data, p.v_out_target);
                 if k.converged { n_converged += 1; }
@@ -347,5 +365,30 @@ mod tests {
         let s = summarize(&[], 0);
         assert_eq!(s.n_runs, 0);
         assert_eq!(s.v_droop_p50_v, 0.0);
+    }
+
+    /// Droop excludes the soft-start ramp: it should be the load-step
+    /// transient dip (a fraction of V_out), not ≈ V_out (which the old
+    /// whole-waveform scan produced because V_out starts at 0).
+    #[test]
+    fn droop_excludes_soft_start_ramp() {
+        let p = SimParams::default();
+        let data = run_simulation_with_ctrl(&p, None).unwrap();
+        let kpi = extract_kpi(&data, p.v_out_target);
+        assert!(
+            kpi.v_droop_max_v < 0.5 * p.v_out_target,
+            "droop {} should be << v_target {} (soft-start ramp must be excluded)",
+            kpi.v_droop_max_v,
+            p.v_out_target,
+        );
+    }
+
+    /// The Monte-Carlo sweep runs end-to-end with the fixed shipped controller.
+    #[test]
+    fn monte_carlo_runs_with_fixed_controller() {
+        let p = SimParams::default();
+        let s = monte_carlo(&p, &Tolerances::tight(), 4, 12345);
+        assert_eq!(s.n_runs, 4);
+        assert!(s.n_converged >= 1, "at least one realization should converge");
     }
 }
