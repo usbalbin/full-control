@@ -1,5 +1,6 @@
 pub mod ac_source;
 pub mod cap_bank;
+pub mod core_loss;
 pub mod edge_transient;
 pub mod math;
 pub mod pfc_boost;

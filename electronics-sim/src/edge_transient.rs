@@ -49,9 +49,14 @@
 //!
 //! Phase D. Parasitic LC ringing. With the diode off, C_oss_LS +
 //! C_oss_HS + sw_node_c float; the inductor current keeps flowing into
-//! the SW node, charging it up toward V_in. The PCB power-loop
-//! inductance `L_power` resonates against C_sw_total, damped by the
-//! loop DC resistance.
+//! the SW node, charging it up toward V_in, where it rings on the
+//! `L_power`–C_sw_total tank (damped by the loop DC resistance).
+//! Because explicit Euler cannot integrate this high-Q (~50–100 MHz,
+//! Q≈hundreds) ring accurately, the ring's first-peak **overshoot** is
+//! added to `v_sw_overshoot` in closed form (exact underdamped
+//! series-RLC step response); the ring's spectral content is modelled
+//! analytically in the spectrum-export path (`RingingParams`), so
+//! `L_power` is NOT an explicit ODE state (see state list below).
 //!
 //! Phase E. V_GS_HS rises past the Miller plateau into the FET's
 //! triode region; V_DS_HS settles at I_L · R_dson_HS.
@@ -669,7 +674,7 @@ pub fn simulate_hs_turn_on(
         // Miller current INTO C_iss from C_rss is C_rss · dV_DS/dt;
         // when V_DS is FALLING (turn-on), this *robs* gate charge for
         // the on-side and *injects* charge into the off-side gate.
-        let i_miller_hs = c_rss_hs * (-prev_dvsw_dt);
+        let i_miller_hs = c_rss_hs * prev_dvsw_dt;
         let i_miller_ls = c_rss_ls * (prev_dvsw_dt);
         let dv_gs_hs_dt = (i_g_hs - i_miller_hs) / fet_hs.c_iss;
         let dv_gs_ls_dt = (i_g_ls + i_miller_ls) / fet_ls.c_iss;
@@ -678,7 +683,7 @@ pub fn simulate_hs_turn_on(
         let dv_sw_dt = match diode {
             DiodeState::Forward => 0.0,
             DiodeState::ReverseRecovery | DiodeState::Off => {
-                (i_d_hs - i_l - i_d_ls - i_diode_ls) / c_sw_total
+                (i_d_hs - i_l - i_d_ls + i_diode_ls) / c_sw_total
             }
         };
 
@@ -710,11 +715,11 @@ pub fn simulate_hs_turn_on(
         // Slew-rate-limited driver outputs — step toward target by at
         // most slew_rate · dt; clamp at the target to avoid overshoot.
         v_drive_act_hs += dv_drv_hs_dt * cfg.dt;
-        if (v_drive_act_hs - v_drive_hs_target).signum() != dv_drv_hs_dt.signum() {
+        if (v_drive_act_hs - v_drive_hs_target).signum() == dv_drv_hs_dt.signum() {
             v_drive_act_hs = v_drive_hs_target;
         }
         v_drive_act_ls += dv_drv_ls_dt * cfg.dt;
-        if (v_drive_act_ls - v_drive_ls_target).signum() != dv_drv_ls_dt.signum() {
+        if (v_drive_act_ls - v_drive_ls_target).signum() == dv_drv_ls_dt.signum() {
             v_drive_act_ls = v_drive_ls_target;
         }
         // Bootstrap discharge: the gate-loop current i_g_hs is sourced
@@ -794,6 +799,27 @@ pub fn simulate_hs_turn_on(
         prev_i_d_ls = i_d_ls;
         t += cfg.dt;
         step += 1;
+    }
+
+    // Commutation-loop (L_power–C_sw) ring overshoot. The switch node doesn't
+    // just settle at V_in — it rings around it, and the first peak is the real
+    // voltage-stress number. Forward Euler cannot integrate this high-Q ring
+    // accurately (an explicit step either grows or artificially damps a
+    // ~50–100 MHz, Q≈hundreds oscillator), so we add the EXACT closed-form
+    // underdamped first-peak overshoot of the series RLC step response:
+    //   overshoot = V_step · exp(−α·π/ω_d),   α = R/(2L),  ω_d = √(ω_n² − α²)
+    // with V_step ≈ V_in (the node commutates by ~V_in). Overdamped ⇒ none.
+    {
+        let omega_n = 2.0 * std::f64::consts::PI * f_ring_est;
+        let alpha = op.loop_r / (2.0 * l_power);
+        let omega_d_sq = omega_n * omega_n - alpha * alpha;
+        if omega_d_sq > 0.0 {
+            let omega_d = omega_d_sq.sqrt();
+            let ring_overshoot = op.v_in * (-alpha * std::f64::consts::PI / omega_d).exp();
+            if ring_overshoot > v_sw_overshoot {
+                v_sw_overshoot = ring_overshoot;
+            }
+        }
     }
 
     let _ = v_boot_min; // optional reporting hook (not yet on EdgeWaveforms)
@@ -993,7 +1019,7 @@ pub fn simulate_hs_turn_off(
         //                     through C_rss. The V_GS_LS ≥ 0 clamp
         //                     (driver pull-down) catches it.
         // The sign convention from turn-on carries over unchanged:
-        let i_miller_hs = c_rss_hs * (-prev_dvsw_dt);
+        let i_miller_hs = c_rss_hs * prev_dvsw_dt;
         let i_miller_ls = c_rss_ls * (prev_dvsw_dt);
         let dv_gs_hs_dt = (i_g_hs - i_miller_hs) / fet_hs.c_iss;
         let dv_gs_ls_dt = (i_g_ls + i_miller_ls) / fet_ls.c_iss;
@@ -1002,7 +1028,7 @@ pub fn simulate_hs_turn_off(
         let dv_sw_dt = match diode {
             DiodeState::Forward => 0.0,
             DiodeState::ReverseRecovery | DiodeState::Off => {
-                (i_d_hs - i_l - i_d_ls - i_diode_ls) / c_sw_total
+                (i_d_hs - i_l - i_d_ls + i_diode_ls) / c_sw_total
             }
         };
 
@@ -1094,11 +1120,11 @@ pub fn simulate_hs_turn_off(
 
         // Slew-rate-limited driver outputs.
         v_drive_act_hs += dv_drv_hs_dt * cfg.dt;
-        if (v_drive_act_hs - v_drive_hs_target).signum() != dv_drv_hs_dt.signum() {
+        if (v_drive_act_hs - v_drive_hs_target).signum() == dv_drv_hs_dt.signum() {
             v_drive_act_hs = v_drive_hs_target;
         }
         v_drive_act_ls += dv_drv_ls_dt * cfg.dt;
-        if (v_drive_act_ls - v_drive_ls_target).signum() != dv_drv_ls_dt.signum() {
+        if (v_drive_act_ls - v_drive_ls_target).signum() == dv_drv_ls_dt.signum() {
             v_drive_act_ls = v_drive_ls_target;
         }
 
@@ -1169,6 +1195,31 @@ mod tests {
         let w = simulate_hs_turn_on(&p, &fet, &fet, &drv, &op, &cfg);
         assert!(!w.samples.is_empty());
         assert!(w.f_ring_est > 1e6); // expect MHz-range ring with these L/C
+    }
+
+    #[test]
+    fn v_sw_overshoot_includes_commutation_ring() {
+        let p = test_parasitics();
+        let fet = FetModel::bsc0902nsi();
+        let drv = DriverModel::generic_si_10v();
+        let op = OperatingPoint {
+            v_in: 12.0, v_out: 3.3, i_l_init: 3.0,
+            loop_r: 20e-3, l_inductor: 4.7e-6, c_in_farad: 0.0, c_y_chassis_farad: 0.0, c_boot_farad: 0.0,
+        };
+        let cfg = SimConfig::auto(&p, &fet);
+        let w = simulate_hs_turn_on(&p, &fet, &fet, &drv, &op, &cfg);
+        // Independent closed-form check: underdamped series-RLC first-peak overshoot.
+        let omega_n = 2.0 * std::f64::consts::PI * w.f_ring_est;
+        let alpha = op.loop_r / (2.0 * p.power_loop_l_henry);
+        let omega_d = (omega_n * omega_n - alpha * alpha).sqrt();
+        let expected = op.v_in * (-alpha * std::f64::consts::PI / omega_d).exp();
+        assert!(expected > 0.1, "test setup should give a real ring overshoot, got {expected}");
+        assert!(
+            w.v_sw_overshoot >= expected - 1e-9,
+            "v_sw_overshoot {} should include the closed-form ring overshoot {}",
+            w.v_sw_overshoot,
+            expected,
+        );
     }
 
     #[test]
