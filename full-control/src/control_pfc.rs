@@ -1,6 +1,6 @@
 use core::f64::consts::PI;
 
-use crate::control_2p2z::TwoPoleTwoZeroParams;
+use crate::control_2p2z::{PhaseMargin, TwoPoleTwoZeroParams};
 use crate::math::{atan, pow2, sqrt, tan};
 
 /// Parameters for PFC boost average current mode compensator design.
@@ -28,10 +28,11 @@ pub struct PfcParameters {
     pub current_crossover_hz: f64,
     /// Outer voltage loop target crossover [Hz].
     pub voltage_crossover_hz: f64,
-    /// Inner current loop phase margin [rad].
-    pub phase_margin_current: f64,
-    /// Outer voltage loop phase margin [rad].
-    pub phase_margin_voltage: f64,
+    /// Inner current loop phase-margin target — with optional transport-delay
+    /// reservation (`PhaseMargin::Calculated`), shared with the buck.
+    pub phase_margin_current: PhaseMargin,
+    /// Outer voltage loop phase-margin target.
+    pub phase_margin_voltage: PhaseMargin,
 }
 
 /// Continuous-time design summary for both PFC control loops.
@@ -53,6 +54,9 @@ pub struct PfcDesignSummary {
     pub inner_omega_x: f64,
     /// Achieved phase margin [rad].
     pub inner_phase_margin: f64,
+    /// Total inner-loop transport delay [s] reserved in the design; drawn as
+    /// e^{-jωτ} on the Bode plot so the plot and the design agree.
+    pub inner_loop_delay_s: f64,
 
     // ── Outer voltage loop ────────────────────────────────────
     /// Voltage plant gain: V_in_pk / (2 × V_out).
@@ -180,12 +184,20 @@ impl PfcParameters {
         // HF pole at Nyquist: ω_cp1 = π × f_sw
         let inner_omega_cp1 = PI * self.f_sw;
 
-        let (inner_omega_cp0, inner_omega_cz1, _) = design_type2(
-            plant_mag_at_fx,
-            omega_x_i,
-            inner_omega_cp1,
-            self.phase_margin_current,
-        )?;
+        // Reserve the loop's transport delay in the phase-margin target, just
+        // as the buck does. The ACM inner loop carries one extra sample of
+        // delay beyond ADC+processing+DAC because it computes duty from the
+        // PREVIOUS cycle's average current (i_avg_prev), hence the 1/f_sw of
+        // `extra_delay_s`.
+        let pm_inner = self.phase_margin_current.effective_rad(
+            self.current_crossover_hz,
+            self.f_sw,
+            1,
+            1.0 / self.f_sw,
+        );
+        let inner_delay_s = self.phase_margin_current.delay_s(self.f_sw, 1, 1.0 / self.f_sw);
+        let (inner_omega_cp0, inner_omega_cz1, _) =
+            design_type2(plant_mag_at_fx, omega_x_i, inner_omega_cp1, pm_inner)?;
 
         let inner_coeffs = bilinear_type2(inner_omega_cp0, inner_omega_cz1, inner_omega_cp1, t_s);
 
@@ -205,12 +217,12 @@ impl PfcParameters {
         // Pole at 2×f_line for 2nd harmonic ripple rejection
         let outer_omega_cp1 = 2.0 * PI * (2.0 * self.f_line);
 
-        let (outer_omega_cp0, outer_omega_cz1, _) = design_type2(
-            outer_plant_mag_at_fx,
-            omega_x_v,
-            outer_omega_cp1,
-            self.phase_margin_voltage,
-        )?;
+        // Outer loop: delay erosion is negligible at a 10–20 Hz crossover, but
+        // resolve it through the same path for consistency.
+        let pm_outer =
+            self.phase_margin_voltage.effective_rad(self.voltage_crossover_hz, self.f_sw, 1, 0.0);
+        let (outer_omega_cp0, outer_omega_cz1, _) =
+            design_type2(outer_plant_mag_at_fx, omega_x_v, outer_omega_cp1, pm_outer)?;
 
         let outer_coeffs = bilinear_type2(outer_omega_cp0, outer_omega_cz1, outer_omega_cp1, t_s);
 
@@ -221,7 +233,8 @@ impl PfcParameters {
             inner_omega_cz1,
             inner_omega_cp1,
             inner_omega_x: omega_x_i,
-            inner_phase_margin: self.phase_margin_current,
+            inner_phase_margin: pm_inner,
+            inner_loop_delay_s: inner_delay_s,
 
             outer_plant_gain,
             c_out: self.c_out,
@@ -230,7 +243,7 @@ impl PfcParameters {
             outer_omega_cz1,
             outer_omega_cp1,
             outer_omega_x: omega_x_v,
-            outer_phase_margin: self.phase_margin_voltage,
+            outer_phase_margin: pm_outer,
 
             f_sw: self.f_sw,
             f_line: self.f_line,
@@ -255,7 +268,10 @@ impl PfcParameters {
         for _ in 0..50 {
             let mid = (lo + hi) / 2.0;
             let omega_x = 2.0 * PI * mid;
-            let phi_target = self.phase_margin_current + atan(omega_x / omega_cp1);
+            let phi_target = self
+                .phase_margin_current
+                .effective_rad(mid, self.f_sw, 1, 1.0 / self.f_sw)
+                + atan(omega_x / omega_cp1);
             if phi_target < 0.5 * PI {
                 lo = mid;
             } else {
@@ -284,9 +300,36 @@ mod tests {
             r_sense: 50e-3,
             current_crossover_hz: 6_500.0, // f_sw / 10
             voltage_crossover_hz: 10.0,
-            phase_margin_current: 60.0_f64.to_radians(),
-            phase_margin_voltage: 60.0_f64.to_radians(),
+            phase_margin_current: PhaseMargin::Manual { phase_margin: 60.0_f64.to_radians() },
+            phase_margin_voltage: PhaseMargin::Manual { phase_margin: 60.0_f64.to_radians() },
         }
+    }
+
+    #[test]
+    fn transport_delay_reservation_caps_crossover() {
+        // Mirror the buck: reserving real MCU delay must (a) lower the max
+        // feasible crossover and (b) make the delay-blind default crossover
+        // infeasible — the honest "too aggressive for this hardware" outcome.
+        let mut p = reference_params();
+        assert!(p.design().is_some(), "ideal-profile reference design should succeed");
+        let max_ideal = p.max_inner_crossover_hz();
+
+        p.phase_margin_current = PhaseMargin::Calculated {
+            base_pm_rad: 60.0_f64.to_radians(),
+            t_adc: 1.2e-6,
+            t_processing: 1.5e-6,
+            t_dac: 1.7e-6,
+        };
+        let max_delay = p.max_inner_crossover_hz();
+        assert!(max_delay < max_ideal, "delay must lower max crossover: {max_delay} vs {max_ideal}");
+        assert!(
+            max_delay < p.current_crossover_hz,
+            "with real delay the 6.5 kHz crossover should exceed the feasible max ({max_delay} Hz)"
+        );
+        assert!(
+            p.design().is_none(),
+            "delay-blind crossover should be infeasible once real delay is reserved"
+        );
     }
 
     #[test]

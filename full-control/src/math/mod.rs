@@ -34,15 +34,23 @@ pub const fn fabs(x: f64) -> f64 {
 }
 
 pub const fn sqrt(x: f64) -> f64 {
-    let mut res = x / 2.0;
     if x == 0.0 {
-        return 0.0;
+        return x; // ±0 → ±0 (preserves the sign of zero)
     }
     if x < 0.0 {
-        panic!("Invalid input");
+        panic!("sqrt of a negative number");
     }
+    if !(x < f64::INFINITY) {
+        return x; // +∞ → +∞ ; NaN → NaN (both fail `x < ∞`)
+    }
+    // Seed by halving the exponent via the classic sqrt bit hack, then refine
+    // with Newton–Raphson. The seed is within ~a factor of 2 across the ENTIRE
+    // normal range, so a handful of quadratically-converging steps suffice.
+    // (The old `x / 2.0` seed needed O(exponent) steps and so silently failed
+    // to converge outside roughly [2^-190, 2^180] with a fixed iteration count.)
+    let mut res = f64::from_bits((x.to_bits() >> 1) + 0x1ff8_0000_0000_0000u64);
     let mut i = 0;
-    while i < 100 {
+    while i < 8 {
         res = 0.5 * (res + x / res);
         i += 1;
     }
@@ -90,3 +98,35 @@ pub(crate) use div;
 pub(crate) use i;
 
 // From https://github.com/rust-lang/libm/blob/master/libm/src/math/mod.rs#L394
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::sqrt;
+
+    #[test]
+    fn sqrt_matches_std_across_wide_range() {
+        // Includes exponents that the old x/2-seed, fixed-100-iteration Newton
+        // failed to converge for (roughly outside [2^-190, 2^180]).
+        let xs = [
+            0.0_f64, 1.0, 2.0, 4.0, 0.25, 1e-6, 1e6, 1e-30, 1e30,
+            2.0_f64.powi(180), 2.0_f64.powi(300), 2.0_f64.powi(-300),
+            1e-300, 1e300, f64::MIN_POSITIVE, 123456.789,
+        ];
+        for &x in &xs {
+            let got = sqrt(x);
+            let want = x.sqrt();
+            let tol = want * 1e-12 + 1e-300;
+            assert!(
+                (got - want).abs() <= tol,
+                "sqrt({x:e}) = {got:e}, std = {want:e}",
+            );
+        }
+    }
+
+    #[test]
+    fn sqrt_special_values() {
+        assert_eq!(sqrt(0.0), 0.0);
+        assert!(sqrt(f64::INFINITY).is_infinite());
+        assert!(sqrt(f64::NAN).is_nan());
+    }
+}

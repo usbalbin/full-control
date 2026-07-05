@@ -44,6 +44,15 @@ impl<S: Scalar> PiController<S> {
         output.clamp(self.out_min, self.out_max)
     }
 
+    /// Output-clamping (back-calculation) anti-windup: set the integrator so
+    /// the controller's output equals `realized` for the given `error`. Call
+    /// after a downstream saturation (e.g. the duty clamp) with the
+    /// actually-applied output, so the integrator tracks reality instead of
+    /// winding up behind the saturation.
+    pub fn set_realized_output(&mut self, realized: S, error: S) {
+        self.integrator = (realized - self.kp * error).clamp(self.out_min, self.out_max);
+    }
+
     pub fn reset(&mut self) {
         self.integrator = S::ZERO;
     }
@@ -88,10 +97,18 @@ impl<S: Scalar> DqCurrentController<S> {
     /// - `kp`, `ki`: PI gains for both d and q axes
     /// - `v_dc_max`: maximum expected DC bus voltage (for PI clamping)
     pub fn new(pll: SrfPll<S>, kp: S, ki: S, v_dc_max: S) -> Self {
+        // The modulator realizes v_cmd = (duty − 0.5)·V_dc with duty ∈ [0, 1],
+        // i.e. |v_cmd| ≤ 0.5·V_dc. Clamp each PI to that same modulation
+        // half-range so the integrator cannot wind up past what the duty
+        // saturation can actually realize — the old ±V_dc clamp was 2× too
+        // loose, so on over-modulation the integrator wound up and recovered
+        // slowly. (A grid-voltage-feedforward-aware back-calculation would be
+        // even tighter, but this ties anti-windup to the real duty limit.)
+        let half_range = v_dc_max * S::from_f32(0.5);
         Self {
             pll,
-            pi_d: PiController::new(kp, ki, -v_dc_max, v_dc_max),
-            pi_q: PiController::new(kp, ki, -v_dc_max, v_dc_max),
+            pi_d: PiController::new(kp, ki, -half_range, half_range),
+            pi_q: PiController::new(kp, ki, -half_range, half_range),
             feedforward: true,
             decoupling_l: S::ZERO,
         }
@@ -143,41 +160,57 @@ impl<S: Scalar> DqCurrentController<S> {
         let (i_d, i_q) = park(i_alpha, i_beta, sin_t, cos_t);
 
         // PI controllers (error = reference − measured)
-        let u_d = self.pi_d.update(i_d_ref - i_d, dt);
-        let u_q = self.pi_q.update(i_q_ref - i_q, dt);
+        let err_d = i_d_ref - i_d;
+        let err_q = i_q_ref - i_q;
+        let u_d = self.pi_d.update(err_d, dt);
+        let u_q = self.pi_q.update(err_q, dt);
 
-        // Converter voltage command in dq frame
-        // v_conv = v_grid − u  (u drives the current error to zero)
-        let mut v_d_cmd = -u_d;
-        let mut v_q_cmd = -u_q;
-
+        // Feedforward + cross-coupling terms, kept SEPARATE from the PI effort
+        // so we can back-calculate the realized PI output after the duty clamp.
+        let mut ff_dec_d = S::ZERO;
+        let mut ff_dec_q = S::ZERO;
         if self.feedforward {
             let (v_d_grid, v_q_grid) = park(v_alpha, v_beta, sin_t, cos_t);
-            v_d_cmd = v_d_cmd + v_d_grid;
-            v_q_cmd = v_q_cmd + v_q_grid;
+            ff_dec_d = ff_dec_d + v_d_grid;
+            ff_dec_q = ff_dec_q + v_q_grid;
         }
-
-        // Cross-coupling decoupling
         let l = self.decoupling_l;
         if !(l == S::ZERO) {
             let omega = pll_out.omega;
-            v_d_cmd = v_d_cmd + omega * l * i_q;
-            v_q_cmd = v_q_cmd - omega * l * i_d;
+            ff_dec_d = ff_dec_d + omega * l * i_q;
+            ff_dec_q = ff_dec_q - omega * l * i_d;
         }
 
-        // Inverse Park: dq → αβ
-        let (v_alpha_cmd, v_beta_cmd) = inv_park(v_d_cmd, v_q_cmd, sin_t, cos_t);
+        // Converter voltage command: v_conv = (feedforward + decoupling) − u.
+        let v_d_cmd = ff_dec_d - u_d;
+        let v_q_cmd = ff_dec_q - u_q;
 
-        // Inverse Clarke: αβ → ABC modulation voltages
+        // Inverse Park → αβ, inverse Clarke → per-phase modulation voltages.
+        let (v_alpha_cmd, v_beta_cmd) = inv_park(v_d_cmd, v_q_cmd, sin_t, cos_t);
         let (v_a_cmd, v_b_cmd, v_c_cmd) = inv_clarke(v_alpha_cmd, v_beta_cmd);
 
-        // Duty cycles: duty = 0.5 + v_cmd / V_dc
+        // Duty cycles: duty = 0.5 + v_cmd / V_dc, clamped to [0, 1].
         let half = S::from_f32(0.5);
         let one = S::from_f32(1.0);
         let inv_vdc = one / v_dc;
         let duty_a = (half + v_a_cmd * inv_vdc).clamp(S::ZERO, one);
         let duty_b = (half + v_b_cmd * inv_vdc).clamp(S::ZERO, one);
         let duty_c = (half + v_c_cmd * inv_vdc).clamp(S::ZERO, one);
+
+        // Back-calculation anti-windup: recover the ACTUALLY-applied dq voltage
+        // from the clamped duties and unwind each integrator to the realized
+        // control effort. This ties anti-windup to the real [0, 1] duty limit
+        // (including the headroom the feedforward already consumes), not just
+        // the coarse PI clamp. When unsaturated it is a no-op (the transform
+        // round-trip recovers v_cmd exactly).
+        let v_a_app = (duty_a - half) * v_dc;
+        let v_b_app = (duty_b - half) * v_dc;
+        let v_c_app = (duty_c - half) * v_dc;
+        let (v_al_app, v_be_app) = clarke(v_a_app, v_b_app, v_c_app);
+        let (v_d_app, v_q_app) = park(v_al_app, v_be_app, sin_t, cos_t);
+        // v_*_app = ff_dec_* − u_*_realized  ⇒  u_*_realized = ff_dec_* − v_*_app.
+        self.pi_d.set_realized_output(ff_dec_d - v_d_app, err_d);
+        self.pi_q.set_realized_output(ff_dec_q - v_q_app, err_q);
 
         DqOutput {
             duty_a,
@@ -223,8 +256,10 @@ mod tests {
         // PLL: omega_n = 2π×30, zeta = 0.707
         let omega_n = TAU * 30.0;
         let zeta = 0.707_f32;
-        let kp_pll = 2.0 * zeta * omega_n / v_pk;
-        let ki_pll = omega_n * omega_n / v_pk;
+        // Amplitude-normalized PLL: gains no longer divide by V_pk.
+        let _ = v_pk;
+        let kp_pll = 2.0 * zeta * omega_n;
+        let ki_pll = omega_n * omega_n;
         let pll = SrfPll::new(f_hz, kp_pll, ki_pll, 5.0);
 
         // Current PI: ω_bw ≈ 2π×500 (current loop bandwidth)
@@ -381,5 +416,31 @@ mod tests {
             out.i_d
         );
         assert!(out.i_q.abs() < i_d_ref * 0.10, "i_q = {}", out.i_q);
+    }
+
+    #[test]
+    fn integrator_bounded_under_saturation() {
+        // Unreachable current reference with zero measured current keeps the
+        // error huge, so the PI + duty stage over-modulates. Back-calculation
+        // must keep each integrator within the modulation half-range
+        // (±0.5·V_dc) rather than winding up to the old ±V_dc clamp.
+        let v_pk = 325.0_f32;
+        let f_hz = 50.0;
+        let v_dc = 700.0;
+        let mut ctrl = make_controller(v_pk, f_hz, v_dc);
+        let dt = 1.0 / 20_000.0;
+        for i in 0..4000 {
+            let t = i as f32 * dt;
+            let (va, vb, vc) = grid_v(v_pk, f_hz, t);
+            ctrl.update(va, vb, vc, 0.0, 0.0, 0.0, 1000.0, 0.0, v_dc, dt);
+        }
+        let bound = 0.5 * v_dc + 1.0;
+        assert!(
+            ctrl.pi_d.integrator.abs() <= bound,
+            "d integrator {} exceeds modulation half-range {}",
+            ctrl.pi_d.integrator,
+            bound
+        );
+        assert!(ctrl.pi_q.integrator.abs() <= bound, "q integrator {}", ctrl.pi_q.integrator);
     }
 }

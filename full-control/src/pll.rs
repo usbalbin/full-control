@@ -38,9 +38,10 @@ pub struct PllOutput<S> {
 ///
 /// # Tuning
 ///
-/// For a 3-phase system with line-to-neutral peak voltage V_pk:
-/// - `kp = 2 × ζ × ω_n / V_pk`
-/// - `ki = ω_n² / V_pk`
+/// The phase detector is amplitude-normalized, so the gains are set directly
+/// by the target loop dynamics — independent of grid voltage:
+/// - `kp = 2 × ζ × ω_n`
+/// - `ki = ω_n²`
 ///
 /// where ω_n is the PLL natural frequency (typically 2π×20‥50 rad/s)
 /// and ζ is the damping ratio (0.707 for critically damped).
@@ -81,17 +82,28 @@ impl<S: Scalar> SrfPll<S> {
     /// `dt`: time step since last call \[s\].
     #[inline(always)]
     pub fn update(&mut self, v_alpha: S, v_beta: S, dt: S) -> PllOutput<S> {
-        // Park transform q-axis: phase error signal
+        // Park transform: v_q is the phase-error signal, v_d the amplitude axis.
+        let v_d = v_alpha * self.cos_theta + v_beta * self.sin_theta;
         let v_q = v_beta * self.cos_theta - v_alpha * self.sin_theta;
 
+        // Normalize the phase detector by the grid amplitude so the loop
+        // bandwidth and damping are independent of grid voltage (robust to
+        // sags/swells). At lock v_amp ≈ V_pk, so phase_err ≈ sin(θ_err).
+        let v_amp = (v_d * v_d + v_q * v_q).sqrt();
+        let phase_err = if v_amp > S::from_f32(1e-6) {
+            v_q / v_amp
+        } else {
+            v_q
+        };
+
         // PI controller
-        self.integrator = self.integrator + self.ki * v_q * dt;
+        self.integrator = self.integrator + self.ki * phase_err * dt;
         self.integrator = self.integrator.clamp(
             S::ZERO - self.omega_max_dev,
             self.omega_max_dev,
         );
 
-        let omega_correction = self.kp * v_q + self.integrator;
+        let omega_correction = self.kp * phase_err + self.integrator;
         self.omega = self.omega_nominal + omega_correction;
 
         // Advance angle: rotating phasor with small-angle approximation
@@ -158,12 +170,40 @@ mod tests {
 
     /// Build a PLL tuned for a given V_pk and grid frequency.
     fn make_pll(v_pk: f32, f_hz: f32) -> SrfPll<f32> {
-        // omega_n = 2π×30, zeta = 0.707
+        // omega_n = 2π×30, zeta = 0.707. With the amplitude-normalized phase
+        // detector the gains no longer divide by V_pk.
+        let _ = v_pk;
         let omega_n = TAU * 30.0;
         let zeta = 0.707_f32;
-        let kp = 2.0 * zeta * omega_n / v_pk;
-        let ki = omega_n * omega_n / v_pk;
+        let kp = 2.0 * zeta * omega_n;
+        let ki = omega_n * omega_n;
         SrfPll::new(f_hz, kp, ki, 5.0)
+    }
+
+    #[test]
+    fn lock_is_amplitude_independent() {
+        // With amplitude normalization the loop dynamics — and thus the settled
+        // phase error — don't depend on grid amplitude. Run the same lock at
+        // nominal and at a deep sag and compare the normalized residual v_q.
+        let residual = |v_pk: f32| -> f32 {
+            let f_sw = 20_000.0;
+            let dt = 1.0 / f_sw;
+            let mut pll = make_pll(v_pk, 50.0);
+            let mut vq_norm = 0.0;
+            for i in 0..2000 {
+                // 100 ms
+                let t = i as f32 * dt;
+                let (va, vb) = grid_alpha_beta(v_pk, 50.0, t);
+                let out = pll.update(va, vb, dt);
+                vq_norm = (vb * out.cos_theta - va * out.sin_theta) / v_pk;
+            }
+            vq_norm.abs()
+        };
+        let nominal = residual(325.0);
+        let sag = residual(50.0); // deep sag to 15% of nominal
+        assert!(nominal < 0.02, "should be locked at nominal, residual={nominal}");
+        assert!(sag < 0.02, "should be locked at deep sag, residual={sag}");
+        assert!((nominal - sag).abs() < 0.02, "lock dynamics must not depend on amplitude");
     }
 
     #[test]

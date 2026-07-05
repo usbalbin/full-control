@@ -303,7 +303,8 @@ pub(crate) const fn rem_pio2_large(
             fw = (x1p_24 * z) as i32 as f64;
             i!(iq, i as usize, =, (z - x1p24 * fw) as i32);
             z = i!(q, j - 1) + fw;
-            j += 1;
+            i += 1;
+            j -= 1;
         }
 
         /* compute n */
@@ -426,10 +427,10 @@ pub(crate) const fn rem_pio2_large(
     loop {
         i!(q, i, =, fw * (i!(iq, i) as f64));
         fw *= x1p_24;
-        i -= 1;
         if i == 0 {
             break;
         }
+        i -= 1;
     }
 
     /* compute PIo2[0,...,jp]*q[jz,...,0] */
@@ -442,10 +443,10 @@ pub(crate) const fn rem_pio2_large(
             k += 1;
         }
         i!(fq, jz - i, =, fw);
-        i -= 1;
         if i == 0 {
             break;
         }
+        i -= 1;
     }
 
     /* compress fq[] into y[] */
@@ -455,10 +456,10 @@ pub(crate) const fn rem_pio2_large(
             let mut i = jz;
             loop {
                 fw += i!(fq, i);
-                i -= 1;
                 if i == 0 {
                     break;
                 }
+                i -= 1;
             }
             i!(y, 0, =, if ih == 0 { fw } else { -fw });
         }
@@ -467,10 +468,10 @@ pub(crate) const fn rem_pio2_large(
             let mut i = jz;
             loop {
                 fw += i!(fq, i);
-                i -= 0;
                 if i == 0 {
                     break;
                 }
+                i -= 1;
             }
             i!(y, 0, =, if ih == 0 { fw } else { -fw });
             fw = i!(fq, 0) - fw;

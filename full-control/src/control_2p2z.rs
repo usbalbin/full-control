@@ -429,10 +429,18 @@ impl Parameters {
         // Additional constraint for Boost and BuckBoost: RHP zero.
         let rhp_limit = match topology {
             Topology::Buck => f64::MAX,
-            Topology::Boost | Topology::BuckBoost => {
+            Topology::Boost => {
                 let d_prime = 1.0 - d;
                 let r_load = self.v_out / self.i_load;
                 let omega_rhp = d_prime * d_prime * r_load / self.l_inductor;
+                omega_rhp / (4.0 * PI * self.safety_factor)
+            }
+            Topology::BuckBoost => {
+                // Buck-boost RHP zero carries an extra 1/D vs boost:
+                //   ω_rhp = R·(1−D)² / (D·L)   (boost: ω_rhp = R·(1−D)²/L).
+                let d_prime = 1.0 - d;
+                let r_load = self.v_out / self.i_load;
+                let omega_rhp = d_prime * d_prime * r_load / (d * self.l_inductor);
                 omega_rhp / (4.0 * PI * self.safety_factor)
             }
         };
@@ -646,14 +654,61 @@ impl Parameters {
 #[derive(Debug, Copy, Clone)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub enum PhaseMargin {
+    /// Fixed phase-margin target [rad]; no transport-delay reservation.
     Manual {
         phase_margin: f64,
     },
+    /// Reserve the phase eroded by transport delay: the compensator targets
+    /// `base_pm_rad` of REALIZED phase margin *after* the ADC + processing +
+    /// DAC (+ decimation-hold + any caller-supplied extra) delay is subtracted
+    /// at crossover.
     Calculated {
+        /// Desired realized phase margin [rad] after delay erosion.
+        base_pm_rad: f64,
         t_adc: f64,
         t_processing: f64,
         t_dac: f64,
     },
+}
+
+impl PhaseMargin {
+    /// Total loop transport delay [s] this setting reserves (`0.0` for
+    /// [`PhaseMargin::Manual`]). Used both for the phase-erosion term and to
+    /// draw a consistent `e^{-jωτ}` on the Bode plot.
+    ///
+    /// - `cycles_per_tick` adds `(cycles_per_tick − 1)/f_sw` of decimation-hold
+    ///   delay (the MCU holds its output between updates).
+    /// - `extra_delay_s` is any additional loop delay beyond ADC+proc+DAC+hold,
+    ///   e.g. the PFC average-current-mode's one-sample current-averaging
+    ///   latency; pass `0.0` when there is none (the buck).
+    pub const fn delay_s(&self, f_sw: f64, cycles_per_tick: usize, extra_delay_s: f64) -> f64 {
+        match *self {
+            PhaseMargin::Manual { .. } => 0.0,
+            PhaseMargin::Calculated { t_adc, t_processing, t_dac, .. } => {
+                let t_hold = cycles_per_tick.saturating_sub(1) as f64 / f_sw;
+                t_adc + t_processing + t_dac + t_hold + extra_delay_s
+            }
+        }
+    }
+
+    /// Effective compensator phase-margin target [rad] at crossover `f_x` — the
+    /// base margin plus the phase the loop's transport delay erodes
+    /// (`2π·f_x·τ`). Shared by the buck ([`TransferFunction::to_2p2z`]) and the
+    /// PFC ([`crate::control_pfc`]) so both reserve delay identically.
+    pub const fn effective_rad(
+        &self,
+        f_x: f64,
+        f_sw: f64,
+        cycles_per_tick: usize,
+        extra_delay_s: f64,
+    ) -> f64 {
+        match *self {
+            PhaseMargin::Manual { phase_margin } => phase_margin,
+            PhaseMargin::Calculated { base_pm_rad, .. } => {
+                base_pm_rad + 2.0 * PI * f_x * self.delay_s(f_sw, cycles_per_tick, extra_delay_s)
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -705,18 +760,8 @@ impl TransferFunction {
         let f_x = self.crossover_hz;
         let ohmega_x = 2.0 * PI * f_x;
 
-        let phase_margin = match self.phase_margin {
-            PhaseMargin::Manual { phase_margin } => phase_margin,
-            PhaseMargin::Calculated {
-                t_adc,
-                t_processing,
-                t_dac,
-            } => {
-                let t_hold = (self.cycles_per_tick - 1) as f64 / self.f_sw;
-                let phase_erosion = 2.0 * PI * f_x * (t_adc + t_processing + t_dac + t_hold);
-                50.0_f64.to_radians() + phase_erosion
-            }
-        };
+        let phase_margin =
+            self.phase_margin.effective_rad(f_x, self.f_sw, self.cycles_per_tick, 0.0);
 
         let r = ohmega_x / ohmega_n;
         let complex_pole_pair = atan(r / (1.0 - pow2(r)));
@@ -779,21 +824,7 @@ impl TransferFunction {
         let ohmega_x = 2.0 * PI * f_x;
         p!(ohmega_x, "?");
 
-        let phase_margin = match phase_margin {
-            PhaseMargin::Manual { phase_margin } => phase_margin,
-            PhaseMargin::Calculated {
-                t_adc,
-                t_processing,
-                t_dac,
-            } => {
-                // Include (cycles_per_tick - 1) extra switching-cycle delays that arise
-                // because the MCU holds its output constant between control updates.
-                let t_hold = (cycles_per_tick - 1) as f64 / f_sw;
-                let phase_erosion = 2.0 * PI * f_x * (t_adc + t_processing + t_dac + t_hold);
-                // TODO: Is 50 enough?
-                50.0f64.to_radians() + phase_erosion
-            }
-        };
+        let phase_margin = phase_margin.effective_rad(f_x, f_sw, cycles_per_tick, 0.0);
 
         //#[cfg(not(feature = "hardware"))]
         //assert!(phase_erosion < 90.0f64.to_radians());

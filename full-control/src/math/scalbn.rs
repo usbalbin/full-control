@@ -23,9 +23,12 @@ pub const fn scalbn(mut x: f64, mut n: i32) -> f64 {
     // Bits including the implicit bit
     let sig_total_bits = SIG_BITS + 1;
 
-    // Maximum and minimum values when biased
-    let exp_max = f64::MAX_EXP;
-    let exp_min = f64::MIN_EXP;
+    // IEEE unbiased exponent limits: Emax = 1023, Emin = -1022 for f64.
+    // NOT f64::MAX_EXP / f64::MIN_EXP (1024 / -1021) — those follow C's
+    // `Emax + 1` convention; using them overshoots by one, which yields a
+    // factor-of-2 scaling error and spurious Inf/underflow at the extremes.
+    let exp_max = EXP_BIAS as i32;
+    let exp_min = -(exp_max - 1);
 
     // 2 ^ Emax, maximum positive with null significand (0x1p1023 for f64)
     let f_exp_max = from_parts(false, EXP_BIAS << 1, zero);

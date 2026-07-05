@@ -60,10 +60,17 @@ impl<S: Scalar, const N: usize> CurrentSharing<S, N> {
         let n = S::from_f32(self.active as f32);
         let mean = sum / n;
 
+        // The democratic mean-based error has an inherent (active-1)/active
+        // sensitivity to each phase's own current, so the loop gain — and thus
+        // bandwidth/damping — would otherwise drift with the active phase
+        // count. Normalize by active/(active-1) so `kp`/`ki` map to a
+        // phase-count-independent loop gain (active >= 2 here, so no /0).
+        let gain_norm = n / (n - S::from_f32(1.0));
+
         let neg_max = -self.max_trim;
 
         for i in 0..self.active {
-            let error = mean - currents[i];
+            let error = (mean - currents[i]) * gain_norm;
 
             // Update integrator.
             self.integrators[i] = self.integrators[i] + self.ki * error;
@@ -84,12 +91,18 @@ impl<S: Scalar, const N: usize> CurrentSharing<S, N> {
 
     /// Change the number of active phases.
     ///
-    /// Resets all integrators for safety (transient protection during
-    /// phase shedding / addition).
+    /// Only the integrators of phases whose activation status changes are
+    /// zeroed (shed phases, and newly-added phases start fresh); phases that
+    /// remain active KEEP their learned mismatch correction. Zeroing every
+    /// integrator (the old behaviour) would bump the surviving phases at each
+    /// shed/add event.
     pub fn set_active(&mut self, n: usize) {
         assert!(n <= N, "active phases exceeds const generic N");
+        let (lo, hi) = (n.min(self.active), n.max(self.active));
+        for i in lo..hi {
+            self.integrators[i] = S::ZERO;
+        }
         self.active = n;
-        self.reset();
     }
 }
 
@@ -239,6 +252,21 @@ mod tests {
                 cs.integrators[i]
             );
         }
+    }
+
+    #[test]
+    fn set_active_preserves_surviving_phase_integrators() {
+        let mut cs = CurrentSharing::<f32, 4>::new(0.1, 0.5, 1.0, 3);
+        for _ in 0..20 {
+            cs.update(&[6.0, 4.0, 5.0, 0.0]);
+        }
+        let saved = cs.integrators;
+        assert!(saved[0].abs() > EPS && saved[1].abs() > EPS, "should have state");
+        // Shed phase 2 (3 → 2): surviving phases keep state, shed phase zeroed.
+        cs.set_active(2);
+        assert_eq!(cs.integrators[0], saved[0], "phase 0 integrator must survive");
+        assert_eq!(cs.integrators[1], saved[1], "phase 1 integrator must survive");
+        assert_eq!(cs.integrators[2], 0.0, "shed phase 2 integrator must be zeroed");
     }
 
     #[test]

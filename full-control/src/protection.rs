@@ -57,6 +57,11 @@ pub struct FaultMonitor<S: Scalar> {
     state: FaultState,
     debounce_counter: u32,
     recovery_counter: u32,
+    /// If set, the monitor stays disarmed until the value has first been in the
+    /// safe range — preventing e.g. a UVLO from latching at power-up while the
+    /// input is still ramping up from 0 V.
+    arm_on_first_valid: bool,
+    armed: bool,
 }
 
 impl<S: Scalar> FaultMonitor<S> {
@@ -70,6 +75,8 @@ impl<S: Scalar> FaultMonitor<S> {
             state: FaultState::Ok,
             debounce_counter: 0,
             recovery_counter: 0,
+            arm_on_first_valid: false,
+            armed: true,
         }
     }
 
@@ -91,12 +98,29 @@ impl<S: Scalar> FaultMonitor<S> {
         self
     }
 
+    /// Enable startup blanking: the monitor will not fault until the value has
+    /// first entered the safe range. Essential for a latched UVLO — otherwise
+    /// the sub-threshold value at power-up (input ramping from 0 V) trips it
+    /// immediately and latches the converter off before it can even start.
+    pub fn with_startup_blanking(mut self) -> Self {
+        self.arm_on_first_valid = true;
+        self.armed = false;
+        self
+    }
+
     /// Main per-tick method: feed the current value and advance the state machine.
     pub fn check(&mut self, value: S) -> FaultState {
         match self.state {
             FaultState::Ok => {
                 let exceeded = self.threshold_exceeded(value);
-                if exceeded {
+                if self.arm_on_first_valid && !self.armed {
+                    // Startup blanking: ignore faults until the value has first
+                    // been in the safe range, then arm.
+                    if !exceeded {
+                        self.armed = true;
+                    }
+                    self.debounce_counter = 0;
+                } else if exceeded {
                     self.debounce_counter += 1;
                     if self.debounce_counter >= self.debounce_ticks {
                         self.debounce_counter = 0;
@@ -158,6 +182,9 @@ impl<S: Scalar> FaultMonitor<S> {
         self.state = FaultState::Ok;
         self.debounce_counter = 0;
         self.recovery_counter = 0;
+        // Re-blank so a cleared UVLO waits for a valid input again rather than
+        // immediately re-tripping on a still-low value.
+        self.armed = !self.arm_on_first_valid;
     }
 
     /// Check if the value exceeds any configured threshold.
@@ -378,5 +405,32 @@ mod tests {
         let low: f32 = Scalar::from_f32(0.5);
         assert_eq!(mon.check(low), FaultState::Ok); // debounce 1
         assert_eq!(mon.check(low), FaultState::Faulted); // debounce 2 => trip
+    }
+
+    // ---- Test 9: startup blanking prevents UVLO false-trip at power-up ----
+    #[test]
+    fn startup_blanking_prevents_uvlo_false_trip() {
+        let mut uvp = FaultMonitor::<f32>::new(FaultAction::Latch)
+            .with_lower(8.0)
+            .with_debounce(1)
+            .with_startup_blanking();
+        // Input ramping from 0 V — below the 8 V UVLO threshold, but must NOT
+        // trip while still starting up.
+        assert_eq!(uvp.check(0.0), FaultState::Ok);
+        assert_eq!(uvp.check(4.0), FaultState::Ok);
+        assert_eq!(uvp.check(7.9), FaultState::Ok);
+        // Input reaches valid range → monitor arms.
+        assert_eq!(uvp.check(24.0), FaultState::Ok);
+        // A genuine brownout AFTER arming does trip.
+        assert_eq!(uvp.check(5.0), FaultState::Faulted);
+    }
+
+    // ---- Test 10: without blanking, a UVLO false-trips at power-up ----
+    #[test]
+    fn without_blanking_uvlo_trips_at_power_up() {
+        let mut uvp = FaultMonitor::<f32>::new(FaultAction::Latch)
+            .with_lower(8.0)
+            .with_debounce(1);
+        assert_eq!(uvp.check(0.0), FaultState::Faulted);
     }
 }

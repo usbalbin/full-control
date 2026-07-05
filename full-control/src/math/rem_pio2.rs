@@ -185,9 +185,45 @@ pub(crate) const fn rem_pio2(x: f64) -> (i32, f64, f64) {
         i -= 1;
     }
     let mut ty = [0.0; 3];
-    let n = rem_pio2_large(&tx, i - 1, &mut ty, ((ix as i32) >> 20) - (0x3ff + 23), 1);
+    let n = rem_pio2_large(&tx, i + 1, &mut ty, ((ix as i32) >> 20) - (0x3ff + 23), 1);
     if sign != 0 {
         return (-n, -i!(ty, 0), -i!(ty, 1));
     }
     (n, i!(ty, 0), i!(ty, 1))
+}
+
+#[cfg(all(test, feature = "std"))]
+mod tests {
+    use super::rem_pio2;
+    use core::f64::consts::FRAC_PI_4;
+
+    // Regression guard for the large-|x| reduction path (rem_pio2_large):
+    // previously several down-counting loops dropped index 0, the distill
+    // loop ran in the wrong direction and never advanced `i`, one loop never
+    // decremented (infinite loop), and rem_pio2 passed the wrong term count.
+    #[test]
+    fn large_argument_reduction() {
+        let xs = [
+            1.0e6_f64, 1.0e8, 1.0e10, 1.0e12, 1.0e15, 1.0e18, 1.0e22,
+            6.283_185_3e7, -9.876_543_21e14, 123_456_789.0,
+        ];
+        for &x in &xs {
+            let (n, y0, y1) = rem_pio2(x);
+            let rem = y0 + y1;
+            // The defining invariant of argument reduction: |x mod pi/2| <= pi/4.
+            assert!(
+                rem.abs() <= FRAC_PI_4 + 1e-9,
+                "x={x}: |y0+y1|={} exceeds pi/4 (n={n})",
+                rem.abs()
+            );
+            let got = crate::math::tan(x);
+            assert!(got.is_finite(), "tan({x}) not finite");
+            // Tight cross-check with std, but only away from the tan poles
+            // (near a pole tan is ill-conditioned: a 1-ulp angle error blows up).
+            let want = x.tan();
+            if want.abs() < 100.0 {
+                assert!((got - want).abs() < 1e-6, "tan({x}) = {got}, std = {want}");
+            }
+        }
+    }
 }

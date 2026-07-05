@@ -174,6 +174,51 @@ fn select_mode(v_in: f64, v_out: f64, current: Mode) -> Mode {
     if ratio >= 1.0 - DELTA && ratio <= 1.0 + DELTA {
         return Mode::BuckBoost;
     }
-    // Soft hysteresis zone between the two boundaries — keep current mode
-    current
+    // Soft hysteresis zone between the two boundaries — keep the current mode,
+    // but only if it is consistent with which side of unity the ratio is on.
+    // A discontinuous V_in jump from (say) the Buck region straight into the
+    // Boost-side band would otherwise latch the WRONG extreme mode; fall back
+    // to BuckBoost in that case.
+    if ratio > 1.0 {
+        // Buck-side band (1+DELTA .. 1+2·DELTA): Boost is inconsistent here.
+        match current {
+            Mode::Boost => Mode::BuckBoost,
+            other => other,
+        }
+    } else {
+        // Boost-side band (1−2·DELTA .. 1−DELTA): Buck is inconsistent here.
+        match current {
+            Mode::Buck => Mode::BuckBoost,
+            other => other,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hysteresis_keeps_same_side_mode() {
+        assert_eq!(select_mode(1.3, 1.0, Mode::Buck), Mode::Buck);
+        assert_eq!(select_mode(0.7, 1.0, Mode::Boost), Mode::Boost);
+        // BuckBoost is valid to keep in either band.
+        assert_eq!(select_mode(1.3, 1.0, Mode::BuckBoost), Mode::BuckBoost);
+        assert_eq!(select_mode(0.7, 1.0, Mode::BuckBoost), Mode::BuckBoost);
+    }
+
+    #[test]
+    fn hysteresis_does_not_latch_opposite_extreme() {
+        // Was Buck, ratio drops into the Boost-side band → must not stay Buck.
+        assert_eq!(select_mode(0.7, 1.0, Mode::Buck), Mode::BuckBoost);
+        // Was Boost, ratio jumps into the Buck-side band → must not stay Boost.
+        assert_eq!(select_mode(1.3, 1.0, Mode::Boost), Mode::BuckBoost);
+    }
+
+    #[test]
+    fn hard_boundaries_switch_regardless_of_current() {
+        assert_eq!(select_mode(2.0, 1.0, Mode::Boost), Mode::Buck);
+        assert_eq!(select_mode(0.4, 1.0, Mode::Buck), Mode::Boost);
+        assert_eq!(select_mode(1.0, 1.0, Mode::Buck), Mode::BuckBoost);
+    }
 }
