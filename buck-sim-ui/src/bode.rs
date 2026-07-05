@@ -327,10 +327,25 @@ impl BodeData {
         }
 
         // Find gain margin: loop gain at the frequency where phase = -180°.
+        // loop_phase comes from atan2 and is wrapped to (-180, 180], so a raw
+        // scan for a downward -180 crossing never fires (at the true crossing
+        // the wrapped value jumps to +180). Unwrap the phase first, then scan.
+        let mut unwrapped = loop_phase.clone();
+        for i in 1..unwrapped.len() {
+            let mut d = unwrapped[i] - unwrapped[i - 1];
+            while d > 180.0 {
+                unwrapped[i] -= 360.0;
+                d -= 360.0;
+            }
+            while d < -180.0 {
+                unwrapped[i] += 360.0;
+                d += 360.0;
+            }
+        }
         let mut gain_margin_db = f64::INFINITY;
         for i in 1..N_POINTS {
-            if loop_phase[i - 1] > -180.0 && loop_phase[i] <= -180.0 {
-                let frac = (loop_phase[i - 1] + 180.0) / (loop_phase[i - 1] - loop_phase[i]);
+            if unwrapped[i - 1] > -180.0 && unwrapped[i] <= -180.0 {
+                let frac = (unwrapped[i - 1] + 180.0) / (unwrapped[i - 1] - unwrapped[i]);
                 let mag_at_cross = loop_mag[i - 1] + frac * (loop_mag[i] - loop_mag[i - 1]);
                 gain_margin_db = -mag_at_cross;
                 break;
