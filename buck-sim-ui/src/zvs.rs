@@ -66,9 +66,9 @@ pub fn coss_total_farads(hs: &FetProfile, ls: &FetProfile) -> f64 {
 /// reaches V_in.
 ///
 /// Solving the LC tank
-///   `V_SW(t) = V_in − V_in·cos(ωt) + I·Z_0·sin(ωt)`
+///   `V_SW(t) = I·Z_0·sin(ωt)`   (the inductor current driving the L_loop–Coss tank)
 /// for V_SW = V_in gives
-///   `t_opt = arctan(V_in / (I · Z_0)) / ω`
+///   `t_opt = asin(V_in / (I · Z_0)) / ω`   (valid when `I·Z_0 ≥ V_in`)
 /// where `ω = 1/√(L·C)`, `Z_0 = √(L/C)`.
 ///
 /// At threshold load (`I·Z_0 = V_in`) → `t_opt = T_res/4` (quarter
@@ -89,17 +89,18 @@ pub fn optimal_deadtime_s(
     }
     let omega = 1.0 / (l_h * coss_total_f).sqrt();
     let z0 = (l_h / coss_total_f).sqrt();
+    let quarter = 0.5 * std::f64::consts::PI / omega;
     let drive = i_load_a.abs() * z0;
-    if drive < 1e-12 {
-        return 0.5 * std::f64::consts::PI / omega; // quarter period
+    // Below the ZVS threshold (I·Z0 < V_in) the swing can't reach V_in no
+    // matter the deadtime; the best you can do is fire at the peak of the
+    // swing, which occurs at the quarter resonance period.
+    if drive < v_in_v {
+        return quarter;
     }
-    let t = (v_in_v / drive).atan() / omega;
-    // Clamp to [0, quarter-period] — the analytic formula returns a
-    // small positive value for any drive, but at high drive levels
-    // it can dip below the simulator's typical clock resolution
-    // (sub-100 ps). The caller uses this as a target deadtime; we
-    // protect against rounding-to-zero with a sub-ps epsilon.
-    t.max(0.0).min(0.5 * std::f64::consts::PI / omega)
+    // At/above threshold: V_SW(t) = I·Z0·sin(ωt) first reaches V_in at
+    // t = asin(V_in/(I·Z0))/ω, which shrinks below T_res/4 as the drive rises.
+    let t = (v_in_v / drive).asin() / omega;
+    t.max(0.0).min(quarter)
 }
 
 /// "Threshold drive" — the load current at which the LC-tank
@@ -122,8 +123,8 @@ pub fn threshold_drive_a(v_in_v: f64, l_h: f64, coss_total_f: f64) -> f64 {
 /// Solves `V_SW(t_dt) = V_in` for I:
 ///
 /// ```text
-/// V_in − V_in·cos(ω·t_dt) + I·Z_0·sin(ω·t_dt) = V_in
-/// I = V_in · cot(ω·t_dt) / Z_0     (when ω·t_dt < π)
+/// I·Z_0·sin(ω·t_dt) = V_in
+/// I = V_in / (Z_0 · sin(ω·t_dt))   (ω·t_dt ≤ π/2; past the peak → threshold V_in/Z_0)
 /// ```
 ///
 /// Below this load and deadtime the SW node hasn't reached V_in
@@ -143,25 +144,19 @@ pub fn min_load_for_zvs_at_deadtime_a(
     let omega = 1.0 / (l_h * coss_total_f).sqrt();
     let z0 = (l_h / coss_total_f).sqrt();
     let phase = omega * t_dt_s;
-    if phase >= std::f64::consts::PI {
-        // Past half-period — V_SW has long since clamped.
-        return 0.0;
-    }
     if phase <= 1e-12 {
         // No deadtime → impossible no matter how high the load.
         return f64::INFINITY;
     }
-    let c = phase.cos();
-    if c <= 0.0 {
-        // V_SW has reached or passed V_in for the first time
-        // (body diode clamped). Any load drives ZVS.
-        return 0.0;
+    // At/after the quarter period the swing has reached its peak (I·Z0); ZVS
+    // then needs only peak ≥ V_in ⇒ the threshold current V_in/Z0 (and once
+    // the node clamps at V_in the HS body diode holds it there through the
+    // window). Unlike the old model, a below-threshold load never reaches ZVS.
+    if phase >= 0.5 * std::f64::consts::PI {
+        return v_in_v / z0;
     }
-    let s = phase.sin();
-    if s.abs() < 1e-12 {
-        return f64::INFINITY;
-    }
-    v_in_v * c / (z0 * s)
+    // Before the peak: need V_SW(t_dt) = I·Z0·sin(phase) ≥ V_in.
+    v_in_v / (z0 * phase.sin())
 }
 
 /// V_DS across the HS FET at the moment its gate fires, given the
@@ -173,7 +168,7 @@ pub fn min_load_for_zvs_at_deadtime_a(
 /// driving at I_0):
 ///
 /// ```text
-/// V_SW(t) = V_in − V_in·cos(ωt) + I·Z_0·sin(ωt)
+/// V_SW(t) = I·Z_0·sin(ωt)   (clamped to [0, V_in] by the LS / HS body diodes)
 /// ```
 ///
 /// Three regimes:
@@ -185,9 +180,10 @@ pub fn min_load_for_zvs_at_deadtime_a(
 ///   clamped node (residual loss is body-diode-driven, not Coss-
 ///   driven, and outside this closed-form's scope).
 ///
-/// At sub-threshold drive (`I·Z_0 < V_in`), V_SW peaks at
-/// `√(V_in² + (I·Z_0)²) − V_in` and then ramps back down. The HS
-/// turn-on at peak yields residual `V_DS = V_in − V_peak`.
+/// At sub-threshold drive (`I·Z_0 < V_in`), V_SW peaks at `I·Z_0`
+/// (< V_in) at the quarter period and then rings back down. The HS
+/// turn-on yields residual `V_DS = V_in − V_SW(t_dt)` (≥ `V_in − I·Z_0`),
+/// never exceeding V_in thanks to the lower body-diode clamp.
 pub fn vds_residual_at_turnon_v(
     v_in_v: f64,
     i_load_a: f64,
@@ -199,16 +195,21 @@ pub fn vds_residual_at_turnon_v(
     if l_h <= 0.0 || coss_total_f <= 0.0 { return v_in_v; }
     let omega = 1.0 / (l_h * coss_total_f).sqrt();
     let z0 = (l_h / coss_total_f).sqrt();
-    let i = i_load_a.abs();
+    let drive = i_load_a.abs() * z0;
     let phase = omega * t_dt_s;
-    // V_SW(t) = V_in − V_in·cos(phase) + I·Z_0·sin(phase)
-    let v_sw = v_in_v - v_in_v * phase.cos() + i * z0 * phase.sin();
-    if v_sw >= v_in_v {
-        // Body diode clamps at V_in. The HS gate fires into a node
-        // already at V_in → ZVS for the FET, body-diode losses
-        // ignored here (they're a separate budget item).
-        return 0.0;
+    if drive >= v_in_v {
+        // The swing can reach V_in; it first does so at ω·t = asin(V_in/(I·Z0)),
+        // after which the HS body diode clamps V_SW at V_in → ZVS, zero residual.
+        if phase >= (v_in_v / drive).asin() {
+            return 0.0;
+        }
+        // Still rising, hasn't reached V_in yet.
+        return v_in_v - drive * phase.sin();
     }
+    // Below threshold the node peaks below V_in and follows the resonance,
+    // floored at the LS body-diode rail (~0) so the residual can't exceed V_in
+    // (the old model omitted this lower clamp, so E_hard could exceed ½·C·V_in²).
+    let v_sw = (drive * phase.sin()).clamp(0.0, v_in_v);
     v_in_v - v_sw
 }
 
@@ -324,33 +325,48 @@ mod tests {
         );
     }
 
-    /// `min_load_for_zvs_at_deadtime_a` solves for the load current
-    /// I such that V_SW(t_dt) = V_in. Above the threshold-drive
-    /// regime the optimal deadtime is < T/4; the test fixes
-    /// V_in=24, L=5nH, C=1.2nF and t_dt=1ns and asks "how much
-    /// current do I need for ZVS at this deadtime?". Closed form:
-    /// I = V_in · cot(ω·t_dt) / Z_0.
-    /// ω = 1/√(5e-9·1.2e-9) = 4.08e8, ωt = 0.408, cos=0.918,
-    /// sin=0.397, Z_0=2.04 → I = 24·(0.918/0.397)/2.04 = 27.2 A.
+    /// `min_load_for_zvs_at_deadtime_a` solves `I·Z_0·sin(ω·t_dt) = V_in` for
+    /// the load current needed to hit ZVS at the given (sub-quarter-period)
+    /// deadtime. V_in=24, L=5nH, C=1.2nF, t_dt=1ns:
+    /// ω = 1/√(5e-9·1.2e-9) = 4.08e8, ω·t = 0.408, sin = 0.397, Z_0 = 2.04
+    /// → I = 24 / (2.04·0.397) = 29.6 A.
     #[test]
     fn min_load_for_zvs_at_deadtime_closed_form() {
         let i = min_load_for_zvs_at_deadtime_a(24.0, 5e-9, 1.2e-9, 1e-9);
+        assert!(i > 28.0 && i < 31.0, "expected ~29.6 A, got {i}");
+    }
+
+    /// Past `T_res/4` the swing has reached its peak (I·Z_0); ZVS then needs
+    /// only peak ≥ V_in, i.e. the threshold current V_in/Z_0. Crucially — and
+    /// unlike the old V_in-driven model — a below-threshold load NEVER achieves
+    /// ZVS no matter how long the deadtime, so this returns the threshold, not 0.
+    #[test]
+    fn min_load_for_zvs_at_long_deadtime_is_threshold() {
+        let (v_in, l, c) = (24.0, 5e-9, 1.2e-9);
+        // T/4 = (π/2)·√(L·C) ≈ 1.92 ns. Use 5 ns ⇒ well past.
+        let i = min_load_for_zvs_at_deadtime_a(v_in, l, c, 5e-9);
+        let threshold = threshold_drive_a(v_in, l, c);
         assert!(
-            i > 25.0 && i < 30.0,
-            "expected ~27 A, got {i}",
+            (i - threshold).abs() < 1e-6,
+            "long-deadtime min load should equal the threshold drive {threshold}, got {i}"
         );
     }
 
-    /// At a deadtime past `T_res/4` the body diode has already
-    /// clamped — any load achieves ZVS. Confirm the helper returns
-    /// 0 in that regime.
+    /// The whole point of the current-source model: at zero inductor current
+    /// there is NO ZVS at any deadtime (the old model spuriously reported it).
     #[test]
-    fn min_load_for_zvs_at_long_deadtime_is_zero() {
-        let l = 5e-9;
-        let c = 1.2e-9;
-        // T/4 = (π/2)·√(L·C) ≈ 1.92 ns. Use 5 ns ⇒ well past.
-        let i = min_load_for_zvs_at_deadtime_a(24.0, l, c, 5e-9);
-        assert_eq!(i, 0.0, "expected 0 at long deadtime, got {i}");
+    fn zero_current_never_achieves_zvs() {
+        let (v_in, l, c) = (24.0, 5e-9, 1.2e-9);
+        // Even at the optimal deadtime, residual = full V_in at I = 0
+        // (the old V_in-driven model spuriously reported ZVS here).
+        let t_opt = optimal_deadtime_s(v_in, 0.0, l, c);
+        let vds = vds_residual_at_turnon_v(v_in, 0.0, l, c, t_opt);
+        assert!((vds - v_in).abs() < 1e-9, "I=0 must give full hard switching, got {vds}");
+        // End-to-end: the report must flag non-ZVS at zero current.
+        let hs = FetProfile::epc2306();
+        let ls = FetProfile::epc2306();
+        let r = zvs_report(v_in, 0.0, 1e6, 5e-9, &hs, &ls, t_opt);
+        assert!(!r.achieved_zvs, "zero-current ZVS must be flagged as not achieved");
     }
 
     /// Below threshold load: V_DS residual ≈ V_in − I·Z_0. With
