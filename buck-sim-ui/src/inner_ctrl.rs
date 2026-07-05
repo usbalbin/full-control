@@ -93,23 +93,26 @@ impl InnerCtrl {
                 InnerCtrl::F32(weights.to_controller(lo_code, hi_code))
             }
             InnerCtrlFlavor::FmacQ15 => {
-                let r = weights.min_fmac_r();
-                let coeffs = weights.fmac_coeffs(r);
+                // The FMAC needs R ≥ 1 (net accumulator shift 15−R ∈ [1, 14]).
+                // This `r_eff` must be used for EVERYTHING — coefficient
+                // quantisation, the y-limit pre-scale, the accumulator shift,
+                // and the code↔q1.15 I/O adapters — so the 2^R gain factors
+                // cancel exactly. Quantising the coefficients at the raw
+                // `min_fmac_r()` (which can be 0) while the shift/I-O used
+                // `r_eff = 1` produced a 2× output-gain error on small-gain
+                // compensators.
+                let r_eff = weights.min_fmac_r().max(1);
+                let coeffs = weights.fmac_coeffs(r_eff);
                 let b = [coeffs[0], coeffs[1], coeffs[2]];
                 let a = [coeffs[3], coeffs[4]];
-                // y_min/y_max in q1.15 bits: `code << R`. Clamp
-                // to i16 range so a high R doesn't overflow.
+                // y_min/y_max in q1.15 bits: `code << R`. Clamp to i16 range so
+                // a high R doesn't overflow.
                 let to_q15_bits = |code: f32| -> i16 {
-                    let bits = (code as i64) << r;
+                    let bits = (code as i64) << r_eff;
                     bits.clamp(i16::MIN as i64, i16::MAX as i64) as i16
                 };
                 let y_min = to_q15_bits(lo_code);
                 let y_max = to_q15_bits(hi_code);
-                // FmacIir::new asserts r ≥ 1; clamp here so an
-                // all-small-coef weight set (which would give r=0)
-                // still runs (it just means no post-accumulator
-                // shift, which is fine for a "small gain" path).
-                let r_eff = r.max(1);
                 let fmac = FmacIir::new(b, a, r_eff, y_min, y_max);
                 InnerCtrl::Fmac {
                     fmac,
@@ -228,6 +231,17 @@ mod tests {
         let out = c.update_clamped(100.0, 0.0, 4095.0);
         // q1.15 round-trip should be within ±1 code at this scale.
         assert!((out - 100.0).abs() <= 1.0, "got {}", out);
+    }
+
+    #[test]
+    fn fmac_sub_unity_gain_correct_when_min_fmac_r_is_zero() {
+        // b0 = 0.5 → min_fmac_r() = 0 (all |coeff| < 1). Previously the
+        // coefficients were quantised at r=0 while the shift/I-O ran at
+        // r_eff=1, doubling the output. Expect ~50 for a 0.5 gain on 100.
+        let w = TwoPoleTwoZeroParams::<f32> { a1: 0.0, a2: 0.0, b0: 0.5, b1: 0.0, b2: 0.0 };
+        let mut c = InnerCtrl::build(w, 0.0, 4095.0, InnerCtrlFlavor::FmacQ15);
+        let out = c.update_clamped(100.0, 0.0, 4095.0);
+        assert!((out - 50.0).abs() <= 1.0, "expected ~50 (0.5 gain), got {}", out);
     }
 
     #[test]
