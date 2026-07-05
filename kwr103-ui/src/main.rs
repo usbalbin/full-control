@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use eframe::NativeOptions;
 
-use kwr103_ui::{PowerSupplyUi, ConnectionType, PowerSupplyControl, MeasurementHistory, LimitMode, infer_limit_mode, apply_sequence_step};
+use kwr103_ui::{PowerSupplyUi, ConnectionType, PowerSupplyControl, MeasurementHistory, LimitMode, infer_limit_mode, apply_sequence_step, SequenceUpdate};
 
 // Desktop app needs interior mutability since Kwr103 is !Send + !Sync
 type SupplyRef = Rc<RefCell<Option<kwr103_ui::RealPowerSupply>>>;
@@ -40,7 +40,17 @@ impl PowerSupplyApp {
     }
 
     fn connect(&mut self) -> Result<(), String> {
-        let supply = kwr103_ui::RealPowerSupply::new(self.connection_type.clone())?;
+        // For Ethernet, use the IP the user typed into the text field rather
+        // than the placeholder baked into the radio button's ConnectionType.
+        let conn = match &self.connection_type {
+            ConnectionType::Eth { .. } => {
+                let ip = self.ip_address.trim();
+                let ip = if ip.is_empty() { "192.168.1.100" } else { ip };
+                ConnectionType::Eth { ip: ip.to_string() }
+            }
+            other => other.clone(),
+        };
+        let supply = kwr103_ui::RealPowerSupply::new(conn)?;
         *self.supply.borrow_mut() = Some(supply);
         Ok(())
     }
@@ -186,12 +196,13 @@ impl eframe::App for PowerSupplyApp {
             let delta_ms = elapsed.as_millis() as u32;
 
             match self.ui_state.sequence.update(delta_ms) {
-                Some(step) => {
+                SequenceUpdate::Step(step) => {
                     if let Some(supply) = self.supply.borrow_mut().as_mut() {
                         let _ = apply_sequence_step(&mut *supply, step);
                     }
                 }
-                None => {
+                SequenceUpdate::Unchanged => {}
+                SequenceUpdate::Finished => {
                     if self.sequence_repeat {
                         self.ui_state.sequence.reset();
                     } else {
@@ -250,6 +261,7 @@ impl PowerSupplyApp {
 
         // Show sequence steps
         let num_steps = self.ui_state.sequence.steps().len();
+        let mut to_remove: Option<usize> = None;
         for i in 0..num_steps {
             ui.horizontal(|ui| {
                 ui.label(format!("Step {}:", i + 1));
@@ -270,10 +282,15 @@ impl PowerSupplyApp {
                     self.ui_state.sequence.steps_mut()[i].duration_ms = d;
                 }
                 if ui.button("X").clicked() {
-                    self.ui_state.sequence.remove_step(i);
-                    return; // Return early to avoid iterator invalidation
+                    // Defer removal: calling remove_step(i) here and `return`ing
+                    // only exits this closure, not the `for` loop, so the next
+                    // iteration would index the shrunk Vec out of bounds and panic.
+                    to_remove = Some(i);
                 }
             });
+        }
+        if let Some(i) = to_remove {
+            self.ui_state.sequence.remove_step(i);
         }
 
         // Show playback progress

@@ -219,11 +219,25 @@ pub struct SequenceStep {
     pub output_on: bool,
 }
 
+/// Result of advancing a [`VoltageSequence`] by one tick.
+pub enum SequenceUpdate {
+    /// A new step became active this tick — apply it to the device.
+    Step(SequenceStep),
+    /// Still within the current step — nothing to send.
+    Unchanged,
+    /// The sequence reached its end.
+    Finished,
+}
+
 /// Voltage sequence manager
 pub struct VoltageSequence {
     pub(crate) steps: Vec<SequenceStep>,
     current_step: usize,
     step_timer: u32,
+    /// Index of the step last handed to the caller, so `update` emits a `Step`
+    /// only on entry instead of every tick (avoids flooding the device with
+    /// duplicate set_voltage/current/output commands ~100×/s).
+    last_applied: Option<usize>,
 }
 
 impl VoltageSequence {
@@ -232,6 +246,7 @@ impl VoltageSequence {
             steps: Vec::new(),
             current_step: 0,
             step_timer: 0,
+            last_applied: None,
         }
     }
 
@@ -239,9 +254,9 @@ impl VoltageSequence {
         self.steps.get(self.current_step).copied()
     }
 
-    pub fn update(&mut self, delta_ms: u32) -> Option<SequenceStep> {
+    pub fn update(&mut self, delta_ms: u32) -> SequenceUpdate {
         if self.steps.is_empty() {
-            return None;
+            return SequenceUpdate::Finished;
         }
 
         self.step_timer += delta_ms;
@@ -250,22 +265,31 @@ impl VoltageSequence {
         if self.step_timer >= current.duration_ms {
             let next = self.current_step + 1;
             if next >= self.steps.len() {
-                // Sequence finished - reset for re-use
+                // Sequence finished - reset for re-use.
                 self.current_step = 0;
                 self.step_timer = 0;
-                return None;
+                self.last_applied = None;
+                return SequenceUpdate::Finished;
             }
             self.current_step = next;
             self.step_timer = 0;
-            Some(self.steps[self.current_step])
+        }
+
+        // Emit the step only when it first becomes active; subsequent ticks
+        // within the same step return `Unchanged`, so the caller does not
+        // re-send commands to the device every frame.
+        if self.last_applied != Some(self.current_step) {
+            self.last_applied = Some(self.current_step);
+            SequenceUpdate::Step(self.steps[self.current_step])
         } else {
-            Some(current)
+            SequenceUpdate::Unchanged
         }
     }
 
     pub fn reset(&mut self) {
         self.current_step = 0;
         self.step_timer = 0;
+        self.last_applied = None;
     }
 
     pub fn is_empty(&self) -> bool {

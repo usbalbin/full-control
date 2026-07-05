@@ -8,7 +8,7 @@ use eframe::WebOptions;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use crate::{PowerSupplyUi, MockPowerSupply, PowerSupplyControl, PowerSupplyState, MeasurementHistory, LimitMode, infer_limit_mode, apply_sequence_step};
+use crate::{PowerSupplyUi, MockPowerSupply, PowerSupplyControl, PowerSupplyState, MeasurementHistory, LimitMode, infer_limit_mode, apply_sequence_step, SequenceUpdate};
 
 fn now_ms() -> f64 {
     web_sys::window()
@@ -154,10 +154,11 @@ impl WebApp {
         }
 
         match self.ui_state.sequence.update(delta_ms) {
-            Some(step) => {
+            SequenceUpdate::Step(step) => {
                 let _ = apply_sequence_step(&mut self.supply, step);
             }
-            None => {
+            SequenceUpdate::Unchanged => {}
+            SequenceUpdate::Finished => {
                 if self.sequence_repeat {
                     self.ui_state.sequence.reset();
                 } else {
