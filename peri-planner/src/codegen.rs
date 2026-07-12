@@ -11,7 +11,9 @@
 //! itself does not depend on embassy, so codegen is string generation, not
 //! compilation.
 
-use crate::pin_plan::{DmaAssignment, FabricNode, Placement, PinPlan};
+use crate::pin_plan::{
+    DmaAssignment, EdgeKind, EevRole, FabricNode, Placement, PinPlan, RouteEdge, SlotPurpose,
+};
 
 /// Peripheral classes whose embassy singleton we bind as a `Board` field.
 /// Their pins are bound regardless; analog peripherals (COMP/OPAMP) get pin
@@ -342,10 +344,108 @@ fn write_behavior(s: &mut String, plan: &PinPlan) {
     let _ = writeln!(s, "}}");
 }
 
-/// Generate the full Tier-1 firmware scaffold module: the board-support layer
-/// (every instance + pin) followed by the behavioral-config contract.
+/// A fabric node as a human-readable label, e.g. `DAC1`, `DAC3 CH1`, `COMP2`,
+/// `TIM1 Cr2`, `MASTER`.
+fn node_label(n: &FabricNode) -> String {
+    let mut s = if n.class == "MASTER" {
+        "MASTER".to_string()
+    } else {
+        format!("{}{}", n.class, n.instance)
+    };
+    if let Some(ch) = n.channel {
+        s = format!("{s} CH{ch}");
+    }
+    if let Some(ev) = &n.event {
+        s = format!("{s} {ev}");
+    }
+    s
+}
+
+/// One internal-routing edge as a reference-manual-style one-liner.
+fn describe_route(e: &RouteEdge) -> String {
+    let (from, to) = (node_label(&e.from), node_label(&e.to));
+    match &e.kind {
+        EdgeKind::DacToComp => format!("{from} → {to} inverting input (threshold)"),
+        EdgeKind::CompToEev { role } => {
+            let r = match role {
+                EevRole::Peak => "peak",
+                EevRole::ZeroCrossDetect => "zero-cross",
+            };
+            format!("{from} → HRTIM {to} ({r} external event)")
+        }
+        EdgeKind::CompToFlt => format!("{from} → HRTIM {to} (fault latch)"),
+        EdgeKind::EevToHrtimTimer => format!("{from} → {to} (external-event reset)"),
+        EdgeKind::CompToTimCapture { channel } => {
+            format!("{from} → {to} input-capture CH{channel}")
+        }
+        EdgeKind::CompToTimBreak { break_input } => {
+            let brk = if *break_input == 2 { "BRK2" } else { "BRK" };
+            format!("{from} → {to} break {brk} (over-current fold)")
+        }
+        EdgeKind::HrtimPhaseShiftPeer => format!("{from} ↔ {to} (phase-shift coupled)"),
+        EdgeKind::EventToAdcTrigger { trig_slot, sequencer_kind } => {
+            format!("{from} → {to} ADC trigger (slot {trig_slot}, {sequencer_kind})")
+        }
+    }
+}
+
+fn describe_purpose(p: SlotPurpose) -> &'static str {
+    match p {
+        SlotPurpose::PcmStep => "PCM step",
+        SlotPurpose::DemCompare => "DEM compare",
+        SlotPurpose::DemCapture => "DEM capture",
+        SlotPurpose::AdcTrigger => "ADC trigger",
+    }
+}
+
+/// Append the **internal routing** section: the cross-peripheral silicon wiring
+/// (DAC→COMP threshold, COMP→break over-current fold, HRTIM crossbar/EEV/fault,
+/// ADC triggers) + reserved compare/capture slots. embassy has no driver for
+/// most of this, so it is emitted as a documented checklist the user configures
+/// in their init — the routing peri-planner uniquely knows, never re-derived by
+/// hand from the reference manual.
+fn write_routing(s: &mut String, plan: &PinPlan) {
+    use std::fmt::Write as _;
+    if plan.routes.is_empty() && plan.slot_claims.is_empty() {
+        return;
+    }
+    // Dedup route/slot descriptions (a path can repeat per group), keep order.
+    let mut lines: Vec<String> = Vec::new();
+    for e in &plan.routes {
+        let l = describe_route(e);
+        if !lines.contains(&l) {
+            lines.push(l);
+        }
+    }
+    let _ = writeln!(s);
+    let _ = writeln!(s, "// ===== Internal routing (silicon interconnect) =====");
+    let _ = writeln!(s, "// The cross-peripheral wiring peri-planner planned. embassy has no driver for");
+    let _ = writeln!(s, "// most of it — configure it in your init (HAL where available, else raw pac).");
+    let _ = writeln!(s, "// This is the routing you'd otherwise transcribe from the reference manual:");
+    for l in &lines {
+        let _ = writeln!(s, "//   • {l}");
+    }
+    if !plan.slot_claims.is_empty() {
+        let mut slots: Vec<String> = Vec::new();
+        for c in &plan.slot_claims {
+            let l = format!("{}.{}  ({})", c.timer, c.slot, describe_purpose(c.purpose));
+            if !slots.contains(&l) {
+                slots.push(l);
+            }
+        }
+        let _ = writeln!(s, "// Timer compare/capture slots reserved:");
+        for l in &slots {
+            let _ = writeln!(s, "//   • {l}");
+        }
+    }
+}
+
+/// Generate the full firmware scaffold module: the board-support layer (every
+/// instance + pin), the internal-routing checklist, and the behavioral-config
+/// contract.
 pub fn generate(plan: &PinPlan) -> String {
     let mut s = generate_board(plan);
+    write_routing(&mut s, plan);
     write_behavior(&mut s, plan);
     s
 }
@@ -473,6 +573,45 @@ mod tests {
     }
 
     #[test]
+    fn c531_ocp_emits_internal_routing_checklist() {
+        // The internal silicon wiring peri-planner uniquely knows must be emitted
+        // as a documented routing checklist (embassy has no driver for it).
+        use crate::c531_design::{C531Design, ConverterLeg, Ocp};
+        use crate::g474::{AdcInstance, CompId, DacId, TimId};
+        use crate::mcu::Package;
+
+        let mut d = C531Design::new();
+        d.add_leg(ConverterLeg {
+            tim: TimId::Tim1, channels_mask: 0b0001, complementary: true, dead_time: true, bkin: false,
+            ocp: Some(Ocp { comp: CompId::Comp1, break_input: 1, threshold_dac: Some(DacId::Dac1Ch1) }),
+            adc_sense: Some((AdcInstance::Adc1, 1)),
+        });
+        let plan = d.to_pin_plan(Package::C531R, Target { package: "C531R".into(), family: "C5".into() });
+        let code = generate(&plan);
+
+        assert!(code.contains("Internal routing (silicon interconnect)"), "routing section present");
+        assert!(
+            code.contains("COMP1 → TIM1 break BRK (over-current fold)"),
+            "COMP→break over-current route emitted:\n{code}"
+        );
+        assert!(
+            code.contains("DAC1 CH1 → COMP1 inverting input (threshold)"),
+            "DAC→COMP threshold route emitted:\n{code}"
+        );
+    }
+
+    #[test]
+    fn g474_hrtim_emits_routing_section() {
+        // The default G474 fabric design carries HRTIM routes + PCM slot claims.
+        let plan = crate::requirements::Design::default()
+            .to_pin_plan(Target { package: "G474RE".into(), family: "G4".into() });
+        assert!(!plan.routes.is_empty(), "G474 default has fabric routes");
+        let code = generate(&plan);
+        assert!(code.contains("Internal routing (silicon interconnect)"));
+        assert!(code.contains(" → "), "at least one route rendered");
+    }
+
+    #[test]
     fn generated_board_references_only_real_singletons() {
         // NAME-VALIDITY guard (not exactly-once — that's the next test): every
         // `peripherals::IDENT` the scaffold emits must be a real metapac entity in
@@ -596,3 +735,4 @@ mod tests {
         assert!(code.contains("signal(s) dropped"), "the conflict warning must be emitted");
     }
 }
+
