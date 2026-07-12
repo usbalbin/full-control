@@ -257,6 +257,72 @@ impl C531Design {
         self.validate(package).is_empty()
     }
 
+    /// Auto-allocate each leg's over-current route (COMP -> timer break, optional
+    /// DAC threshold) and ADC-sense channel to a **conflict-free, fabric-valid**
+    /// assignment — the non-HRTIM equivalent of the G474 solver. Preserves the
+    /// user's INTENT (which legs want OCP / a DAC threshold / sense) and their
+    /// timer + channel topology; only fills the internal routing + sense channel.
+    /// Legs it can't satisfy on this chip's fabric are reported and left as-is.
+    pub fn auto_assign(&mut self, package: Package) -> AutoAssign {
+        let mut result = AutoAssign::default();
+        let Some(fab) = package.descriptor().fabric else {
+            return result; // no modeled fabric -> nothing to solve against
+        };
+
+        // ---- OCP: distinct-comp, distinct-dac routes, break-1 preferred ----
+        let ocp_legs: Vec<usize> = self
+            .legs
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.ocp.is_some())
+            .map(|(i, _)| i)
+            .collect();
+        let cands: Vec<Vec<OcpCand>> = ocp_legs
+            .iter()
+            .map(|&i| {
+                let leg = &self.legs[i];
+                let want_dac = leg.ocp.as_ref().and_then(|o| o.threshold_dac).is_some();
+                ocp_candidates(fab, leg.tim.number(), want_dac)
+            })
+            .collect();
+        let assignment = max_ocp_assignment(&cands);
+        for (slot, &leg_i) in ocp_legs.iter().enumerate() {
+            match assignment[slot] {
+                Some(c) => {
+                    let ocp = self.legs[leg_i].ocp.as_mut().unwrap();
+                    ocp.comp = comp_from_num(c.comp).unwrap();
+                    ocp.break_input = c.brk;
+                    ocp.threshold_dac = c.dac.and_then(|(di, dc)| dac_from_inst_ch(di, dc));
+                }
+                None => {
+                    // Can't route this leg's OCP on the fabric — drop it so the
+                    // plan stays realizable, and report it (the user's intent is
+                    // recorded in the result, not silently kept as a conflict).
+                    self.legs[leg_i].ocp = None;
+                    result.ocp_unassignable.push(leg_i);
+                }
+            }
+        }
+
+        // ---- ADC sense: a distinct channel per sensing leg (on its own ADC) ----
+        let mut used: std::collections::HashSet<(u8, u8)> = std::collections::HashSet::new();
+        for (i, leg) in self.legs.iter_mut().enumerate() {
+            let Some((adc, _)) = leg.adc_sense else { continue };
+            let mut ch = 1u8;
+            while ch < 32 && used.contains(&(adc.number(), ch)) {
+                ch += 1;
+            }
+            if ch >= 32 {
+                leg.adc_sense = None;
+                result.sense_unassignable.push(i);
+                continue;
+            }
+            used.insert((adc.number(), ch));
+            leg.adc_sense = Some((adc, ch));
+        }
+        result
+    }
+
     /// Lower this converter plan into the unified
     /// [`PinPlan`](crate::pin_plan::PinPlan). One-way / derived (see
     /// `docs/firmware-codegen-design.md` §8).
@@ -411,9 +477,155 @@ impl C531Design {
     }
 }
 
+/// Outcome of [`C531Design::auto_assign`]: the legs it could NOT satisfy.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AutoAssign {
+    /// Legs whose OCP request has no fabric-valid, conflict-free route here.
+    pub ocp_unassignable: Vec<usize>,
+    /// Legs whose ADC sense could not be given a free channel.
+    pub sense_unassignable: Vec<usize>,
+}
+
+impl AutoAssign {
+    pub fn fully_solved(&self) -> bool {
+        self.ocp_unassignable.is_empty() && self.sense_unassignable.is_empty()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct OcpCand {
+    comp: u8,
+    brk: u8,
+    dac: Option<(u8, u8)>,
+}
+
+/// Candidate (comp, break, optional DAC) OCP routes for `tim`; break input 1
+/// listed first (preferred). When `want_dac`, only comps that HAVE a DAC
+/// threshold source qualify, paired with each such source.
+fn ocp_candidates(fab: &crate::mcu::ChipFabric, tim: u8, want_dac: bool) -> Vec<OcpCand> {
+    let mut out = Vec::new();
+    for brk in [1u8, 2] {
+        for comp in fab.comps_for_tim_break(tim, brk) {
+            let dacs = fab.dac_threshold_sources_for_comp(comp);
+            if want_dac {
+                for (di, dc) in dacs {
+                    out.push(OcpCand { comp, brk, dac: Some((di, dc)) });
+                }
+            } else {
+                out.push(OcpCand { comp, brk, dac: None });
+            }
+        }
+    }
+    out
+}
+
+/// Assign as many legs as possible a distinct-comp, distinct-dac candidate
+/// (exhaustive backtracking — the C5 fabric is tiny). Per-leg `Some`/`None`.
+fn max_ocp_assignment(cands: &[Vec<OcpCand>]) -> Vec<Option<OcpCand>> {
+    let n = cands.len();
+    let mut cur = vec![None; n];
+    let mut best = vec![None; n];
+    let mut best_count = 0usize;
+    let mut used_comp = std::collections::HashSet::new();
+    let mut used_dac = std::collections::HashSet::new();
+    rec_ocp(cands, 0, &mut cur, &mut used_comp, &mut used_dac, &mut best, &mut best_count);
+    best
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rec_ocp(
+    cands: &[Vec<OcpCand>],
+    idx: usize,
+    cur: &mut Vec<Option<OcpCand>>,
+    used_comp: &mut std::collections::HashSet<u8>,
+    used_dac: &mut std::collections::HashSet<(u8, u8)>,
+    best: &mut Vec<Option<OcpCand>>,
+    best_count: &mut usize,
+) {
+    if idx == cands.len() {
+        let count = cur.iter().filter(|x| x.is_some()).count();
+        if count > *best_count {
+            *best_count = count;
+            *best = cur.clone();
+        }
+        return;
+    }
+    // Leave this leg unassigned (so a fully-infeasible leg doesn't block others).
+    cur[idx] = None;
+    rec_ocp(cands, idx + 1, cur, used_comp, used_dac, best, best_count);
+    // Or take any still-free candidate.
+    for &cand in &cands[idx] {
+        if used_comp.contains(&cand.comp) {
+            continue;
+        }
+        if let Some(d) = cand.dac {
+            if used_dac.contains(&d) {
+                continue;
+            }
+        }
+        cur[idx] = Some(cand);
+        used_comp.insert(cand.comp);
+        if let Some(d) = cand.dac {
+            used_dac.insert(d);
+        }
+        rec_ocp(cands, idx + 1, cur, used_comp, used_dac, best, best_count);
+        used_comp.remove(&cand.comp);
+        if let Some(d) = cand.dac {
+            used_dac.remove(&d);
+        }
+        cur[idx] = None;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mk_ocp_leg(tim: TimId, comp: CompId, dac: Option<DacId>, sense: Option<(AdcInstance, u8)>) -> ConverterLeg {
+        ConverterLeg {
+            tim,
+            channels_mask: 0b0001,
+            complementary: false,
+            dead_time: false,
+            bkin: false,
+            ocp: Some(Ocp { comp, break_input: 1, threshold_dac: dac }),
+            adc_sense: sense,
+        }
+    }
+
+    #[test]
+    fn auto_assign_resolves_comp_and_adc_conflicts() {
+        // Two OCP legs both initially on COMP1 + ADC1 ch1 (double conflict), no
+        // DAC threshold — the solver must split them onto distinct comps/channels.
+        let mut d = C531Design::new();
+        d.add_leg(mk_ocp_leg(TimId::Tim1, CompId::Comp1, None, Some((AdcInstance::Adc1, 1))));
+        d.add_leg(mk_ocp_leg(TimId::Tim8, CompId::Comp1, None, Some((AdcInstance::Adc1, 1))));
+        assert!(!d.is_valid(Package::C531R), "starts conflicted");
+
+        let r = d.auto_assign(Package::C531R);
+        assert!(r.fully_solved(), "both legs assignable on C531: {r:?}");
+        assert!(d.is_valid(Package::C531R), "solver produced a realizable plan");
+        assert_ne!(
+            d.legs[0].ocp.as_ref().unwrap().comp,
+            d.legs[1].ocp.as_ref().unwrap().comp,
+            "distinct comparators"
+        );
+        assert_ne!(d.legs[0].adc_sense, d.legs[1].adc_sense, "distinct ADC channels");
+    }
+
+    #[test]
+    fn auto_assign_reports_c531_single_dac_threshold_limit() {
+        // On C531 only COMP1 has an internal DAC threshold, so at most ONE
+        // DAC-thresholded OCP leg can route — the solver surfaces the hardware limit.
+        let mut d = C531Design::new();
+        d.add_leg(mk_ocp_leg(TimId::Tim1, CompId::Comp1, Some(DacId::Dac1Ch1), None));
+        d.add_leg(mk_ocp_leg(TimId::Tim8, CompId::Comp1, Some(DacId::Dac1Ch1), None));
+        let r = d.auto_assign(Package::C531R);
+        assert_eq!(r.ocp_unassignable.len(), 1, "second DAC-thresholded OCP is unroutable: {r:?}");
+        // The assignable one is a real, conflict-free route.
+        let assigned = d.legs.iter().filter(|l| l.ocp.as_ref().and_then(|o| o.threshold_dac).is_some()).count();
+        assert_eq!(assigned, 1);
+    }
 
     /// A canonical synchronous buck leg on C531: TIM1 CH1 + CH1N complementary
     /// with dead-time, hardware OCP via COMP1 on BRK with a DAC1 threshold, and

@@ -1066,6 +1066,10 @@ impl PeriPlannerApp {
                     *slot = leg;
                 }
             }
+            ConverterAction::AutoAssign => {
+                let pkg = self.active.package;
+                self.active.c531_design.auto_assign(pkg);
+            }
         }
     }
 }

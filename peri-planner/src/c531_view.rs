@@ -27,6 +27,9 @@ pub enum ConverterAction {
     /// Replace leg `usize` wholesale with an edited copy (mirrors the
     /// timers-tab "rebuild the spec and diff" pattern).
     SetLeg(usize, ConverterLeg),
+    /// Auto-allocate every leg's OCP route + ADC-sense channel to a conflict-free,
+    /// fabric-valid assignment (the non-HRTIM solver).
+    AutoAssign,
 }
 
 /// Descriptor timer-`number` -> `TimId`. Only the ids the model understands.
@@ -73,9 +76,24 @@ pub fn show(ui: &mut egui::Ui, design: &C531Design, package: Package) -> Option<
     }
     ui.separator();
 
-    if ui.button("+ Add leg").clicked() {
-        action = Some(ConverterAction::AddLeg);
-    }
+    ui.horizontal(|ui| {
+        if ui.button("+ Add leg").clicked() {
+            action = Some(ConverterAction::AddLeg);
+        }
+        if ui
+            .add_enabled(
+                design.legs.iter().any(|l| l.ocp.is_some() || l.adc_sense.is_some()),
+                egui::Button::new("Auto-assign"),
+            )
+            .on_hover_text(
+                "Allocate every leg's over-current route (COMP→break + DAC threshold) \
+                 and ADC-sense channel to a conflict-free, fabric-valid assignment",
+            )
+            .clicked()
+        {
+            action = Some(ConverterAction::AutoAssign);
+        }
+    });
 
     // Advanced-control timers actually present on this chip — the only timers
     // that carry complementary outputs, dead-time and break inputs.
