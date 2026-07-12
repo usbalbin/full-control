@@ -47,6 +47,7 @@ enum ViewMode {
     Dropin,
     Converter,
     Peripherals,
+    Analog,
 }
 
 /// One named design — the savable unit ("project"). Holds the full design state:
@@ -150,6 +151,8 @@ pub struct PeriPlannerApp {
     picked: Option<crate::picker::PickedRole>,
     /// Filter state for the AfTable view. Ephemeral.
     af_filter: crate::af_view::AfFilter,
+    /// Filter/picker state for the Analog differential-pairs view. Ephemeral.
+    analog_filter: crate::analog_view::AnalogFilter,
     /// Part-finder query state (whole-lineup catalog search). Ephemeral.
     catalog_query: crate::catalog::SearchQuery,
     /// Memoized Part-finder evaluation (recomputed only when query/demands change).
@@ -189,6 +192,7 @@ impl Default for PeriPlannerApp {
             nav_epoch: 0,
             picked: None,
             af_filter: Default::default(),
+            analog_filter: Default::default(),
             catalog_query: Default::default(),
             catalog_eval_cache: Default::default(),
             catalog_sort: Default::default(),
@@ -354,7 +358,7 @@ impl PeriPlannerApp {
     fn land_on_active_view(&mut self) {
         let shared = matches!(
             self.view,
-            ViewMode::Inventory | ViewMode::AfTable | ViewMode::Catalog | ViewMode::Dropin
+            ViewMode::Inventory | ViewMode::AfTable | ViewMode::Analog | ViewMode::Catalog | ViewMode::Dropin
         );
         if !shared {
             self.view = match self.active.mcu {
@@ -780,6 +784,7 @@ impl PeriPlannerApp {
                 // Descriptor views — available for both planner chips and asset parts.
                 ui.selectable_value(&mut self.view, ViewMode::Inventory, "Inventory");
                 ui.selectable_value(&mut self.view, ViewMode::AfTable, "Pin / AF");
+                ui.selectable_value(&mut self.view, ViewMode::Analog, "Analog pairs");
                 ui.selectable_value(&mut self.view, ViewMode::Catalog, "Part finder");
                 if !browsing {
                     ui.selectable_value(&mut self.view, ViewMode::Dropin, "Drop-in finder");
@@ -970,6 +975,7 @@ impl eframe::App for PeriPlannerApp {
             self.render_status_line(ctx);
             let view = self.view;
             let af_filter = &mut self.af_filter;
+            let analog_filter = &mut self.analog_filter;
             let catalog_query = &mut self.catalog_query;
             let catalog_demands = &mut self.active.catalog_demands;
             let catalog_cache = &mut self.catalog_eval_cache;
@@ -977,6 +983,12 @@ impl eframe::App for PeriPlannerApp {
             let mut open: Option<String> = None;
             egui::CentralPanel::default().show(ctx, |ui| match view {
                 ViewMode::AfTable => crate::af_view::show(ui, desc.raw, af_filter, None),
+                ViewMode::Analog => crate::analog_view::show(
+                    ui,
+                    desc.raw,
+                    analog_filter,
+                    crate::phys_pinout::best_footprint(desc.name, desc.package.package_label()),
+                ),
                 ViewMode::Catalog => {
                     open = crate::catalog_view::show(
                         ui, catalog_query, catalog_demands, catalog_cache, catalog_sort,
@@ -1012,6 +1024,7 @@ impl eframe::App for PeriPlannerApp {
             let package = self.active.package;
             let view = self.view;
             let af_filter = &mut self.af_filter;
+            let analog_filter = &mut self.analog_filter;
             // Active H523-family design, created on first touch for this MCU.
             // (`render_top_bar` above may have switched MCU this frame; this binds
             // to the now-active one — the post-render diff is skipped on a switch.)
@@ -1034,6 +1047,14 @@ impl eframe::App for PeriPlannerApp {
                     }
                     ViewMode::Peripherals => {
                         crate::peripherals_view::show(ui, descriptor.raw, h523);
+                    }
+                    ViewMode::Analog => {
+                        crate::analog_view::show(
+                            ui,
+                            descriptor.raw,
+                            analog_filter,
+                            crate::phys_pinout::best_footprint(package.name(), package.package_label()),
+                        );
                     }
                     ViewMode::Catalog => {
                         jump = crate::catalog_view::show(
@@ -1802,6 +1823,17 @@ impl eframe::App for PeriPlannerApp {
                     // locking flows through the existing pin_assignments
                     // map on `Design`. Pass None.
                     crate::af_view::show(ui, self.active.package.descriptor().raw, &mut self.af_filter, None);
+                }
+                ViewMode::Analog => {
+                    crate::analog_view::show(
+                        ui,
+                        self.active.package.descriptor().raw,
+                        &mut self.analog_filter,
+                        crate::phys_pinout::best_footprint(
+                            self.active.package.name(),
+                            self.active.package.package_label(),
+                        ),
+                    );
                 }
                 // Non-G474 views; never selectable while the G474 planner is active.
                 ViewMode::Converter | ViewMode::Peripherals => {}

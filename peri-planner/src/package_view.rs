@@ -8,8 +8,13 @@
 
 use std::collections::HashMap;
 
-use eframe::egui::{self, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use eframe::egui::{
+    self,
+    epaint::{CubicBezierShape, PathStroke},
+    Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2,
+};
 
+use crate::phys_pinout::{PinFunction, PinoutRecord};
 use crate::pinout::{ChipVariant, Pin};
 
 /// One click event from the package view.
@@ -786,4 +791,546 @@ fn inside_align(n: usize, per_side: usize) -> egui::Align2 {
         2 => egui::Align2::RIGHT_CENTER,
         _ => egui::Align2::CENTER_TOP,
     }
+}
+
+// ======================================================================
+// Generic, lineup-wide footprint renderer (any STM32 part, any package).
+//
+// Unlike `show()` (which draws the six hand-coded G474 `ChipVariant` maps for
+// the pin-placement view), `show_record()` draws directly from a
+// `phys_pinout::PinoutRecord` — the whole-lineup physical asset — so it works
+// for every family/package. It also draws optional `PinLink` connectors between
+// pin pairs (the differential +/- overlay). The existing `show()` path is left
+// entirely untouched.
+// ======================================================================
+
+/// A connector to draw between two pins (a differential +/- pair).
+pub struct PinLink {
+    pub a: Pin,
+    pub b: Pin,
+    pub color: Color32,
+    pub label: Option<String>,
+}
+
+/// One rendered slot on a generic footprint.
+struct GenCell {
+    /// GPIOs bonded here (usually one; merged balls carry several).
+    gpios: Vec<Pin>,
+    /// Display text: the GPIO name(s), or the raw power / dedicated token(s).
+    label: String,
+    /// Power / dedicated / NC — dimmed and non-interactive.
+    power: bool,
+}
+
+enum GenLayout {
+    /// QFP/QFN: 4 sides, `cells[1..=total]` indexed by datasheet pin number.
+    Quad { total: usize, per_side: usize, cells: Vec<Option<GenCell>> },
+    /// SO/TSSOP: 2 sides (down the left 1..=n/2, up the right n/2+1..=n).
+    Dual { total: usize, per_side: usize, cells: Vec<Option<GenCell>> },
+    /// BGA/CSP grid: each cell placed at its (row, col) index.
+    Grid { rows: Vec<String>, cols: Vec<i64>, cells: Vec<(usize, usize, GenCell)> },
+    Unsupported(String),
+}
+
+fn gen_cell(pin: &crate::phys_pinout::PhysPin) -> GenCell {
+    match PinFunction::classify(&pin.s) {
+        PinFunction::Gpio(pins) => {
+            let gpios: Vec<Pin> = pins.iter().map(|p| Pin::new(p.port, p.num)).collect();
+            let label = gpios.iter().map(|p| p.name()).collect::<Vec<_>>().join("/");
+            GenCell { gpios, label, power: false }
+        }
+        PinFunction::Nc => GenCell { gpios: Vec::new(), label: String::new(), power: true },
+        // Power / dedicated: show the raw datasheet token(s).
+        _ => GenCell { gpios: Vec::new(), label: pin.s.join("/"), power: true },
+    }
+}
+
+/// Split a BGA position like `"A1"`, `"K9"`, `"AB3"` into (row letters, column).
+fn split_grid(pos: &str) -> Option<(String, i64)> {
+    let i = pos.find(|c: char| c.is_ascii_digit())?;
+    let (letters, num) = pos.split_at(i);
+    if letters.is_empty() || !letters.bytes().all(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    Some((letters.to_string(), num.parse().ok()?))
+}
+
+fn build_layout(rec: &PinoutRecord) -> GenLayout {
+    let numeric = !rec.pins.is_empty()
+        && rec.pins.iter().all(|p| !p.p.is_empty() && p.p.bytes().all(|b| b.is_ascii_digit()));
+    if numeric {
+        let maxpos = rec.pins.iter().filter_map(|p| p.p.parse::<usize>().ok()).max().unwrap_or(0);
+        // Total pin count comes from the package name (so unbonded positions — C5
+        // omits power pads — still render as empty slots in a full outline).
+        let kind = crate::phys_pinout::package_class(&rec.pkg).map(|(k, _)| k);
+        let total = crate::phys_pinout::package_class(&rec.pkg)
+            .map(|(_, c)| c as usize)
+            .filter(|&c| c >= maxpos)
+            .unwrap_or(maxpos);
+        let mut cells: Vec<Option<GenCell>> = (0..=total).map(|_| None).collect();
+        for p in &rec.pins {
+            if let Ok(n) = p.p.parse::<usize>()
+                && (1..=total).contains(&n)
+            {
+                cells[n] = Some(gen_cell(p));
+            }
+        }
+        let dual = matches!(kind, Some("SO" | "SOIC" | "TSSOP" | "MSOP" | "DIP" | "SOP"));
+        if dual || !total.is_multiple_of(4) {
+            if total.is_multiple_of(2) {
+                return GenLayout::Dual { total, per_side: total / 2, cells };
+            }
+            return GenLayout::Unsupported(format!("no drawing for {} ({total} pins)", rec.pkg));
+        }
+        return GenLayout::Quad { total, per_side: total / 4, cells };
+    }
+
+    if rec.pins.iter().all(|p| split_grid(&p.p).is_some()) {
+        let mut rows: Vec<String> = Vec::new();
+        let mut cols: Vec<i64> = Vec::new();
+        for p in &rec.pins {
+            let (r, c) = split_grid(&p.p).unwrap();
+            if !rows.contains(&r) {
+                rows.push(r);
+            }
+            if !cols.contains(&c) {
+                cols.push(c);
+            }
+        }
+        // BGA row order: A,B,…,H,J,…,Z,AA,AB (JEDEC skips I/O — absent letters just
+        // don't appear). Sort by (length, lexicographic) to order multi-letter rows.
+        rows.sort_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)));
+        cols.sort_unstable();
+        let cells: Vec<(usize, usize, GenCell)> = rec
+            .pins
+            .iter()
+            .filter_map(|p| {
+                let (r, c) = split_grid(&p.p)?;
+                let ri = rows.iter().position(|x| *x == r)?;
+                let ci = cols.iter().position(|x| *x == c)?;
+                Some((ri, ci, gen_cell(p)))
+            })
+            .collect();
+        return GenLayout::Grid { rows, cols, cells };
+    }
+
+    GenLayout::Unsupported(format!("no drawing for {}", rec.pkg))
+}
+
+/// Draw the differential-pair connectors over the package, bowed toward center.
+fn draw_links(
+    painter: &egui::Painter,
+    centers: &HashMap<Pin, Pos2>,
+    links: &[PinLink],
+    pkg_center: Pos2,
+) {
+    for l in links {
+        let (Some(&a), Some(&b)) = (centers.get(&l.a), centers.get(&l.b)) else {
+            continue;
+        };
+        let cp1 = a + (pkg_center - a) * 0.4;
+        let cp2 = b + (pkg_center - b) * 0.4;
+        painter.add(CubicBezierShape::from_points_stroke(
+            [a, cp1, cp2, b],
+            false,
+            Color32::TRANSPARENT,
+            PathStroke::new(2.0, l.color),
+        ));
+        if let Some(text) = &l.label {
+            let mid = a + (b - a) * 0.5;
+            let mid = mid + (pkg_center - mid) * 0.15;
+            let galley = painter.layout_no_wrap(text.clone(), FontId::monospace(9.0), l.color);
+            let r = Rect::from_center_size(mid, galley.size() + Vec2::splat(4.0));
+            painter.rect_filled(r, 2.0, Color32::from_black_alpha(210));
+            painter.galley(r.min + Vec2::splat(2.0), galley, l.color);
+        }
+    }
+}
+
+/// The resolved paint for one generic cell: fill/border/label/interactive, plus
+/// which GPIO (if any) a click reports and the tooltip.
+struct CellPaint {
+    fill: Color32,
+    border: Option<Stroke>,
+    /// Text drawn beside the pin (name + optional +/- tag, or a power token).
+    outside: String,
+    tooltip: Option<String>,
+    /// The GPIO a click on this cell selects (the painted/interactive one).
+    click_pin: Option<Pin>,
+    interactive: bool,
+}
+
+fn resolve_cell(cell: Option<&GenCell>, paints: &HashMap<Pin, PinPaint>) -> CellPaint {
+    match cell {
+        Some(c) if !c.power && !c.gpios.is_empty() => {
+            // Prefer the interactive (analog +) GPIO, else any painted one, else free.
+            let painted = c
+                .gpios
+                .iter()
+                .find(|g| paints.get(g).is_some_and(|p| p.interactive))
+                .or_else(|| c.gpios.iter().find(|g| paints.contains_key(g)))
+                .copied();
+            match painted.and_then(|g| paints.get(&g).map(|p| (g, p))) {
+                Some((g, p)) => {
+                    let outside = match &p.sublabel {
+                        Some(s) => format!("{} {}", c.label, s),
+                        None => c.label.clone(),
+                    };
+                    CellPaint {
+                        fill: p.fill,
+                        border: p.border,
+                        outside,
+                        tooltip: p.tooltip.clone(),
+                        click_pin: p.interactive.then_some(g),
+                        interactive: p.interactive,
+                    }
+                }
+                None => CellPaint {
+                    fill: C_PIN,
+                    border: None,
+                    outside: c.label.clone(),
+                    tooltip: None,
+                    click_pin: None,
+                    interactive: false,
+                },
+            }
+        }
+        Some(c) => CellPaint {
+            fill: if c.label.is_empty() { C_PIN_DIMMED } else { C_PIN_POWER },
+            border: None,
+            outside: c.label.clone(),
+            tooltip: None,
+            click_pin: None,
+            interactive: false,
+        },
+        None => CellPaint {
+            fill: C_PIN_DIMMED,
+            border: None,
+            outside: String::new(),
+            tooltip: None,
+            click_pin: None,
+            interactive: false,
+        },
+    }
+}
+
+/// Draw a footprint from a `PinoutRecord` with an optional +/- pair overlay.
+/// Returns the clicked GPIO (a `+`-terminal in the analog overlay), if any.
+pub fn show_record(
+    ui: &mut egui::Ui,
+    record: &PinoutRecord,
+    paints: &HashMap<Pin, PinPaint>,
+    links: &[PinLink],
+) -> Option<Action> {
+    let layout = build_layout(record);
+    if let GenLayout::Unsupported(msg) = &layout {
+        ui.label(
+            egui::RichText::new(format!("({} — switch to the table view)", msg)).weak(),
+        );
+        return None;
+    }
+
+    let avail = ui.available_size_before_wrap();
+    let side = avail.x.min(avail.y).max(300.0) - 20.0;
+    let (rect, response) =
+        ui.allocate_exact_size(Vec2::new(avail.x, side + 20.0), Sense::click());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 4.0, C_BG);
+    let title = format!("{}  {}", record.fam, record.pkg);
+
+    let result = match &layout {
+        GenLayout::Quad { total, per_side, cells }
+        | GenLayout::Dual { total, per_side, cells } => {
+            let dual = matches!(layout, GenLayout::Dual { .. });
+            draw_generic_quad(
+                &painter, &response, rect, side, &title, *total, *per_side, cells, dual, paints,
+                links,
+            )
+        }
+        GenLayout::Grid { rows, cols, cells } => {
+            draw_generic_grid(&painter, &response, rect, side, &title, rows, cols, cells, paints, links)
+        }
+        GenLayout::Unsupported(_) => unreachable!(),
+    };
+
+    if let Some((_pos, tt)) = result.hover_tooltip {
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
+            ui.layer_id(),
+            egui::Id::new("pkg_rec_tooltip"),
+            egui::PopupAnchor::Pointer,
+        )
+        .show(|ui| {
+            ui.label(tt);
+        });
+    }
+    if let Some(p) = result.hit {
+        return Some(Action::Click(p));
+    }
+    if response.clicked() {
+        return Some(Action::ClickEmpty);
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_generic_quad(
+    painter: &egui::Painter,
+    response: &egui::Response,
+    rect: Rect,
+    side: f32,
+    title: &str,
+    total: usize,
+    per_side: usize,
+    cells: &[Option<GenCell>],
+    dual: bool,
+    paints: &HashMap<Pin, PinPaint>,
+    links: &[PinLink],
+) -> DrawResult {
+    let cx = rect.center().x;
+    let cy = rect.top() + (side + 20.0) / 2.0;
+    let pkg_size = side * 0.55;
+    let pkg = Rect::from_center_size(Pos2::new(cx, cy), Vec2::new(pkg_size, pkg_size));
+    painter.rect_filled(pkg, 6.0, C_PKG);
+    painter.text(pkg.center(), egui::Align2::CENTER_CENTER, title, FontId::proportional(15.0), C_TEXT);
+    painter.circle_filled(Pos2::new(pkg.left() + 10.0, pkg.top() + 10.0), 3.0, Color32::from_gray(180));
+
+    let step = pkg_size / per_side as f32;
+    let pin_w = (step * 0.45).clamp(3.0, 8.0);
+    let pin_l = (step * 1.0).clamp(8.0, 14.0);
+    let small = FontId::monospace(9.0);
+    let hover_pos = response.hover_pos();
+    let mut hit: Option<Pin> = None;
+    let mut hover_tooltip: Option<(Pos2, String)> = None;
+    let mut centers: HashMap<Pin, Pos2> = HashMap::new();
+
+    for idx in 1..=total {
+        let (pin_rect, click_rect, label_anchor, label_dir) = if dual {
+            dual_geometry(idx, &pkg, per_side, pin_w, pin_l)
+        } else {
+            pin_geometry(idx, &pkg, per_side, pin_w, pin_l)
+        };
+        let cell = cells.get(idx).and_then(|c| c.as_ref());
+        let cp = resolve_cell(cell, paints);
+
+        painter.rect_filled(pin_rect, 1.0, cp.fill);
+        if let Some(stroke) = cp.border {
+            painter.rect_stroke(pin_rect, 1.0, stroke, egui::epaint::StrokeKind::Middle);
+        }
+        let (num_anchor, num_align) = if dual {
+            (Pos2::new(pin_rect.center().x, pin_rect.center().y), egui::Align2::CENTER_CENTER)
+        } else {
+            (inside_of(pin_rect, idx, per_side, 2.0), inside_align(idx, per_side))
+        };
+        painter.text(num_anchor, num_align, idx.to_string(), small.clone(), C_TEXT_DIM);
+
+        if !cp.outside.is_empty() {
+            painter.text(label_anchor, label_dir, &cp.outside, small.clone(), C_TEXT);
+        }
+        if let Some(c) = cell {
+            for g in &c.gpios {
+                centers.insert(*g, pin_rect.center());
+            }
+        }
+        if let (Some(hp), Some(tt)) = (hover_pos, &cp.tooltip)
+            && click_rect.contains(hp)
+        {
+            hover_tooltip = Some((hp, tt.clone()));
+        }
+        if cp.interactive
+            && response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+            && click_rect.contains(pos)
+        {
+            hit = cp.click_pin;
+        }
+    }
+    draw_links(painter, &centers, links, pkg.center());
+    DrawResult { hit, hover_tooltip }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::phys_pinout;
+
+    #[test]
+    fn quad_layout_from_record_places_gpio_at_datasheet_position() {
+        // G474RE LQFP64: 64-pin quad (16/side), PA0 at position 12 (datasheet).
+        let rec = phys_pinout::footprint_for("STM32G474RE", "LQFP64").unwrap();
+        match build_layout(rec) {
+            GenLayout::Quad { total, per_side, cells } => {
+                assert_eq!((total, per_side), (64, 16));
+                let c = cells[12].as_ref().expect("pos 12 bonded");
+                assert!(c.gpios.contains(&Pin::new('A', 0)) && !c.power);
+                // Position 15 is VSS (power, dim, no gpio).
+                let p15 = cells[15].as_ref().unwrap();
+                assert!(p15.power && p15.gpios.is_empty());
+            }
+            _ => panic!("expected Quad"),
+        }
+    }
+
+    #[test]
+    fn quad_total_from_package_even_when_c5_omits_power_pads() {
+        // C531RC reports only 52 bonded positions but is a 64-pin LQFP — the
+        // outline must still be a full 64-slot quad (missing slots render empty).
+        let rec = phys_pinout::best_footprint("STM32C531RCT6", "LQFP64").unwrap();
+        match build_layout(rec) {
+            GenLayout::Quad { total, per_side, .. } => assert_eq!((total, per_side), (64, 16)),
+            _ => panic!("expected Quad"),
+        }
+    }
+
+    #[test]
+    fn grid_layout_from_bga_record() {
+        // A BGA/CSP part parses into a Grid with letter rows + numeric columns.
+        let rec = phys_pinout::best_footprint("STM32G474ME", "WLCSP81").unwrap();
+        match build_layout(rec) {
+            GenLayout::Grid { rows, cols, cells } => {
+                assert!(rows.len() >= 9 && !cols.is_empty());
+                assert!(cells.iter().any(|(_, _, c)| !c.gpios.is_empty()));
+                // Rows are ordered A,B,… (single letters before any multi-letter).
+                assert_eq!(rows[0], "A");
+            }
+            other => panic!("expected Grid, got {}", matches!(other, GenLayout::Grid { .. })),
+        }
+    }
+
+    #[test]
+    fn best_footprint_resolves_every_compiled_family() {
+        // All four deeply-supported families (incl. the label-mismatch BGA cases)
+        // must resolve to *some* drawable footprint.
+        for (name, label) in [
+            ("STM32G474RE", "LQFP64"),
+            ("STM32H523RE", "LQFP64"),
+            ("STM32C5A3ZGT6", "LQFP144"),
+            ("STM32C531RCT6", "LQFP64"),
+            ("STM32G474PE", "TFBGA100"), // asset actually has UFBGA121 — name fallback
+            ("STM32H523HE", "UFBGA100"), // asset actually has WLCSP39 — name fallback
+        ] {
+            let rec = phys_pinout::best_footprint(name, label);
+            assert!(rec.is_some(), "no footprint for {name}/{label}");
+            assert!(!matches!(build_layout(rec.unwrap()), GenLayout::Unsupported(_)), "{name} undrawable");
+        }
+    }
+}
+
+/// 2-side (SO/TSSOP) pin geometry: pins 1..=per_side down the left, the rest up
+/// the right.
+fn dual_geometry(
+    n: usize,
+    pkg: &Rect,
+    per_side: usize,
+    pin_w: f32,
+    pin_l: f32,
+) -> (Rect, Rect, Pos2, egui::Align2) {
+    let step = pkg.height() / per_side as f32;
+    if n <= per_side {
+        let cy = pkg.top() + step * ((n - 1) as f32 + 0.5);
+        let pin = Rect::from_center_size(Pos2::new(pkg.left() - pin_l / 2.0, cy), Vec2::new(pin_l, pin_w));
+        let click = Rect::from_min_max(
+            Pos2::new(pkg.left() - 200.0, cy - step / 2.0),
+            Pos2::new(pkg.left(), cy + step / 2.0),
+        );
+        (pin, click, Pos2::new(pkg.left() - pin_l - 6.0, cy), egui::Align2::RIGHT_CENTER)
+    } else {
+        let k = n - per_side; // 1..=per_side up the right side
+        let cy = pkg.bottom() - step * ((k - 1) as f32 + 0.5);
+        let pin = Rect::from_center_size(Pos2::new(pkg.right() + pin_l / 2.0, cy), Vec2::new(pin_l, pin_w));
+        let click = Rect::from_min_max(
+            Pos2::new(pkg.right(), cy - step / 2.0),
+            Pos2::new(pkg.right() + 200.0, cy + step / 2.0),
+        );
+        (pin, click, Pos2::new(pkg.right() + pin_l + 6.0, cy), egui::Align2::LEFT_CENTER)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_generic_grid(
+    painter: &egui::Painter,
+    response: &egui::Response,
+    rect: Rect,
+    side: f32,
+    title: &str,
+    rows: &[String],
+    cols: &[i64],
+    cells: &[(usize, usize, GenCell)],
+    paints: &HashMap<Pin, PinPaint>,
+    links: &[PinLink],
+) -> DrawResult {
+    let ncols = cols.len().max(1);
+    let nrows = rows.len().max(1);
+    let pkg_size = (side * 0.9).min(side - 20.0);
+    let cx = rect.center().x;
+    let cy = rect.top() + (side + 20.0) / 2.0;
+    let pkg = Rect::from_center_size(Pos2::new(cx, cy), Vec2::new(pkg_size, pkg_size));
+    painter.rect_filled(pkg, 6.0, C_PKG);
+    painter.text(
+        Pos2::new(pkg.left() + 8.0, pkg.top() - 20.0),
+        egui::Align2::LEFT_BOTTOM,
+        title,
+        FontId::proportional(13.0),
+        C_TEXT,
+    );
+    painter.circle_filled(Pos2::new(pkg.left() + 10.0, pkg.top() + 10.0), 3.0, Color32::from_gray(180));
+
+    let inset = 24.0f32;
+    let grid_rect = Rect::from_min_max(
+        Pos2::new(pkg.left() + inset, pkg.top() + inset),
+        Pos2::new(pkg.right() - inset, pkg.bottom() - inset),
+    );
+    let step_x = grid_rect.width() / ncols as f32;
+    let step_y = grid_rect.height() / nrows as f32;
+    let ball_r = (step_x.min(step_y) * 0.36).max(2.5);
+    let small = FontId::monospace(9.0);
+    let tiny = FontId::monospace(8.0);
+
+    // Headers.
+    for (c, col) in cols.iter().enumerate() {
+        let x = grid_rect.left() + step_x * (c as f32 + 0.5);
+        painter.text(Pos2::new(x, grid_rect.top() - 4.0), egui::Align2::CENTER_BOTTOM, col.to_string(), small.clone(), C_TEXT_DIM);
+    }
+    for (r, letter) in rows.iter().enumerate() {
+        let y = grid_rect.top() + step_y * (r as f32 + 0.5);
+        painter.text(Pos2::new(grid_rect.left() - 4.0, y), egui::Align2::RIGHT_CENTER, letter, small.clone(), C_TEXT_DIM);
+    }
+
+    let hover_pos = response.hover_pos();
+    let mut hit: Option<Pin> = None;
+    let mut hover_tooltip: Option<(Pos2, String)> = None;
+    let mut centers: HashMap<Pin, Pos2> = HashMap::new();
+
+    for (ri, ci, cell) in cells {
+        let bx = grid_rect.left() + step_x * (*ci as f32 + 0.5);
+        let by = grid_rect.top() + step_y * (*ri as f32 + 0.5);
+        let center = Pos2::new(bx, by);
+        let cp = resolve_cell(Some(cell), paints);
+
+        painter.circle_filled(center, ball_r, cp.fill);
+        if let Some(stroke) = cp.border {
+            painter.circle_stroke(center, ball_r, stroke);
+        }
+        if !cp.outside.is_empty() {
+            painter.text(Pos2::new(bx, by + ball_r + 1.0), egui::Align2::CENTER_TOP, &cp.outside, tiny.clone(), C_TEXT);
+        }
+        for g in &cell.gpios {
+            centers.insert(*g, center);
+        }
+        let click_rect = Rect::from_center_size(center, Vec2::new(step_x, step_y));
+        if let (Some(hp), Some(tt)) = (hover_pos, &cp.tooltip)
+            && click_rect.contains(hp)
+        {
+            hover_tooltip = Some((hp, tt.clone()));
+        }
+        if cp.interactive
+            && response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+            && click_rect.contains(pos)
+        {
+            hit = cp.click_pin;
+        }
+    }
+    draw_links(painter, &centers, links, pkg.center());
+    DrawResult { hit, hover_tooltip }
 }

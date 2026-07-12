@@ -350,6 +350,28 @@ pub fn record(hash: &str) -> Option<&'static PinoutRecord> {
     by_hash().get(hash).copied()
 }
 
+/// Best-effort footprint for *display* (the package drawing): the exact
+/// `(name, label)` match if present, else any footprint the part ships in by
+/// name. Tolerant on purpose — peri-planner's compiled `package_label` sometimes
+/// disagrees with stm32-data's footprint name (e.g. it calls G474P "TFBGA100"
+/// while the asset has it as UFBGA121), and for drawing we just want *a* valid
+/// physical layout for the part rather than a strict drop-in match.
+pub fn best_footprint(name: &str, label: &str) -> Option<&'static PinoutRecord> {
+    if let Some(r) = footprint_for(name, label) {
+        return Some(r);
+    }
+    // Name fallback (tolerates the ordering-code suffix like footprint_for does).
+    if let Some(r) = footprints_for(name).first().copied() {
+        return Some(r);
+    }
+    asset()
+        .index
+        .iter()
+        .filter(|f| name.starts_with(f.name.as_str()))
+        .max_by_key(|f| f.name.len())
+        .and_then(|f| record(&f.h))
+}
+
 /// Number of distinct pinouts / index rows (test + diagnostic).
 pub fn record_count() -> usize {
     asset().records.len()
