@@ -69,6 +69,15 @@ struct Project {
     /// directly, so it round-trips via `select::demand_serde`.)
     #[serde(with = "crate::select::demand_serde", default = "crate::select::default_demands")]
     catalog_demands: Vec<crate::select::DemandInput>,
+    /// Active *arbitrary* chip: any catalog part name (not one of the 14 compiled
+    /// packages). `Some` overrides `package`/`mcu` and routes the whole lineup
+    /// through the generic descriptor-driven planner. `None` = a compiled chip.
+    #[serde(default)]
+    asset_chip: Option<String>,
+    /// Per-arbitrary-part generic pin-lock design, keyed by descriptor prefix
+    /// (`"STM32<line><letter>"`). The editable planning state for any STM32.
+    #[serde(default)]
+    asset_designs: std::collections::HashMap<String, H523Design>,
 }
 
 impl Project {
@@ -82,7 +91,16 @@ impl Project {
             package: Package::G474R,
             variant: ChipVariant::G474R,
             catalog_demands: crate::select::default_demands(),
+            asset_chip: None,
+            asset_designs: std::collections::HashMap::new(),
         }
+    }
+
+    /// The descriptor-prefix key used to store an arbitrary part's design
+    /// (`"STM32<line><letter>"`, first 10 chars) — several flash/temp variants of
+    /// one pinout share a design, like the compiled `chip_prefix`.
+    fn asset_key(name: &str) -> String {
+        name.chars().take(10).collect()
     }
 
     /// Coarse, open family tag for the active MCU (gates fabric topology /
@@ -302,6 +320,33 @@ impl PeriPlannerApp {
             self.clear_undo_for_nav();
             self.active.mcu = m;
         }
+        // Selecting a compiled MCU always leaves any-STM32 mode.
+        self.active.asset_chip = None;
+    }
+
+    /// Re-derive the ephemeral asset descriptor from the (persisted) active
+    /// `asset_chip`. The single place `asset_part` is set — called after any
+    /// change to the active project's `asset_chip` (nav, open, chip switch).
+    fn sync_asset_part(&mut self) {
+        self.asset_part = self
+            .active
+            .asset_chip
+            .as_deref()
+            .and_then(crate::desc_asset::descriptor_for);
+    }
+
+    /// Make an arbitrary catalog part the active (any-STM32) chip.
+    fn set_active_asset(&mut self, name: String) {
+        self.clear_undo_for_nav();
+        self.active.asset_chip = Some(name);
+        self.sync_asset_part();
+        // Land on the generic planner unless already on a shared descriptor view.
+        if !matches!(
+            self.view,
+            ViewMode::Inventory | ViewMode::AfTable | ViewMode::Analog | ViewMode::Catalog
+        ) {
+            self.view = ViewMode::Peripherals;
+        }
     }
 
     /// Switch the active project to `others[i]`, swapping the current active back
@@ -311,7 +356,7 @@ impl PeriPlannerApp {
         if i < self.others.len() {
             std::mem::swap(&mut self.active, &mut self.others[i]);
             self.clear_undo_for_nav();
-            self.asset_part = None;
+            self.sync_asset_part();
             self.land_on_active_view();
         }
     }
@@ -322,7 +367,7 @@ impl PeriPlannerApp {
         std::mem::swap(&mut self.active, &mut np);
         self.others.push(np);
         self.clear_undo_for_nav();
-        self.asset_part = None;
+        self.sync_asset_part();
         self.land_on_active_view();
     }
 
@@ -335,7 +380,7 @@ impl PeriPlannerApp {
         std::mem::swap(&mut self.active, &mut copy);
         self.others.push(copy);
         self.clear_undo_for_nav();
-        self.asset_part = None;
+        self.sync_asset_part();
         self.land_on_active_view();
     }
 
@@ -345,7 +390,7 @@ impl PeriPlannerApp {
         if !self.others.is_empty() {
             self.active = self.others.remove(0);
             self.clear_undo_for_nav();
-            self.asset_part = None;
+            self.sync_asset_part();
             self.land_on_active_view();
         }
     }
@@ -361,10 +406,15 @@ impl PeriPlannerApp {
             ViewMode::Inventory | ViewMode::AfTable | ViewMode::Analog | ViewMode::Catalog | ViewMode::Dropin
         );
         if !shared {
-            self.view = match self.active.mcu {
-                Mcu::G474 => ViewMode::Fabric,
-                Mcu::C531 => ViewMode::Converter,
-                Mcu::H523 | Mcu::C5A3 => ViewMode::Peripherals,
+            // An arbitrary (any-STM32) chip has no family planner — land on the generic one.
+            self.view = if self.active.asset_chip.is_some() {
+                ViewMode::Peripherals
+            } else {
+                match self.active.mcu {
+                    Mcu::G474 => ViewMode::Fabric,
+                    Mcu::C531 => ViewMode::Converter,
+                    Mcu::H523 | Mcu::C5A3 => ViewMode::Peripherals,
+                }
             };
         }
     }
@@ -530,14 +580,25 @@ impl PeriPlannerApp {
         const YELLOW: egui::Color32 = egui::Color32::from_rgb(210, 180, 80);
         egui::TopBottomPanel::bottom("status_line").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                // Browsing a read-only asset part: identity + why it's not plannable.
+                // Any-STM32 (arbitrary part): identity + generic-planner completeness.
                 if let Some(desc) = self.asset_part {
                     ui.label(egui::RichText::new(desc.name).strong());
+                    ui.label(desc.family);
                     ui.separator();
-                    ui.colored_label(
-                        YELLOW,
-                        "read-only — not plannable (lineup descriptor: no fabric / HRTIM)",
-                    );
+                    let empty = H523Design::new();
+                    let d = self
+                        .active
+                        .asset_designs
+                        .get(&Project::asset_key(desc.name))
+                        .unwrap_or(&empty);
+                    let problems = d.validate(desc.raw);
+                    ui.label(format!("{} peripherals · {} pins locked", d.uses.len(), d.pin_locks.len()));
+                    ui.separator();
+                    if problems.is_empty() {
+                        ui.colored_label(GREEN, "✓ complete");
+                    } else {
+                        ui.colored_label(YELLOW, format!("⚠ {} unplaced/unreachable", problems.len()));
+                    }
                     return;
                 }
                 ui.label(egui::RichText::new(self.active.package.chip_prefix()).strong());
@@ -673,15 +734,18 @@ impl PeriPlannerApp {
                 if let Some(name) = browse_name {
                     ui.colored_label(
                         egui::Color32::from_rgb(120, 170, 220),
-                        format!("● Browsing {name}"),
+                        format!("● {name}"),
                     );
                     ui.label(
-                        egui::RichText::new("read-only · package-letter pinout (flash-invariant)")
+                        egui::RichText::new("any STM32 · generic planner · package-letter pinout")
                             .small()
                             .weak(),
                     );
-                    if ui.button("✕ Close").clicked() {
-                        self.asset_part = None;
+                    if ui.button("Select another…").clicked() {
+                        self.view = ViewMode::Catalog;
+                    }
+                    if ui.button("✕ Back to G474").clicked() {
+                        self.active.asset_chip = None;
                     }
                 } else {
                     ui.label("MCU:");
@@ -753,6 +817,13 @@ impl PeriPlannerApp {
                             self.mutate(|d| d.set_variant(v));
                         }
                     }
+                    if ui
+                        .button("Any STM32…")
+                        .on_hover_text("Plan / analyse any of the ~1600 STM32 parts (Part finder → click a part)")
+                        .clicked()
+                    {
+                        self.view = ViewMode::Catalog;
+                    }
                     ui.separator();
                     if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
                         self.undo();
@@ -780,6 +851,9 @@ impl PeriPlannerApp {
                     if self.active.mcu == Mcu::H523 || self.active.mcu == Mcu::C5A3 {
                         ui.selectable_value(&mut self.view, ViewMode::Peripherals, "Peripherals");
                     }
+                } else {
+                    // Any arbitrary STM32 gets the generic (descriptor-driven) planner.
+                    ui.selectable_value(&mut self.view, ViewMode::Peripherals, "Peripherals");
                 }
                 // Descriptor views — available for both planner chips and asset parts.
                 ui.selectable_value(&mut self.view, ViewMode::Inventory, "Inventory");
@@ -945,31 +1019,40 @@ impl eframe::App for PeriPlannerApp {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Keep the ephemeral asset descriptor in lockstep with the (persisted)
+        // active `asset_chip` — covers reload of a saved any-STM32 chip and any
+        // mutation of `asset_chip` (MCU combo, Close, project switch). Cheap: a
+        // single hashmap lookup.
+        self.sync_asset_part();
+
         // Open a part clicked in a finder last frame (deferred so we never switch
-        // the active chip mid-render). A compiled part becomes the active planner
-        // chip; any other opens the read-only descriptor browser.
+        // the active chip mid-render). A compiled part becomes the fully-typed
+        // active chip; any other becomes the active any-STM32 chip.
         if let Some(name) = self.pending_open.take() {
             if let Some(pkg) = Package::for_chip_name(&name) {
-                // Opening a part can switch the active MCU — clear undo history
-                // just like the MCU combo does (each MCU has its own design).
+                // A compiled part becomes the fully-typed active chip. Opening it
+                // can switch the active MCU — clear undo (each MCU has its own
+                // design); set_active_mcu also leaves any-STM32 mode.
                 self.set_active_mcu(pkg.mcu());
                 self.active.package = pkg;
                 if let Some(v) = pkg.to_g474_variant() {
                     self.active.variant = v;
                 }
-                self.asset_part = None;
+                self.sync_asset_part();
                 self.view = ViewMode::Inventory;
-            } else if let Some(d) = crate::desc_asset::descriptor_for(&name) {
-                self.asset_part = Some(d);
-                self.view = ViewMode::Inventory;
+            } else if crate::desc_asset::descriptor_for(&name).is_some() {
+                // Any other STM32 becomes the active any-STM32 chip (generic,
+                // editable planner over the lineup descriptor asset).
+                self.set_active_asset(name);
             }
         }
 
-        // Read-only browse mode for a non-compiled part: the SAME chrome as the
-        // planner (top bar shows a read-only badge + the descriptor views; status
-        // line shows the part identity), restricted to Inventory / Pin-AF / Part
-        // finder. Handled before the keyboard/undo block so Ctrl+Z never touches
-        // the underlying planner's history while browsing.
+        // Any-STM32 (arbitrary catalog part) mode: the SAME chrome as the planner,
+        // but the chip is a lineup-descriptor part with the generic, editable
+        // planner (Peripherals / Pin-AF locks) + analysis views (Analog + package
+        // drawing / Inventory / Part finder). Pin-lock edits persist per part in
+        // `asset_designs`; undo isn't wired here (edits apply directly). Handled
+        // before the keyboard/undo block so Ctrl+Z never touches a planner's history.
         if let Some(desc) = self.asset_part {
             self.render_top_bar(ctx, false, false);
             self.render_status_line(ctx);
@@ -977,17 +1060,19 @@ impl eframe::App for PeriPlannerApp {
             let af_filter = &mut self.af_filter;
             let analog_filter = &mut self.analog_filter;
             let catalog_query = &mut self.catalog_query;
-            let catalog_demands = &mut self.active.catalog_demands;
             let catalog_cache = &mut self.catalog_eval_cache;
             let catalog_sort = &mut self.catalog_sort;
+            let catalog_demands = &mut self.active.catalog_demands;
+            let design = self.active.asset_designs.entry(Project::asset_key(desc.name)).or_default();
             let mut open: Option<String> = None;
             egui::CentralPanel::default().show(ctx, |ui| match view {
-                ViewMode::AfTable => crate::af_view::show(ui, desc.raw, af_filter, None),
+                ViewMode::Peripherals => crate::peripherals_view::show(ui, desc.raw, design),
+                ViewMode::AfTable => crate::af_view::show(ui, desc.raw, af_filter, Some(design)),
                 ViewMode::Analog => crate::analog_view::show(
                     ui,
                     desc.raw,
                     analog_filter,
-                    crate::phys_pinout::best_footprint(desc.name, desc.package.package_label()),
+                    crate::phys_pinout::best_footprint(desc.name, ""),
                 ),
                 ViewMode::Catalog => {
                     open = crate::catalog_view::show(
