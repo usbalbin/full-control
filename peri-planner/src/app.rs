@@ -31,6 +31,8 @@ enum DesignSnapshot {
     G474(Design),
     H523(H523Design), // snapshot of the active H523-family (H523 or C5A3) design
     C531(C531Design),
+    /// An any-STM32 (arbitrary part) generic design, tagged with its asset key.
+    Asset(String, H523Design),
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -316,10 +318,14 @@ impl PeriPlannerApp {
     /// live view — that invariant is what makes per-MCU undo coherent. No-op if
     /// already active. A package switch within an MCU keeps history (same design).
     fn set_active_mcu(&mut self, m: Mcu) {
-        if m != self.active.mcu {
+        // Undo history holds only the ACTIVE model's snapshots, so it clears on an
+        // MCU change OR when leaving any-STM32 mode (Asset snapshots must not
+        // restore into a compiled model).
+        let leaving_asset = self.active.asset_chip.is_some();
+        if m != self.active.mcu || leaving_asset {
             self.clear_undo_for_nav();
-            self.active.mcu = m;
         }
+        self.active.mcu = m;
         // Selecting a compiled MCU always leaves any-STM32 mode.
         self.active.asset_chip = None;
     }
@@ -421,6 +427,13 @@ impl PeriPlannerApp {
 
     /// Snapshot whichever model is active.
     fn snapshot_active(&self) -> DesignSnapshot {
+        // An any-STM32 chip's generic design takes precedence over the (stale,
+        // placeholder) `mcu` — its editable state lives in `asset_designs`.
+        if let Some(desc) = self.asset_part {
+            let key = Project::asset_key(desc.name);
+            let d = self.active.asset_designs.get(&key).cloned().unwrap_or_default();
+            return DesignSnapshot::Asset(key, d);
+        }
         match self.active.mcu {
             Mcu::G474 => DesignSnapshot::G474(self.active.design.clone()),
             Mcu::H523 | Mcu::C5A3 => {
@@ -440,6 +453,9 @@ impl PeriPlannerApp {
                 self.active.h523_designs.insert(self.active.mcu, d);
             }
             DesignSnapshot::C531(d) => self.active.c531_design = d,
+            DesignSnapshot::Asset(key, d) => {
+                self.active.asset_designs.insert(key, d);
+            }
         }
     }
 
@@ -452,6 +468,10 @@ impl PeriPlannerApp {
                 !self.h523(&empty).eq_ignoring_notes(b)
             }
             DesignSnapshot::C531(b) => self.active.c531_design != *b,
+            DesignSnapshot::Asset(key, b) => {
+                let cur = self.active.asset_designs.get(key).cloned().unwrap_or_default();
+                !cur.eq_ignoring_notes(b)
+            }
             DesignSnapshot::G474(_) => false,
         }
     }
@@ -746,6 +766,14 @@ impl PeriPlannerApp {
                     }
                     if ui.button("✕ Back to G474").clicked() {
                         self.active.asset_chip = None;
+                        self.clear_undo_for_nav(); // Asset history must not survive the switch.
+                    }
+                    ui.separator();
+                    if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
+                        self.undo();
+                    }
+                    if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
+                        self.redo_op();
                     }
                 } else {
                     ui.label("MCU:");
@@ -1051,10 +1079,21 @@ impl eframe::App for PeriPlannerApp {
         // but the chip is a lineup-descriptor part with the generic, editable
         // planner (Peripherals / Pin-AF locks) + analysis views (Analog + package
         // drawing / Inventory / Part finder). Pin-lock edits persist per part in
-        // `asset_designs`; undo isn't wired here (edits apply directly). Handled
-        // before the keyboard/undo block so Ctrl+Z never touches a planner's history.
+        // `asset_designs` and are undoable via the same per-frame bracket the other
+        // generic families use. Ctrl+Z is handled here (this block returns early).
         if let Some(desc) = self.asset_part {
-            self.render_top_bar(ctx, false, false);
+            let ctrl = ctx.input(|i| i.modifiers.command);
+            if ctrl && ctx.input(|i| i.key_pressed(egui::Key::Z)) {
+                if ctx.input(|i| i.modifiers.shift) { self.redo_op(); } else { self.undo(); }
+            }
+            if ctrl && ctx.input(|i| i.key_pressed(egui::Key::Y)) {
+                self.redo_op();
+            }
+            let nav_before = self.nav_epoch;
+            let before = self.snapshot_active();
+            let can_undo = !self.history.is_empty();
+            let can_redo = !self.redo.is_empty();
+            self.render_top_bar(ctx, can_undo, can_redo);
             self.render_status_line(ctx);
             let view = self.view;
             let af_filter = &mut self.af_filter;
@@ -1098,6 +1137,11 @@ impl eframe::App for PeriPlannerApp {
                 _ => crate::inventory_view::show(ui, desc),
             });
             self.pending_open = open;
+            // Record this frame's pin-lock edits as one undo step (unless a nav
+            // switched the active chip mid-frame — nav_epoch guards that).
+            if self.nav_epoch == nav_before && self.non_g474_changed(&before) {
+                self.push_history(before);
+            }
             return;
         }
 
@@ -2328,6 +2372,35 @@ mod seed_tests {
         assert_eq!(plan.target.family, "H5");
         assert!(plan.routes.is_empty());
         assert!(plan.placements.iter().any(|p| p.signal.peripheral == "USART1"));
+    }
+
+    #[test]
+    fn asset_undo_snapshots_and_round_trips() {
+        // An arbitrary (any-STM32) part's pin-lock edits are undoable/redoable via
+        // the DesignSnapshot::Asset variant.
+        let mut app = PeriPlannerApp::default();
+        app.active.asset_chip = Some("STM32H743ZI".to_string());
+        app.sync_asset_part();
+        let desc = app.asset_part.expect("H743 resolves to an asset descriptor");
+        let key = Project::asset_key(desc.name);
+
+        let before = app.snapshot_active();
+        assert!(matches!(before, DesignSnapshot::Asset(_, _)), "active is an asset chip");
+        // Edit: lock a pin on the per-part generic design.
+        app.active
+            .asset_designs
+            .entry(key.clone())
+            .or_default()
+            .lock("SPI1", "MOSI", crate::mcu_pinout::PinId { port: 'A', num: 7 });
+        assert!(app.non_g474_changed(&before), "the lock edit is detected");
+
+        // Undo restores the empty design; redo re-applies the lock.
+        app.push_history(before);
+        app.undo();
+        assert!(app.active.asset_designs.get(&key).cloned().unwrap_or_default().pin_locks.is_empty());
+        assert!(!app.redo.is_empty(), "redo available after undo");
+        app.redo_op();
+        assert_eq!(app.active.asset_designs.get(&key).unwrap().pin_locks.len(), 1, "redo re-applied");
     }
 
     #[test]
