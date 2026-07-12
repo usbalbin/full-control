@@ -20,9 +20,10 @@ use crate::pinout::ChipVariant;
 // ---------- Mcu / Package ----------
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-pub enum Mcu { G474, H523, C5A3, C531 }
+#[derive(Default)]
+pub enum Mcu { #[default]
+G474, H523, C5A3, C531 }
 
-impl Default for Mcu { fn default() -> Self { Self::G474 } }
 
 impl Mcu {
     pub const ALL: &'static [Mcu] = &[Mcu::G474, Mcu::H523, Mcu::C5A3, Mcu::C531];

@@ -135,11 +135,10 @@ fn registry() -> &'static HashMap<&'static str, &'static McuDescriptor> {
 /// the lineup asset somehow lacks the prefix.
 pub fn descriptor_for(name: &str) -> Option<&'static McuDescriptor> {
     let reg = registry();
-    if name.len() >= 10 {
-        if let Some(d) = reg.get(&name[..10]) {
+    if name.len() >= 10
+        && let Some(d) = reg.get(&name[..10]) {
             return Some(d);
         }
-    }
     reg.iter().find(|(pre, _)| name.starts_with(**pre)).map(|(_, d)| *d)
 }
 

@@ -40,6 +40,27 @@ fn static_sig(raw: &'static RawMcuData, peripheral: &str, role: &str) -> Option<
         .find(|s| s.peripheral == peripheral && s.role == role)
 }
 
+/// Reachable pins for `(peripheral, role)` that are free — or already locked to
+/// this same role. The pin-map's placement candidates (conflict-aware via the
+/// generic engine + the design's current locks).
+pub(crate) fn candidate_pins(
+    raw: &'static RawMcuData,
+    design: &H523Design,
+    peripheral: &str,
+    role: &str,
+) -> Vec<PinId> {
+    let Some(sig) = static_sig(raw, peripheral, role) else {
+        return Vec::new();
+    };
+    pins_for(raw, sig)
+        .into_iter()
+        .filter(|pin| match design.occupant_of(*pin) {
+            None => true,
+            Some((p, r)) => p == peripheral && r == role,
+        })
+        .collect()
+}
+
 /// One deferred edit produced during rendering (egui renders the immutable
 /// design, we apply after — same idiom as `peripherals_view`).
 enum Edit {
@@ -100,17 +121,9 @@ pub fn show(
         .collect();
 
     // Candidate pins for the picked role: reachable AND free (or already its own).
-    let picked_sig = picked.as_ref().and_then(|(p, r)| static_sig(raw, p, r));
-    let candidates: Vec<PinId> = picked_sig
-        .map(|sig| {
-            pins_for(raw, sig)
-                .into_iter()
-                .filter(|pin| match taken.get(pin) {
-                    None => true,
-                    Some((p, r)) => p == sig.peripheral && r == sig.role,
-                })
-                .collect()
-        })
+    let candidates: Vec<PinId> = picked
+        .as_ref()
+        .map(|(p, r)| candidate_pins(raw, design, p, r))
         .unwrap_or_default();
     let picked_pin = picked
         .as_ref()
@@ -249,5 +262,34 @@ fn apply(design: &mut H523Design, picked: &mut Option<(String, String)>, edit: O
             }
         }
         None => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_pins_exclude_pins_taken_by_other_roles() {
+        let raw = crate::mcu::Package::H523R.raw();
+        let mut d = H523Design::new();
+        let cands0 = candidate_pins(raw, &d, "SPI1", "MOSI");
+        assert!(!cands0.is_empty(), "SPI1.MOSI has candidate pins on H523");
+        let taken = cands0[0];
+
+        // Taken by a DIFFERENT role -> no longer a candidate.
+        d.lock("USART1", "TX", taken);
+        assert!(!candidate_pins(raw, &d, "SPI1", "MOSI").contains(&taken));
+
+        // Locked to MOSI itself -> stays a candidate (its own placement).
+        d.unlock("USART1", "TX");
+        d.lock("SPI1", "MOSI", taken);
+        assert!(candidate_pins(raw, &d, "SPI1", "MOSI").contains(&taken));
+    }
+
+    #[test]
+    fn candidate_pins_empty_for_unknown_role() {
+        let raw = crate::mcu::Package::H523R.raw();
+        assert!(candidate_pins(raw, &H523Design::new(), "NOPE", "XYZ").is_empty());
     }
 }

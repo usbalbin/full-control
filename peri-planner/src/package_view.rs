@@ -548,21 +548,17 @@ fn draw_quad(
             painter.text(label_anchor, label_dir, outside_text, small, text_color);
         }
 
-        if let (Some(hp), Some(tt)) = (hover_pos, &paint.tooltip) {
-            if click_rect.contains(hp) {
+        if let (Some(hp), Some(tt)) = (hover_pos, &paint.tooltip)
+            && click_rect.contains(hp) {
                 hover_tooltip = Some((hp, tt.clone()));
             }
-        }
 
-        if paint.interactive && response.clicked() {
-            if let Some(pos) = response.interact_pointer_pos() {
-                if click_rect.contains(pos) {
-                    if let Some(p) = pin_opt {
+        if paint.interactive && response.clicked()
+            && let Some(pos) = response.interact_pointer_pos()
+                && click_rect.contains(pos)
+                    && let Some(p) = pin_opt {
                         hit = Some(p);
                     }
-                }
-            }
-        }
     }
     DrawResult { hit, hover_tooltip }
 }
@@ -686,20 +682,16 @@ fn draw_bga(
                 ball_center,
                 Vec2::new(ball_step_x, ball_step_y),
             );
-            if let (Some(hp), Some(tt)) = (hover_pos, &paint.tooltip) {
-                if click_rect.contains(hp) {
+            if let (Some(hp), Some(tt)) = (hover_pos, &paint.tooltip)
+                && click_rect.contains(hp) {
                     hover_tooltip = Some((hp, tt.clone()));
                 }
-            }
-            if paint.interactive && response.clicked() {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    if click_rect.contains(pos) {
-                        if let Some(p) = pin_opt {
+            if paint.interactive && response.clicked()
+                && let Some(pos) = response.interact_pointer_pos()
+                    && click_rect.contains(pos)
+                        && let Some(p) = pin_opt {
                             hit = Some(p);
                         }
-                    }
-                }
-            }
         }
     }
     DrawResult { hit, hover_tooltip }

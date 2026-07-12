@@ -589,7 +589,7 @@ impl DemandInput {
         }
     }
     pub fn has_option(&self, key: &str) -> bool {
-        self.options.iter().any(|k| *k == key)
+        self.options.contains(&key)
     }
     /// Whether this kind can use DMA — OCP is an internal silicon trip (no DMA),
     /// so the UI hides its DMA toggle.

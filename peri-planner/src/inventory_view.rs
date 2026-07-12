@@ -30,12 +30,11 @@ fn render_analog(ui: &mut egui::Ui, mcu: &McuDescriptor) {
             let names: Vec<String> = mcu.adcs.iter().map(|a| format!("ADC{}", a.number)).collect();
             ui.label(format!("ADC: {}", names.join(", ")));
             // Fast-channel rule is uniform across instances on supported MCUs.
-            if let Some(first) = mcu.adcs.first() {
-                if !first.fast_channels.is_empty() {
+            if let Some(first) = mcu.adcs.first()
+                && !first.fast_channels.is_empty() {
                     let chs: Vec<String> = first.fast_channels.iter().map(u8::to_string).collect();
                     ui.label(egui::RichText::new(format!("  fast channels: IN{}", chs.join(", IN"))).weak());
                 }
-            }
         }
         if mcu.dacs.is_empty() {
             ui.label("DAC: (none)");

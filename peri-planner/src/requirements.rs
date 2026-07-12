@@ -401,8 +401,8 @@ fn assignment_signals(a: &Assignment) -> Vec<crate::pinout::Signal> {
                     if let Some(z) = zcd_eev { out.push(Signal::HrtimEev(*z)); }
                     if let Some(d) = dac { out.push(Signal::DacOut(*d)); }
                 }
-                HrtimResolved::PcmInternal { zcd_eev, .. } => {
-                    if let Some(z) = zcd_eev { out.push(Signal::HrtimEev(*z)); }
+                HrtimResolved::PcmInternal { zcd_eev: Some(z), .. } => {
+                    out.push(Signal::HrtimEev(*z));
                 }
                 _ => {}
             }
@@ -775,12 +775,10 @@ impl RequirementSpec {
                 mode, capture_comp, bkin_comp,
             } => {
                 if used.contains(&Resource::Tim(instance)) { return Vec::new(); }
-                if let Some(c) = capture_comp {
-                    if used.contains(&Resource::Comp(c)) { return Vec::new(); }
-                }
-                if let Some(c) = bkin_comp {
-                    if used.contains(&Resource::Comp(c)) { return Vec::new(); }
-                }
+                if let Some(c) = capture_comp
+                    && used.contains(&Resource::Comp(c)) { return Vec::new(); }
+                if let Some(c) = bkin_comp
+                    && used.contains(&Resource::Comp(c)) { return Vec::new(); }
                 vec![Assignment::Tim {
                     instance, channels_mask, complementary, bkin, etr,
                     mode, capture_comp, bkin_comp,
@@ -1134,9 +1132,8 @@ fn enumerate_hrtim_sub(
     };
 
     // Fault resource must be free regardless of role.
-    if let Some(f) = fault {
-        if used.contains(&Resource::Flt(f)) { return Vec::new(); }
-    }
+    if let Some(f) = fault
+        && used.contains(&Resource::Flt(f)) { return Vec::new(); }
 
     let mut out = Vec::new();
     match role {
@@ -1314,13 +1311,11 @@ fn enumerate_sequencer(
         return Vec::new();
     }
     // If the trigger event depends on a compare slot, that slot must be free.
-    if let TriggerSource::Event(ev) = trigger {
-        if let Some(slot) = compare_slot_for_event(ev) {
-            if used.contains(&slot) {
+    if let TriggerSource::Event(ev) = trigger
+        && let Some(slot) = compare_slot_for_event(ev)
+            && used.contains(&slot) {
                 return Vec::new();
             }
-        }
-    }
     if kind.is_dual() {
         let slave_kind = match kind {
             SequencerKind::DualRegular => SequencerKind::Regular,
@@ -1844,8 +1839,8 @@ impl Design {
                             if let Some(z) = zcd_eev { s.push(Signal::HrtimEev(*z)); }
                             if let Some(d) = dac { s.push(Signal::DacOut(*d)); }
                         }
-                        HrtimResolved::PcmInternal { zcd_eev, .. } => {
-                            if let Some(z) = zcd_eev { s.push(Signal::HrtimEev(*z)); }
+                        HrtimResolved::PcmInternal { zcd_eev: Some(z), .. } => {
+                            s.push(Signal::HrtimEev(*z));
                         }
                         _ => {}
                     }
@@ -1991,11 +1986,11 @@ impl Design {
 
     pub fn phase_timers_and_dem(&self) -> Vec<(HrtimId, bool)> {
         self.assignments.iter().flatten().filter_map(|a| match a {
-            Assignment::HrtimSub { sub_timer, resolved, .. } => match resolved {
-                HrtimResolved::PcmInternal { dem, .. }
-                | HrtimResolved::PcmExternal { dem, .. } => Some((*sub_timer, *dem)),
-                _ => None,
-            },
+            Assignment::HrtimSub {
+                sub_timer,
+                resolved: HrtimResolved::PcmInternal { dem, .. } | HrtimResolved::PcmExternal { dem, .. },
+                ..
+            } => Some((*sub_timer, *dem)),
             _ => None,
         }).collect()
     }
@@ -2015,12 +2010,13 @@ impl Design {
     /// First sequencer whose trigger event routes through the master timer.
     pub fn master_triggered_sequencer(&self) -> Option<Assignment> {
         self.assignments.iter().flatten().find_map(|a| match a {
-            Assignment::AdcSequencer { trigger: TriggerSource::Event(ev), .. }
-                if matches!(
-                    ev,
+            Assignment::AdcSequencer {
+                trigger: TriggerSource::Event(
                     CrossbarSource::Mcr1 | CrossbarSource::Mcr2 |
-                    CrossbarSource::Mcr3 | CrossbarSource::Mcr4 | CrossbarSource::Mper
-                ) => Some(a.clone()),
+                    CrossbarSource::Mcr3 | CrossbarSource::Mcr4 | CrossbarSource::Mper,
+                ),
+                ..
+            } => Some(a.clone()),
             _ => None,
         })
     }

@@ -292,11 +292,10 @@ impl PeriPlannerApp {
         if let Some(design) = eframe::get_value::<Design>(storage, STORAGE_KEY) {
             proj.design = design;
         }
-        if let Some(v) = eframe::get_value::<ChipVariant>(storage, "peri_planner_variant_v1") {
-            if proj.design.variant != v {
+        if let Some(v) = eframe::get_value::<ChipVariant>(storage, "peri_planner_variant_v1")
+            && proj.design.variant != v {
                 proj.design.set_variant(v);
             }
-        }
         proj.variant = proj.design.variant;
         if let Some(m) = eframe::get_value::<Mcu>(storage, "peri_planner_mcu_v1") {
             proj.mcu = m;
@@ -795,8 +794,8 @@ impl PeriPlannerApp {
                         self.redo_op();
                     }
                     ui.separator();
-                    if ui.button("Export").clicked() {
-                        if let Some(desc) = self.asset_part {
+                    if ui.button("Export").clicked()
+                        && let Some(desc) = self.asset_part {
                             let empty = H523Design::new();
                             let d = self
                                 .active
@@ -806,7 +805,6 @@ impl PeriPlannerApp {
                             let text = d.export_summary(desc.name);
                             ui.ctx().copy_text(text);
                         }
-                    }
                     if ui
                         .button("Gen firmware")
                         .on_hover_text("Copy a generated embassy-stm32 board scaffold for this part")
@@ -1370,11 +1368,10 @@ impl eframe::App for PeriPlannerApp {
                     };
                     ui.horizontal_wrapped(|ui| {
                         ui.colored_label(color, format!("  {} {}", glyph, c.message));
-                        if let Some(fix) = &c.fix {
-                            if ui.small_button(fix.label()).clicked() {
+                        if let Some(fix) = &c.fix
+                            && ui.small_button(fix.label()).clicked() {
                                 fix_to_apply = Some(fix.clone());
                             }
-                        }
                     });
                 }
                 if let Some(fix) = fix_to_apply {

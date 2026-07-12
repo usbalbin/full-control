@@ -152,11 +152,10 @@ pub struct SearchQuery {
 
 impl SearchQuery {
     pub fn matches(&self, e: &CatalogEntry) -> bool {
-        if let Some(f) = &self.family {
-            if !e.family.eq_ignore_ascii_case(f) {
+        if let Some(f) = &self.family
+            && !e.family.eq_ignore_ascii_case(f) {
                 return false;
             }
-        }
         e.flash_kb >= self.min_flash_kb
             && e.ram_kb >= self.min_ram_kb
             && e.total_uart() >= self.min_uart

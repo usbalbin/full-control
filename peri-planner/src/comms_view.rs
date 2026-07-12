@@ -34,11 +34,10 @@ pub fn show(ui: &mut egui::Ui, design: &Design, variant: ChipVariant) -> Option<
         .map(|k| (*k, Vec::new()))
         .collect();
     for (i, spec) in design.requirements.iter().enumerate() {
-        if let Some(kind) = comms_kind_of(spec) {
-            if let Some((_, list)) = groups.iter_mut().find(|(k, _)| *k == kind) {
+        if let Some(kind) = comms_kind_of(spec)
+            && let Some((_, list)) = groups.iter_mut().find(|(k, _)| *k == kind) {
                 list.push(i);
             }
-        }
     }
 
     egui::ScrollArea::vertical().show(ui, |ui| {

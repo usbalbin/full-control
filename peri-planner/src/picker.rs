@@ -93,8 +93,8 @@ pub fn role_for_pin(
         Signal::AdcIn { adc, channel } => {
             // Find the AdcConversion assignment matching this (adc, channel).
             for (idx, asn) in design.assignments.iter().enumerate() {
-                if let Some(Assignment::AdcConversion { adc: a, channel: c, .. }) = asn {
-                    if *a == adc && *c == channel {
+                if let Some(Assignment::AdcConversion { adc: a, channel: c, .. }) = asn
+                    && *a == adc && *c == channel {
                         return Some(PickedRole::AdcConversion {
                             req_idx: idx,
                             current_pin: pin,
@@ -102,7 +102,6 @@ pub fn role_for_pin(
                             current_channel: channel,
                         });
                     }
-                }
             }
             None
         }
@@ -110,8 +109,8 @@ pub fn role_for_pin(
             // Find the HrtimSub assignment using this sub-timer. Retargeting
             // moves both CH1 and CH2 (for Ch1AndCh2 outputs).
             for (idx, asn) in design.assignments.iter().enumerate() {
-                if let Some(Assignment::HrtimSub { sub_timer: t, .. }) = asn {
-                    if *t == timer {
+                if let Some(Assignment::HrtimSub { sub_timer: t, .. }) = asn
+                    && *t == timer {
                         return Some(PickedRole::HrtimSubChannel {
                             req_idx: idx,
                             current_pin: pin,
@@ -119,7 +118,6 @@ pub fn role_for_pin(
                             current_ch: ch,
                         });
                     }
-                }
             }
             None
         }
@@ -357,11 +355,12 @@ fn compute_phase_move(
     }
     // Is this HRTIM use DEM-capable? (Preserves CR4/CPT2 claims on move.)
     let dem = match design.assignments.get(req_idx) {
-        Some(Some(Assignment::HrtimSub { resolved, .. })) => match resolved {
-            crate::requirements::HrtimResolved::PcmInternal { dem, .. }
-            | crate::requirements::HrtimResolved::PcmExternal { dem, .. } => *dem,
-            _ => false,
-        },
+        Some(Some(Assignment::HrtimSub {
+            resolved:
+                crate::requirements::HrtimResolved::PcmInternal { dem, .. }
+                | crate::requirements::HrtimResolved::PcmExternal { dem, .. },
+            ..
+        })) => *dem,
         _ => false,
     };
     // Resource pool excluding this phase's own claims.
@@ -714,8 +713,7 @@ fn apply_cascade_step(design: &mut Design, variant: ChipVariant, c: &CascadeMove
                 for i in 0..design.assignments.len() {
                     if let Some(Assignment::AdcConversion { adc: a, channel: c_ch, purpose }) =
                         design.assignments[i]
-                    {
-                        if a == adc && c_ch == old_ch {
+                        && a == adc && c_ch == old_ch {
                             design.set_assignment(i, Assignment::AdcConversion {
                                 adc, channel: ch, purpose,
                             });
@@ -729,7 +727,6 @@ fn apply_cascade_step(design: &mut Design, variant: ChipVariant, c: &CascadeMove
                             }
                             break;
                         }
-                    }
                 }
             }
         }

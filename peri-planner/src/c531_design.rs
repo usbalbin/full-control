@@ -212,14 +212,13 @@ impl C531Design {
                 });
             }
 
-            if let Some(dac) = ocp.threshold_dac {
-                if !fab
+            if let Some(dac) = ocp.threshold_dac
+                && !fab
                     .dac_threshold_sources_for_comp(comp_num(ocp.comp))
                     .contains(&dac_inst_ch(dac))
                 {
                     problems.push(Problem::ThresholdUnroutable { leg: i, dac, comp: ocp.comp });
                 }
-            }
         }
 
         // Cross-leg: each exclusive resource may be claimed by only one leg.
@@ -233,19 +232,17 @@ impl C531Design {
                     if oa.comp == ob.comp {
                         problems.push(Problem::CompConflict { legs: (a, b), comp: oa.comp });
                     }
-                    if let (Some(da), Some(db)) = (oa.threshold_dac, ob.threshold_dac) {
-                        if da == db {
+                    if let (Some(da), Some(db)) = (oa.threshold_dac, ob.threshold_dac)
+                        && da == db {
                             problems.push(Problem::DacConflict { legs: (a, b), dac: da });
                         }
-                    }
                 }
-                if let (Some(sa), Some(sb)) = (la.adc_sense, lb.adc_sense) {
-                    if sa == sb {
+                if let (Some(sa), Some(sb)) = (la.adc_sense, lb.adc_sense)
+                    && sa == sb {
                         problems.push(Problem::AdcConflict {
                             legs: (a, b), adc: sa.0, channel: sa.1,
                         });
                     }
-                }
             }
         }
 
@@ -558,11 +555,10 @@ fn rec_ocp(
         if used_comp.contains(&cand.comp) {
             continue;
         }
-        if let Some(d) = cand.dac {
-            if used_dac.contains(&d) {
+        if let Some(d) = cand.dac
+            && used_dac.contains(&d) {
                 continue;
             }
-        }
         cur[idx] = Some(cand);
         used_comp.insert(cand.comp);
         if let Some(d) = cand.dac {

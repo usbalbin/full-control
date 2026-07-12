@@ -106,8 +106,8 @@ impl H523Design {
     /// the same signal. Removes any other lock that was on this pin.
     pub fn lock(&mut self, peripheral: &str, role: &str, pin: PinId) {
         self.pin_locks.retain(|l| {
-            !(l.peripheral == peripheral && l.role == role)
-                && !(l.port == pin.port && l.num == pin.num)
+            !((l.peripheral == peripheral && l.role == role)
+                || (l.port == pin.port && l.num == pin.num))
         });
         self.pin_locks.push(PinLock {
             peripheral: peripheral.to_string(),

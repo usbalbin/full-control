@@ -295,8 +295,8 @@ pub fn show(ui: &mut egui::Ui, sel: &Selection, locks: &ResourceBag) -> Option<R
         // sawtooth (any TIMA..TIMF can drive any DAC3/DAC4 channel via
         // the DAC's STRGINSEL register). Placed below the node so it
         // doesn't sit on the DAC→COMP edge.
-        if d.is_fast() {
-            if let Some((_, timer)) = sel.phase_dac_timers.iter().find(|(dac, _)| *dac == d) {
+        if d.is_fast()
+            && let Some((_, timer)) = sel.phase_dac_timers.iter().find(|(dac, _)| *dac == d) {
                 painter.text(
                     Pos2::new(p.x, p.y + NODE_R + 2.0),
                     egui::Align2::CENTER_TOP,
@@ -305,7 +305,6 @@ pub fn show(ui: &mut egui::Ui, sel: &Selection, locks: &ResourceBag) -> Option<R
                     Color32::from_rgb(200, 180, 80),
                 );
             }
-        }
     }
     for &c in &layout.comps {
         let p = pc(c);
@@ -532,11 +531,10 @@ pub fn show(ui: &mut egui::Ui, sel: &Selection, locks: &ResourceBag) -> Option<R
         }
     }
 
-    if response.clicked() {
-        if let Some(click_pos) = response.interact_pointer_pos() {
+    if response.clicked()
+        && let Some(click_pos) = response.interact_pointer_pos() {
             return hit_test(click_pos, &layout, &column_rect);
         }
-    }
     None
 }
 
@@ -643,8 +641,7 @@ fn draw_adc_sequencer_panel(
     // Vertically-stacked blocks down the right-side panel.
     let block_w = ADC_PANEL_W - 8.0;
     let block_h = ((panel_h - ADC_BLOCK_PAD * (n.saturating_sub(1)) as f32) / n as f32)
-        .max(40.0)
-        .min(180.0);
+        .clamp(40.0, 180.0);
     for (i, seq) in sel.adc_sequencers.iter().enumerate() {
         let y = panel_top + i as f32 * (block_h + ADC_BLOCK_PAD);
         let block = egui::Rect::from_min_size(
@@ -754,12 +751,11 @@ fn trigger_source_pos(rect: &egui::Rect, layout: &Layout, ev: CrossbarSource) ->
         | CrossbarSource::TimFCrPer | CrossbarSource::TimFCrRst => Some(HrtimId::TimF),
         _ => None,
     };
-    if let Some(t) = timer {
-        if let Some(idx) = layout.timers.iter().position(|&x| x == t) {
+    if let Some(t) = timer
+        && let Some(idx) = layout.timers.iter().position(|&x| x == t) {
             let p = pos(rect, COL_TIMER, idx + 1, total_timer_slots);
             return Pos2::new(p.x + TIMER_BLOCK_W / 2.0, p.y);
         }
-    }
     // Fallback: middle-right of canvas.
     Pos2::new(rect.right() - 50.0, rect.center().y)
 }
