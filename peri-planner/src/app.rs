@@ -121,6 +121,21 @@ impl Project {
     /// picks the right per-family lowerer. One-way / derived (the family models
     /// stay authoritative); this is the input the firmware codegen reads.
     pub(crate) fn to_pin_plan(&self) -> crate::pin_plan::PinPlan {
+        // An any-STM32 chip lowers its generic design against the lineup
+        // descriptor (coarse family = the line, e.g. "H7", "F4").
+        if let Some(name) = &self.asset_chip
+            && let Some(desc) = crate::desc_asset::descriptor_for(name)
+        {
+            let key = Self::asset_key(desc.name);
+            let d = self.asset_designs.get(&key).cloned().unwrap_or_default();
+            let target = crate::pin_plan::Target {
+                package: desc.name.to_string(),
+                family: desc.family.strip_prefix("STM32").unwrap_or(desc.family).to_string(),
+            };
+            let mut plan = d.to_pin_plan(target, desc.raw);
+            crate::pin_plan::assign_dma(&mut plan, desc);
+            return plan;
+        }
         let target = crate::pin_plan::Target {
             package: self.package.name().to_string(),
             family: self.family_tag().to_string(),
@@ -778,6 +793,27 @@ impl PeriPlannerApp {
                     }
                     if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
                         self.redo_op();
+                    }
+                    ui.separator();
+                    if ui.button("Export").clicked() {
+                        if let Some(desc) = self.asset_part {
+                            let empty = H523Design::new();
+                            let d = self
+                                .active
+                                .asset_designs
+                                .get(&Project::asset_key(desc.name))
+                                .unwrap_or(&empty);
+                            let text = d.export_summary(desc.name);
+                            ui.ctx().copy_text(text);
+                        }
+                    }
+                    if ui
+                        .button("Gen firmware")
+                        .on_hover_text("Copy a generated embassy-stm32 board scaffold for this part")
+                        .clicked()
+                    {
+                        let plan = self.active.to_pin_plan();
+                        ui.ctx().copy_text(crate::codegen::generate(&plan));
                     }
                 } else {
                     ui.label("MCU:");
@@ -2396,6 +2432,32 @@ mod seed_tests {
         assert_eq!(plan.target.family, "H5");
         assert!(plan.routes.is_empty());
         assert!(plan.placements.iter().any(|p| p.signal.peripheral == "USART1"));
+    }
+
+    #[test]
+    fn asset_chip_lowers_to_pin_plan_for_codegen() {
+        // An any-STM32 part exports/codegens from its generic design (coarse
+        // family derived from the descriptor line).
+        let mut p = Project::new("h7");
+        p.asset_chip = Some("STM32H743ZI".to_string());
+        let desc = crate::desc_asset::descriptor_for("STM32H743ZI").unwrap();
+        let sig = crate::mcu_pinout::af_rows(desc.raw)
+            .map(|r| r.signal)
+            .find(|s| s.peripheral == "USART1" && s.role == "TX")
+            .expect("H743 has USART1.TX");
+        let pin = *crate::mcu_pinout::pins_for(desc.raw, sig).first().unwrap();
+        let d = p.asset_designs.entry(Project::asset_key(desc.name)).or_default();
+        d.add_use(sig.peripheral, &[sig.role]);
+        d.lock(sig.peripheral, sig.role, pin);
+
+        let plan = p.to_pin_plan();
+        assert_eq!(plan.target.family, "H7", "coarse family from the descriptor line");
+        assert!(
+            plan.placements.iter().any(|pl| pl.signal.peripheral == "USART1" && pl.signal.role == "TX"),
+            "the locked role lowers into the plan"
+        );
+        // Codegen is family-generic (open family string) — must produce output.
+        assert!(!crate::codegen::generate(&plan).is_empty());
     }
 
     #[test]

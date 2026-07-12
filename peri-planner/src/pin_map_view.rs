@@ -25,6 +25,7 @@ const LOCKED_FILL: Color32 = Color32::from_rgb(70, 150, 95);
 const CAND_FILL: Color32 = Color32::from_rgb(70, 130, 200);
 const PICK_BORDER: Color32 = Color32::from_rgb(240, 240, 240);
 const GREEN: Color32 = Color32::from_rgb(110, 200, 130);
+const YELLOW: Color32 = Color32::from_rgb(210, 180, 80);
 const DIM: Color32 = Color32::from_gray(150);
 
 fn as_pin(p: PinId) -> Pin {
@@ -55,6 +56,7 @@ pub fn show(
     design: &mut H523Design,
     picked: &mut Option<(String, String)>,
 ) {
+    let problems = design.validate(raw);
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(format!("{} — pin map", raw.name)).strong());
         ui.label(
@@ -62,6 +64,26 @@ pub fn show(
                 .weak()
                 .small(),
         );
+        if !design.declared_signals().is_empty() {
+            if problems.is_empty() {
+                ui.colored_label(GREEN, "✓ all placed");
+            } else {
+                let detail = problems
+                    .iter()
+                    .map(|p| match p {
+                        crate::h523_design::H523Problem::Unplaced { peripheral, role } => {
+                            format!("{peripheral}.{role}: unplaced")
+                        }
+                        crate::h523_design::H523Problem::Unreachable { peripheral, role } => {
+                            format!("{peripheral}.{role}: no pin on this chip")
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                ui.colored_label(YELLOW, format!("⚠ {} to resolve", problems.len()))
+                    .on_hover_text(detail);
+            }
+        }
     });
     ui.separator();
 
