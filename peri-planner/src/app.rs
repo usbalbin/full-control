@@ -188,6 +188,9 @@ pub struct PeriPlannerApp {
     af_filter: crate::af_view::AfFilter,
     /// Filter/picker state for the Analog differential-pairs view. Ephemeral.
     analog_filter: crate::analog_view::AnalogFilter,
+    /// Per-chip memo of the analog front-end enumeration (avoids a per-frame
+    /// full-AF-table rebuild). Ephemeral; keyed on the active chip's raw.
+    analog_cache: crate::analog_view::EnumCache,
     /// The (peripheral, role) picked up for placement in the generic pin-map view.
     /// Ephemeral.
     pin_map_pick: Option<(String, String)>,
@@ -234,6 +237,7 @@ impl Default for PeriPlannerApp {
             picked: None,
             af_filter: Default::default(),
             analog_filter: Default::default(),
+            analog_cache: Default::default(),
             pin_map_pick: None,
             c531_status: None,
             catalog_query: Default::default(),
@@ -1169,6 +1173,7 @@ impl eframe::App for PeriPlannerApp {
             let view = self.view;
             let af_filter = &mut self.af_filter;
             let analog_filter = &mut self.analog_filter;
+            let analog_cache = &mut self.analog_cache;
             let catalog_query = &mut self.catalog_query;
             let catalog_cache = &mut self.catalog_eval_cache;
             let catalog_sort = &mut self.catalog_sort;
@@ -1195,6 +1200,7 @@ impl eframe::App for PeriPlannerApp {
                     desc.raw,
                     analog_filter,
                     crate::phys_pinout::best_footprint(desc.name, ""),
+                    analog_cache,
                 ),
                 ViewMode::Catalog => {
                     open = crate::catalog_view::show(
@@ -1249,6 +1255,7 @@ impl eframe::App for PeriPlannerApp {
             let view = self.view;
             let af_filter = &mut self.af_filter;
             let analog_filter = &mut self.analog_filter;
+            let analog_cache = &mut self.analog_cache;
             let c531_status = self.c531_status.as_deref();
             // Active H523-family design, created on first touch for this MCU.
             // (`render_top_bar` above may have switched MCU this frame; this binds
@@ -1289,6 +1296,7 @@ impl eframe::App for PeriPlannerApp {
                             descriptor.raw,
                             analog_filter,
                             crate::phys_pinout::best_footprint(package.name(), package.package_label()),
+                            analog_cache,
                         );
                     }
                     ViewMode::Catalog => {
@@ -2067,6 +2075,7 @@ impl eframe::App for PeriPlannerApp {
                             self.active.package.name(),
                             self.active.package.package_label(),
                         ),
+                        &mut self.analog_cache,
                     );
                 }
                 // Non-G474 views; never selectable while the G474 planner is active.

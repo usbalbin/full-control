@@ -363,13 +363,37 @@ fn passes_base(f: &DiffFrontEnd, filter: &AnalogFilter, q: &str) -> bool {
     true
 }
 
+/// Per-chip memo of the (chip-only) differential-front-end enumeration, so
+/// `enumerate` — which scans the whole AF table and allocates a note String per
+/// row — isn't rebuilt on every egui frame. Key = the `&'static` raw pointer
+/// (one stable address per chip: compiled consts + once-leaked asset descriptors),
+/// so it recomputes only on a chip switch. `enumerate` is independent of the
+/// filter, so the filter is applied per-frame over the cached borrow.
+#[derive(Default)]
+pub struct EnumCache {
+    key: Option<usize>,
+    fes: Vec<DiffFrontEnd>,
+}
+
+impl EnumCache {
+    pub fn frontends(&mut self, raw: &'static RawMcuData) -> &[DiffFrontEnd] {
+        let k = raw as *const RawMcuData as usize;
+        if self.key != Some(k) {
+            self.fes = enumerate(raw);
+            self.key = Some(k);
+        }
+        &self.fes
+    }
+}
+
 pub fn show(
     ui: &mut egui::Ui,
     raw: &'static RawMcuData,
     filter: &mut AnalogFilter,
     footprint: Option<&'static PinoutRecord>,
+    cache: &mut EnumCache,
 ) {
-    let all = enumerate(raw);
+    let all = cache.frontends(raw);
     if footprint.is_none() {
         filter.display = Display::Table;
     }
@@ -460,8 +484,8 @@ pub fn show(
     ui.separator();
 
     match (filter.display, footprint) {
-        (Display::Package, Some(rec)) => show_package(ui, filter, &all, rec),
-        _ => show_table(ui, filter, &all),
+        (Display::Package, Some(rec)) => show_package(ui, filter, all, rec),
+        _ => show_table(ui, filter, all),
     }
 }
 
@@ -627,6 +651,26 @@ fn show_package(
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn enum_cache_recomputes_only_on_chip_switch() {
+        let g474 = &crate::mcu_data::g474r::RAW;
+        let h523 = &crate::mcu_data::h523r::RAW;
+        let mut c = EnumCache::default();
+
+        let g_pairs = c.frontends(g474).len();
+        assert!(g_pairs > 0);
+        assert_eq!(c.key, Some(g474 as *const RawMcuData as usize));
+
+        // Same chip → cached (key unchanged), same result.
+        assert_eq!(c.frontends(g474).len(), g_pairs);
+        assert_eq!(c.key, Some(g474 as *const RawMcuData as usize));
+
+        // Different chip → recompute (key + result change).
+        let h_pairs = c.frontends(h523).len();
+        assert_eq!(c.key, Some(h523 as *const RawMcuData as usize));
+        assert_ne!(g_pairs, h_pairs, "different chips enumerate differently");
+    }
 
     fn adc_channels(fes: &[DiffFrontEnd], adc: &str) -> BTreeSet<u8> {
         fes.iter()

@@ -257,7 +257,34 @@ impl H523Design {
     /// package: a declared role that can't be placed on this package at all
     /// (`Unreachable`) or hasn't been pinned yet (`Unplaced`). Empty == every
     /// declared role is placed on a real pin.
+    ///
+    /// Memoized: this is called up to twice per egui frame (status line + the
+    /// pin-map view) and scans the whole AF table, so a single-slot thread-local
+    /// memo keyed on `(raw pointer, this design)` collapses the repeated calls to
+    /// one recompute per (chip, design) change. The design fingerprint (a clone,
+    /// compared by value) is load-bearing — a raw-only key would serve a stale
+    /// problem set after every placement/lock/role edit.
     pub fn validate(&self, raw: &'static RawMcuData) -> Vec<H523Problem> {
+        thread_local! {
+            static MEMO: std::cell::RefCell<Option<(usize, H523Design, Vec<H523Problem>)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        let key = raw as *const RawMcuData as usize;
+        MEMO.with(|m| {
+            let mut slot = m.borrow_mut();
+            if let Some((k, d, res)) = slot.as_ref()
+                && *k == key
+                && d == self
+            {
+                return res.clone();
+            }
+            let res = self.validate_uncached(raw);
+            *slot = Some((key, self.clone(), res.clone()));
+            res
+        })
+    }
+
+    fn validate_uncached(&self, raw: &'static RawMcuData) -> Vec<H523Problem> {
         let rows: Vec<_> = crate::mcu_pinout::af_rows(raw).collect();
         let mut out = Vec::new();
         for u in &self.uses {
