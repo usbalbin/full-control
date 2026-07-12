@@ -860,8 +860,8 @@ impl PeriPlannerApp {
                 ui.selectable_value(&mut self.view, ViewMode::AfTable, "Pin / AF");
                 ui.selectable_value(&mut self.view, ViewMode::Analog, "Analog pairs");
                 ui.selectable_value(&mut self.view, ViewMode::Catalog, "Part finder");
+                ui.selectable_value(&mut self.view, ViewMode::Dropin, "Drop-in finder");
                 if !browsing {
-                    ui.selectable_value(&mut self.view, ViewMode::Dropin, "Drop-in finder");
                     ui.separator();
                     if ui.button("Export").clicked() {
                         // Family-correct: each MCU exports ITS model, not always G474.
@@ -1063,7 +1063,11 @@ impl eframe::App for PeriPlannerApp {
             let catalog_cache = &mut self.catalog_eval_cache;
             let catalog_sort = &mut self.catalog_sort;
             let catalog_demands = &mut self.active.catalog_demands;
-            let design = self.active.asset_designs.entry(Project::asset_key(desc.name)).or_default();
+            let dropin_query = &mut self.dropin_query;
+            let dropin_cache = &mut self.dropin_cache;
+            let dropin_focus = &mut self.dropin_focus;
+            let key = Project::asset_key(desc.name);
+            let design = self.active.asset_designs.entry(key.clone()).or_default();
             let mut open: Option<String> = None;
             egui::CentralPanel::default().show(ctx, |ui| match view {
                 ViewMode::Peripherals => crate::peripherals_view::show(ui, desc.raw, design),
@@ -1077,6 +1081,18 @@ impl eframe::App for PeriPlannerApp {
                 ViewMode::Catalog => {
                     open = crate::catalog_view::show(
                         ui, catalog_query, catalog_demands, catalog_cache, catalog_sort,
+                    );
+                }
+                ViewMode::Dropin => {
+                    open = crate::dropin_view::show_named(
+                        ui,
+                        &key,
+                        desc.name,
+                        "",
+                        crate::dropin::DesignSource::H523(design),
+                        dropin_query,
+                        dropin_cache,
+                        dropin_focus,
                     );
                 }
                 _ => crate::inventory_view::show(ui, desc),

@@ -79,6 +79,22 @@ pub fn show(
     cache: &mut DropinCache,
     focus: &mut Option<String>,
 ) -> Option<String> {
+    show_named(ui, package.chip_prefix(), package.name(), package.package_label(), src, q, cache, focus)
+}
+
+/// Drop-in finder for a source identified by `(prefix, name, label)` — works for
+/// both a compiled `Package` (via [`show`]) and an arbitrary any-STM32 part.
+#[allow(clippy::too_many_arguments)]
+pub fn show_named(
+    ui: &mut egui::Ui,
+    prefix: &str,
+    name: &str,
+    label: &str,
+    src: DesignSource,
+    q: &mut DropinQuery,
+    cache: &mut DropinCache,
+    focus: &mut Option<String>,
+) -> Option<String> {
     let mut open: Option<String> = None;
     ui.heading("Drop-in finder");
     ui.label(
@@ -96,13 +112,12 @@ pub fn show(
     );
     ui.separator();
 
-    let Some(profile) = dropin::build_source_profile(&src, package) else {
+    let Some(profile) = dropin::build_source_profile_named(&src, name, label) else {
         ui.colored_label(
             C_WARN,
             format!(
                 "No physical-pinout data for {} ({}). Cannot run the drop-in search.",
-                package.chip_prefix(),
-                package.package_label()
+                prefix, label
             ),
         );
         return None;
@@ -115,7 +130,7 @@ pub fn show(
     ui.horizontal(|ui| {
         ui.strong(format!(
             "Source: {} ({})",
-            package.chip_prefix(),
+            prefix,
             profile.footprint.pkg
         ));
         ui.label(format!(

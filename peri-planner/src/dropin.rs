@@ -187,11 +187,20 @@ impl SourceProfile {
 /// Build the source profile from the active design + selected package. `None` if
 /// the package's footprint isn't in the pinout asset.
 pub fn build_source_profile(src: &DesignSource, package: Package) -> Option<SourceProfile> {
-    let name = package.name();
-    let label = package.package_label();
-    // Suffix-tolerant: compiled C5 descriptors carry an ordering-code suffix
-    // ("STM32C531RCT6") that the index doesn't key on ("STM32C531RC").
-    let footprint = phys_pinout::footprint_for(name, label)?;
+    build_source_profile_named(src, package.name(), package.package_label())
+}
+
+/// Same, but from a raw `(part name, package label)` — so an arbitrary any-STM32
+/// part (which has no compiled `Package`) can be a drop-in *source* too.
+pub fn build_source_profile_named(
+    src: &DesignSource,
+    name: &str,
+    label: &str,
+) -> Option<SourceProfile> {
+    // Suffix-tolerant + label-tolerant: compiled C5 descriptors carry an
+    // ordering-code suffix the index omits, and an any-STM32 part's label may not
+    // match the asset's footprint name — resolve by name as a fallback.
+    let footprint = phys_pinout::best_footprint(name, label)?;
     // Keep only wired pins that physically exist as a GPIO on this footprint.
     // Defends against stale locks from another MCU: `h523_design` (the pin-lock
     // model) is shared between H523 and C5A3 and is not cleared on MCU switch.
