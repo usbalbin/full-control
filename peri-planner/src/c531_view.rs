@@ -30,6 +30,10 @@ pub enum ConverterAction {
     /// Auto-allocate every leg's OCP route + ADC-sense channel to a conflict-free,
     /// fabric-valid assignment (the non-HRTIM solver).
     AutoAssign,
+    /// Pin a converter GPIO signal to a specific pad (overrides auto-placement).
+    LockPin(crate::pinout::Signal, crate::pinout::Pin),
+    /// Revert a signal's pin to auto-placement.
+    ClearPin(crate::pinout::Signal),
 }
 
 /// Descriptor timer-`number` -> `TimId`. Only the ids the model understands.
@@ -119,7 +123,7 @@ pub fn show(
             for (i, leg) in design.legs.iter().enumerate() {
                 ui.allocate_ui(egui::vec2(320.0, 0.0), |ui| {
                     ui.group(|ui| {
-                        if let Some(a) = render_card(ui, package, i, leg, &advanced_tims, &adcs) {
+                        if let Some(a) = render_card(ui, package, design, i, leg, &advanced_tims, &adcs) {
                             action = Some(a);
                         }
                     });
@@ -131,9 +135,11 @@ pub fn show(
     action
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_card(
     ui: &mut egui::Ui,
     package: Package,
+    design: &C531Design,
     idx: usize,
     leg: &ConverterLeg,
     advanced_tims: &[TimId],
@@ -286,8 +292,8 @@ fn render_card(
         new.adc_sense = None;
     }
 
-    // Pin map for the leg's claimed GPIO signals (read-only for now — pin-lock
-    // persistence is a later slice).
+    // Pin selection for the leg's claimed GPIO signals: pick a specific pad or
+    // leave it "auto" (the lowerer materializes the first free candidate).
     ui.separator();
     ui.label(egui::RichText::new("Pins:").weak());
     for (sig, pins) in leg.pin_candidates(package) {
@@ -295,12 +301,32 @@ fn render_card(
             ui.label(egui::RichText::new(format!("  {:<10}", sig.name())).monospace());
             if pins.is_empty() {
                 ui.colored_label(egui::Color32::from_rgb(220, 100, 100), "(no pin)");
-            } else if pins.len() == 1 {
-                ui.label(pins[0].name());
-            } else {
-                let names: Vec<String> = pins.iter().map(|p| p.name()).collect();
-                ui.label(egui::RichText::new(names.join(", ")).small());
+                return;
             }
+            let locked = design.locked_pin(sig);
+            let sel_text = locked.map(|p| p.name()).unwrap_or_else(|| "auto".to_string());
+            egui::ComboBox::from_id_salt(("c531-pin", idx, sig.name()))
+                .width(110.0)
+                .selected_text(sel_text)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(locked.is_none(), "auto").clicked() {
+                        action = Some(ConverterAction::ClearPin(sig));
+                    }
+                    for p in &pins {
+                        let pid = crate::mcu_pinout::PinId { port: p.port, num: p.num };
+                        // Flag a pad already locked by a DIFFERENT signal.
+                        let taken_by = design.occupant_of(pid).filter(|o| {
+                            crate::pinout::signal_to_owned(sig).as_ref() != Some(*o)
+                        });
+                        let label = match taken_by {
+                            Some(o) => format!("{} (used by {}.{})", p.name(), o.peripheral, o.role),
+                            None => p.name(),
+                        };
+                        if ui.selectable_label(locked == Some(pid), label).clicked() {
+                            action = Some(ConverterAction::LockPin(sig, *p));
+                        }
+                    }
+                });
         });
     }
 

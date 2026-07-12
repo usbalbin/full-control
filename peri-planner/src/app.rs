@@ -1082,6 +1082,12 @@ impl PeriPlannerApp {
                     *slot = leg;
                 }
             }
+            ConverterAction::LockPin(sig, pin) => {
+                self.active
+                    .c531_design
+                    .lock_pin(sig, crate::mcu_pinout::PinId { port: pin.port, num: pin.num });
+            }
+            ConverterAction::ClearPin(sig) => self.active.c531_design.clear_pin(sig),
             ConverterAction::AutoAssign => {
                 let pkg = self.active.package;
                 let r = self.active.c531_design.auto_assign(pkg);

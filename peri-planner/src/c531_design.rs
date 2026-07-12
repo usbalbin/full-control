@@ -19,7 +19,8 @@
 
 use crate::g474::{AdcInstance, CompId, DacId, TimCh, TimId};
 use crate::mcu::Package;
-use crate::pinout::{pins_for_pkg, Pin, Signal};
+use crate::mcu_pinout::{OwnedSignal, PinId};
+use crate::pinout::{pins_for_pkg, signal_to_owned, Pin, Signal};
 
 /// Which timer break input a comparator trips: 1 = BRK, 2 = BRK2.
 pub type BreakInput = u8;
@@ -192,11 +193,42 @@ pub const C531_DESIGN_FORMAT_VERSION: u32 = 1;
 pub struct C531Design {
     pub format_version: u32,
     pub legs: Vec<ConverterLeg>,
+    /// User-chosen pins for the converter's GPIO signals (timer channels / break
+    /// pins). `to_pin_plan` honors a lock over its auto-materialized default; an
+    /// unlisted signal is auto-placed. A pin serves at most one signal.
+    #[serde(default)]
+    pub pin_locks: Vec<(OwnedSignal, PinId)>,
 }
 
 impl C531Design {
     pub fn new() -> Self {
-        Self { format_version: C531_DESIGN_FORMAT_VERSION, legs: Vec::new() }
+        Self { format_version: C531_DESIGN_FORMAT_VERSION, legs: Vec::new(), pin_locks: Vec::new() }
+    }
+
+    /// The pin the user locked for `signal`, if any.
+    pub fn locked_pin(&self, signal: Signal) -> Option<PinId> {
+        let owned = signal_to_owned(signal)?;
+        self.pin_locks.iter().find(|(s, _)| *s == owned).map(|(_, p)| *p)
+    }
+
+    /// The signal currently locked onto `pin`, if any (for conflict display).
+    pub fn occupant_of(&self, pin: PinId) -> Option<&OwnedSignal> {
+        self.pin_locks.iter().find(|(_, p)| *p == pin).map(|(s, _)| s)
+    }
+
+    /// Lock `signal` to `pin`, evicting any prior lock on that signal or that pin
+    /// (a pin serves one signal, a signal has one pin).
+    pub fn lock_pin(&mut self, signal: Signal, pin: PinId) {
+        let Some(owned) = signal_to_owned(signal) else { return };
+        self.pin_locks.retain(|(s, p)| *s != owned && *p != pin);
+        self.pin_locks.push((owned, pin));
+    }
+
+    /// Drop `signal`'s pin lock (revert to auto-placement).
+    pub fn clear_pin(&mut self, signal: Signal) {
+        if let Some(owned) = signal_to_owned(signal) {
+            self.pin_locks.retain(|(s, _)| *s != owned);
+        }
     }
 
     pub fn add_leg(&mut self, leg: ConverterLeg) {
@@ -380,17 +412,19 @@ impl C531Design {
         package: Package,
         target: crate::pin_plan::Target,
     ) -> crate::pin_plan::PinPlan {
-        use crate::mcu_pinout::{af_rows, PinId};
+        use crate::mcu_pinout::af_rows;
         use crate::pin_plan::{
             EdgeKind, FabricNode, Placement, PinOrigin, PinPlan, RoleKind, RouteEdge,
         };
-        use crate::pinout::{pins_for_pkg, signal_to_owned, Signal};
-        use std::collections::HashSet;
+        use std::collections::{HashMap, HashSet};
 
         let raw = package.raw();
+        // User pin choices, honored over the auto-materialized default.
+        let locks: HashMap<OwnedSignal, PinId> = self.pin_locks.iter().cloned().collect();
 
-        // Materialize one pin for a typed signal: pick the first conflict-free
-        // candidate (single candidate => Forced, else Solver), store BY VALUE.
+        // Materialize one pin for a typed signal: a valid user lock wins; else the
+        // first conflict-free candidate (single candidate => Forced, else Solver).
+        // Stored BY VALUE.
         type Materialized = (crate::mcu_pinout::OwnedSignal, Option<PinId>, PinOrigin, Option<u8>);
         let materialize = |signal: Signal, taken: &mut HashSet<PinId>| -> Option<Materialized> {
             let owned = signal_to_owned(signal)?;
@@ -398,12 +432,18 @@ impl C531Design {
                 .into_iter()
                 .map(|p| PinId { port: p.port, num: p.num })
                 .collect();
-            let (pin, origin) = match cands.as_slice() {
-                [] => (None, PinOrigin::Solver), // unreachable on this package
-                [only] => (Some(*only), PinOrigin::Forced),
-                many => {
-                    let chosen = many.iter().copied().find(|p| !taken.contains(p)).unwrap_or(many[0]);
-                    (Some(chosen), PinOrigin::Solver)
+            let (pin, origin) = if let Some(&locked) = locks.get(&owned)
+                && cands.contains(&locked)
+            {
+                (Some(locked), PinOrigin::Locked)
+            } else {
+                match cands.as_slice() {
+                    [] => (None, PinOrigin::Solver), // unreachable on this package
+                    [only] => (Some(*only), PinOrigin::Forced),
+                    many => {
+                        let chosen = many.iter().copied().find(|p| !taken.contains(p)).unwrap_or(many[0]);
+                        (Some(chosen), PinOrigin::Solver)
+                    }
                 }
             };
             if let Some(p) = pin {
@@ -423,6 +463,10 @@ impl C531Design {
 
         let mut plan = PinPlan::empty(target);
         let mut taken: HashSet<PinId> = HashSet::new();
+        // Reserve every user-locked pin so auto-placed signals never steal one.
+        for (_, p) in &self.pin_locks {
+            taken.insert(*p);
+        }
 
         for (i, leg) in self.legs.iter().enumerate() {
             let group = Some(i as u32);
@@ -627,6 +671,42 @@ mod tests {
             ocp: Some(Ocp { comp, break_input: 1, threshold_dac: dac }),
             adc_sense: sense,
         }
+    }
+
+    #[test]
+    fn pin_lock_overrides_auto_placement_and_reverts_on_clear() {
+        use crate::g474::TimCh;
+
+        let mut d = C531Design::new();
+        d.add_leg(ConverterLeg::pwm(TimId::Tim1)); // CH1 only
+        let sig = Signal::TimCh(TimId::Tim1, TimCh::Ch1);
+        let cands = pins_for_pkg(sig, Package::C531R);
+        assert!(cands.len() >= 2, "TIM1 CH1 has multiple candidate pins on C531: {cands:?}");
+
+        let auto = PinId { port: cands[0].port, num: cands[0].num };
+        let chosen = PinId { port: cands[1].port, num: cands[1].num }; // NOT the auto default
+
+        let plan_kind = |d: &C531Design| {
+            d.to_pin_plan(Package::C531R, crate::pin_plan::Target { package: "C531R".into(), family: "C5".into() })
+                .placements
+                .into_iter()
+                .find(|p| p.signal.peripheral == "TIM1" && p.signal.role == "CH1")
+                .map(|p| (p.pin, p.origin))
+                .unwrap()
+        };
+
+        // Default: auto-placed on the first candidate.
+        assert_eq!(plan_kind(&d), (Some(auto), crate::pin_plan::PinOrigin::Solver));
+
+        // Locked: the lowerer uses the user's pin with a Locked origin.
+        d.lock_pin(sig, chosen);
+        assert_eq!(d.locked_pin(sig), Some(chosen));
+        assert_eq!(plan_kind(&d), (Some(chosen), crate::pin_plan::PinOrigin::Locked));
+
+        // Cleared: reverts to the auto default.
+        d.clear_pin(sig);
+        assert_eq!(d.locked_pin(sig), None);
+        assert_eq!(plan_kind(&d), (Some(auto), crate::pin_plan::PinOrigin::Solver));
     }
 
     #[test]
