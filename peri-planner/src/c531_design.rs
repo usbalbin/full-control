@@ -162,6 +162,27 @@ pub enum Problem {
     DacConflict { legs: (usize, usize), dac: DacId },
     /// Two legs sense on the same ADC input channel.
     AdcConflict { legs: (usize, usize), adc: AdcInstance, channel: u8 },
+    /// A leg senses on an ADC channel with no bonded input pin on this chip.
+    SenseChannelUnavailable { leg: usize, adc: AdcInstance, channel: u8 },
+}
+
+/// The bonded single-ended input channels of `ADC{adc}` on `raw` — channels that
+/// have a real `IN<n>` pin, i.e. the ones an ADC sense can actually reach.
+fn adc_bonded_channels(raw: &'static crate::mcu_raw::RawMcuData, adc: u8) -> Vec<u8> {
+    let name = format!("ADC{adc}");
+    let mut chs: Vec<u8> = crate::mcu_pinout::af_rows(raw)
+        .filter(|r| r.af.is_none() && r.signal.peripheral == name)
+        .filter_map(|r| {
+            let t = r.signal.role.strip_prefix("IN")?;
+            if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            t.parse().ok()
+        })
+        .collect();
+    chs.sort_unstable();
+    chs.dedup();
+    chs
 }
 
 pub const C531_DESIGN_FORMAT_VERSION: u32 = 1;
@@ -196,6 +217,15 @@ impl C531Design {
         let descriptor = package.descriptor();
         let fabric = descriptor.fabric;
         let mut problems = Vec::new();
+
+        // Per-leg: an ADC sense channel must have a real input pin on this chip.
+        for (i, leg) in self.legs.iter().enumerate() {
+            if let Some((adc, ch)) = leg.adc_sense
+                && !adc_bonded_channels(descriptor.raw, adc.number()).contains(&ch)
+            {
+                problems.push(Problem::SenseChannelUnavailable { leg: i, adc, channel: ch });
+            }
+        }
 
         // Per-leg: the internal COMP->break and DAC->COMP routes must exist in
         // the chip fabric. Without a modeled fabric we can't check, so skip.
@@ -292,30 +322,40 @@ impl C531Design {
                     ocp.threshold_dac = c.dac.and_then(|(di, dc)| dac_from_inst_ch(di, dc));
                 }
                 None => {
-                    // Can't route this leg's OCP on the fabric — drop it so the
-                    // plan stays realizable, and report it (the user's intent is
-                    // recorded in the result, not silently kept as a conflict).
-                    self.legs[leg_i].ocp = None;
+                    // Can't route this leg's OCP on this fabric. KEEP the user's
+                    // intent (never silently delete it) and report it — validate()
+                    // then surfaces it as a Problem the user resolves.
                     result.ocp_unassignable.push(leg_i);
                 }
             }
         }
 
-        // ---- ADC sense: a distinct channel per sensing leg (on its own ADC) ----
+        // ---- ADC sense: a distinct BONDED channel per sensing leg (its own ADC).
+        // Keep a leg's channel if it's already valid + conflict-free; only
+        // reassign the rest, and only to channels with a real input pin.
+        let raw = package.raw();
         let mut used: std::collections::HashSet<(u8, u8)> = std::collections::HashSet::new();
-        for (i, leg) in self.legs.iter_mut().enumerate() {
-            let Some((adc, _)) = leg.adc_sense else { continue };
-            let mut ch = 1u8;
-            while ch < 32 && used.contains(&(adc.number(), ch)) {
-                ch += 1;
+        let mut reassign: Vec<usize> = Vec::new();
+        for (i, leg) in self.legs.iter().enumerate() {
+            let Some((adc, ch)) = leg.adc_sense else { continue };
+            if adc_bonded_channels(raw, adc.number()).contains(&ch)
+                && used.insert((adc.number(), ch))
+            {
+                // Already a bonded, conflict-free channel — leave the user's choice.
+            } else {
+                reassign.push(i);
             }
-            if ch >= 32 {
-                leg.adc_sense = None;
-                result.sense_unassignable.push(i);
-                continue;
+        }
+        for i in reassign {
+            let (adc, _) = self.legs[i].adc_sense.unwrap();
+            match adc_bonded_channels(raw, adc.number())
+                .into_iter()
+                .find(|ch| used.insert((adc.number(), *ch)))
+            {
+                Some(ch) => self.legs[i].adc_sense = Some((adc, ch)),
+                // No free bonded channel left — keep intent, report it.
+                None => result.sense_unassignable.push(i),
             }
-            used.insert((adc.number(), ch));
-            leg.adc_sense = Some((adc, ch));
         }
         result
     }
@@ -618,9 +658,50 @@ mod tests {
         d.add_leg(mk_ocp_leg(TimId::Tim8, CompId::Comp1, Some(DacId::Dac1Ch1), None));
         let r = d.auto_assign(Package::C531R);
         assert_eq!(r.ocp_unassignable.len(), 1, "second DAC-thresholded OCP is unroutable: {r:?}");
-        // The assignable one is a real, conflict-free route.
-        let assigned = d.legs.iter().filter(|l| l.ocp.as_ref().and_then(|o| o.threshold_dac).is_some()).count();
-        assert_eq!(assigned, 1);
+        assert!(!r.fully_solved());
+        // Intent is KEPT, never silently deleted — both legs still carry their OCP.
+        assert!(d.legs.iter().all(|l| l.ocp.is_some()), "auto_assign must not delete OCP intent");
+        // …and the unroutable leg is surfaced by validate() as a real problem
+        // (the two legs now conflict on COMP1), not swept under the rug.
+        assert!(!d.is_valid(Package::C531R), "the kept-but-unroutable leg is reported by validate");
+    }
+
+    #[test]
+    fn auto_assign_sense_uses_only_bonded_channels_and_keeps_valid_ones() {
+        let raw = Package::C531R.raw();
+        let bonded: u8 = crate::mcu_pinout::af_rows(raw)
+            .filter(|r| r.af.is_none() && r.signal.peripheral == "ADC1")
+            .filter_map(|r| {
+                let t = r.signal.role.strip_prefix("IN")?;
+                (!t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())).then(|| t.parse().ok()).flatten()
+            })
+            .next()
+            .expect("ADC1 has a bonded channel on C531");
+
+        // (a) A leg already on a valid bonded channel is NOT clobbered.
+        let mut d = C531Design::new();
+        let mut leg = ConverterLeg::pwm(TimId::Tim1);
+        leg.adc_sense = Some((AdcInstance::Adc1, bonded));
+        d.add_leg(leg);
+        d.auto_assign(Package::C531R);
+        assert_eq!(d.legs[0].adc_sense, Some((AdcInstance::Adc1, bonded)), "valid channel preserved");
+
+        // (b) A non-existent channel is flagged by validate and reassigned to a
+        // real bonded channel by auto_assign.
+        let mut d2 = C531Design::new();
+        let mut leg2 = ConverterLeg::pwm(TimId::Tim8);
+        leg2.adc_sense = Some((AdcInstance::Adc1, 250));
+        d2.add_leg(leg2);
+        assert!(
+            d2.validate(Package::C531R).iter().any(|p| matches!(p, Problem::SenseChannelUnavailable { .. })),
+            "a channel with no input pin is reported"
+        );
+        d2.auto_assign(Package::C531R);
+        assert_ne!(d2.legs[0].adc_sense, Some((AdcInstance::Adc1, 250)), "auto_assign moved off the bad channel");
+        assert!(
+            !d2.validate(Package::C531R).iter().any(|p| matches!(p, Problem::SenseChannelUnavailable { .. })),
+            "no unavailable-channel problem after auto_assign"
+        );
     }
 
     /// A canonical synchronous buck leg on C531: TIM1 CH1 + CH1N complementary

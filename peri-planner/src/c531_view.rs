@@ -42,7 +42,12 @@ fn adc_from_num(n: u8) -> Option<AdcInstance> {
     AdcInstance::ALL.iter().copied().find(|a| a.number() == n)
 }
 
-pub fn show(ui: &mut egui::Ui, design: &C531Design, package: Package) -> Option<ConverterAction> {
+pub fn show(
+    ui: &mut egui::Ui,
+    design: &C531Design,
+    package: Package,
+    status: Option<&str>,
+) -> Option<ConverterAction> {
     let mut action: Option<ConverterAction> = None;
     let descriptor = package.descriptor();
 
@@ -52,6 +57,9 @@ pub fn show(ui: &mut egui::Ui, design: &C531Design, package: Package) -> Option<
             egui::RichText::new("— advanced-timer legs with COMP→break hardware OCP").weak(),
         );
     });
+    if let Some(msg) = status {
+        ui.colored_label(egui::Color32::from_rgb(210, 180, 80), msg);
+    }
     ui.separator();
 
     // Problems panel first, so the user sees realizability at a glance.
@@ -357,6 +365,10 @@ fn describe_problem(p: &Problem) -> String {
         Problem::AdcConflict { legs, adc, channel } => format!(
             "Legs {} and {} both sense ADC{} IN{}",
             legs.0 + 1, legs.1 + 1, adc.number(), channel,
+        ),
+        Problem::SenseChannelUnavailable { leg, adc, channel } => format!(
+            "Leg {} senses ADC{} IN{} — no input pin for that channel on this chip",
+            leg + 1, adc.number(), channel,
         ),
     }
 }

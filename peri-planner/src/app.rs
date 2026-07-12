@@ -191,6 +191,9 @@ pub struct PeriPlannerApp {
     /// The (peripheral, role) picked up for placement in the generic pin-map view.
     /// Ephemeral.
     pin_map_pick: Option<(String, String)>,
+    /// Transient outcome of the last C531 Auto-assign (which legs couldn't route).
+    /// Ephemeral; cleared on any other converter edit.
+    c531_status: Option<String>,
     /// Part-finder query state (whole-lineup catalog search). Ephemeral.
     catalog_query: crate::catalog::SearchQuery,
     /// Memoized Part-finder evaluation (recomputed only when query/demands change).
@@ -232,6 +235,7 @@ impl Default for PeriPlannerApp {
             af_filter: Default::default(),
             analog_filter: Default::default(),
             pin_map_pick: None,
+            c531_status: None,
             catalog_query: Default::default(),
             catalog_eval_cache: Default::default(),
             catalog_sort: Default::default(),
@@ -329,6 +333,9 @@ impl PeriPlannerApp {
         self.history.clear();
         self.redo.clear();
         self.nav_epoch = self.nav_epoch.wrapping_add(1);
+        // Per-chip ephemeral UI state must not leak across a chip switch.
+        self.pin_map_pick = None;
+        self.c531_status = None;
     }
 
     /// Switch the active MCU, clearing undo/redo history. Each MCU has its own
@@ -785,6 +792,9 @@ impl PeriPlannerApp {
                     if ui.button("✕ Back to G474").clicked() {
                         self.active.asset_chip = None;
                         self.clear_undo_for_nav(); // Asset history must not survive the switch.
+                        // The asset-only Pin map / Peripherals view would render blank
+                        // on G474 — land on a view the target chip actually has.
+                        self.land_on_active_view();
                     }
                     ui.separator();
                     if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
@@ -1043,6 +1053,10 @@ impl PeriPlannerApp {
     /// converter plan is a separate model.
     fn apply_converter_action(&mut self, action: Option<ConverterAction>) {
         let Some(action) = action else { return };
+        // Any edit other than Auto-assign clears the transient auto-assign notice.
+        if !matches!(action, ConverterAction::AutoAssign) {
+            self.c531_status = None;
+        }
         match action {
             ConverterAction::AddLeg => {
                 // Default a new leg to the first advanced-control timer on the
@@ -1066,7 +1080,20 @@ impl PeriPlannerApp {
             }
             ConverterAction::AutoAssign => {
                 let pkg = self.active.package;
-                self.active.c531_design.auto_assign(pkg);
+                let r = self.active.c531_design.auto_assign(pkg);
+                self.c531_status = (!r.fully_solved()).then(|| {
+                    let mut parts = Vec::new();
+                    if !r.ocp_unassignable.is_empty() {
+                        parts.push(format!("{} OCP", r.ocp_unassignable.len()));
+                    }
+                    if !r.sense_unassignable.is_empty() {
+                        parts.push(format!("{} ADC-sense", r.sense_unassignable.len()));
+                    }
+                    format!(
+                        "⚠ Auto-assign couldn't route {} — this chip's fabric can't satisfy them all (see problems).",
+                        parts.join(" + "),
+                    )
+                });
             }
         }
     }
@@ -1222,6 +1249,7 @@ impl eframe::App for PeriPlannerApp {
             let view = self.view;
             let af_filter = &mut self.af_filter;
             let analog_filter = &mut self.analog_filter;
+            let c531_status = self.c531_status.as_deref();
             // Active H523-family design, created on first touch for this MCU.
             // (`render_top_bar` above may have switched MCU this frame; this binds
             // to the now-active one — the post-render diff is skipped on a switch.)
@@ -1281,7 +1309,7 @@ impl eframe::App for PeriPlannerApp {
                         );
                     }
                     ViewMode::Converter if package.mcu() == Mcu::C531 => {
-                        conv_action = crate::c531_view::show(ui, c531, package);
+                        conv_action = crate::c531_view::show(ui, c531, package, c531_status);
                     }
                     _ => crate::inventory_view::show(ui, descriptor),
                 }

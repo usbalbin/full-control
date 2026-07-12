@@ -114,6 +114,11 @@ pub fn show(
         .into_iter()
         .map(|(p, r)| (p.to_string(), r.to_string()))
         .collect();
+    // A pick that isn't a declared role on THIS chip (e.g. left over from another
+    // chip before the pick was cleared) must never place — drop it.
+    if picked.as_ref().is_some_and(|pk| !roles.contains(pk)) {
+        *picked = None;
+    }
     let taken: HashMap<PinId, (String, String)> = design
         .taken_pins()
         .into_iter()

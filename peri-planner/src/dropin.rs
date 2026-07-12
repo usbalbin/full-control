@@ -197,10 +197,17 @@ pub fn build_source_profile_named(
     name: &str,
     label: &str,
 ) -> Option<SourceProfile> {
-    // Suffix-tolerant + label-tolerant: compiled C5 descriptors carry an
-    // ordering-code suffix the index omits, and an any-STM32 part's label may not
-    // match the asset's footprint name — resolve by name as a fallback.
-    let footprint = phys_pinout::best_footprint(name, label)?;
+    // With a real package label (a compiled part), resolve STRICTLY: if this
+    // exact footprint isn't in the asset, return None so the finder honestly
+    // refuses rather than silently searching against a DIFFERENT physical
+    // package. Only the any-STM32 path (empty label, no reliable package)
+    // falls back to a tolerant name-based lookup. `footprint_for` is already
+    // ordering-code-suffix tolerant (compiled C5 names carry one).
+    let footprint = if label.is_empty() {
+        phys_pinout::best_footprint(name, "")?
+    } else {
+        phys_pinout::footprint_for(name, label)?
+    };
     // Keep only wired pins that physically exist as a GPIO on this footprint.
     // Defends against stale locks from another MCU: `h523_design` (the pin-lock
     // model) is shared between H523 and C5A3 and is not cleared on MCU switch.
@@ -679,6 +686,27 @@ impl DropinCache {
 mod tests {
     use super::*;
     use crate::phys_pinout::PhysPin;
+
+    #[test]
+    fn source_profile_strict_for_labeled_parts_tolerant_for_assets() {
+        // A compiled part passes a real label -> STRICT: a label with no exact
+        // footprint honestly refuses (None) instead of silently substituting a
+        // different physical package. G474P's compiled label is "TFBGA100" but
+        // the asset stores that part as UFBGA121.
+        let d = crate::h523_design::H523Design::new();
+        let src = DesignSource::H523(&d);
+        assert!(
+            build_source_profile_named(&src, "STM32G474PE", "TFBGA100").is_none(),
+            "labeled part with no exact footprint must refuse, not substitute"
+        );
+        // The any-STM32 path passes an empty label -> tolerant name resolution.
+        assert!(
+            build_source_profile_named(&src, "STM32G474PE", "").is_some(),
+            "empty-label (asset) path resolves the footprint by name"
+        );
+        // A correct compiled (name,label) still resolves (suffix-tolerant).
+        assert!(build_source_profile_named(&src, "STM32C531RCT6", "LQFP64").is_some());
+    }
 
     fn pin(s: &str) -> PinId {
         PinId::from_metapac(s).unwrap()
