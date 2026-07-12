@@ -173,6 +173,9 @@ pub struct PeriPlannerApp {
     af_filter: crate::af_view::AfFilter,
     /// Filter/picker state for the Analog differential-pairs view. Ephemeral.
     analog_filter: crate::analog_view::AnalogFilter,
+    /// The (peripheral, role) picked up for placement in the generic pin-map view.
+    /// Ephemeral.
+    pin_map_pick: Option<(String, String)>,
     /// Part-finder query state (whole-lineup catalog search). Ephemeral.
     catalog_query: crate::catalog::SearchQuery,
     /// Memoized Part-finder evaluation (recomputed only when query/demands change).
@@ -213,6 +216,7 @@ impl Default for PeriPlannerApp {
             picked: None,
             af_filter: Default::default(),
             analog_filter: Default::default(),
+            pin_map_pick: None,
             catalog_query: Default::default(),
             catalog_eval_cache: Default::default(),
             catalog_sort: Default::default(),
@@ -878,10 +882,12 @@ impl PeriPlannerApp {
                     }
                     if self.active.mcu == Mcu::H523 || self.active.mcu == Mcu::C5A3 {
                         ui.selectable_value(&mut self.view, ViewMode::Peripherals, "Peripherals");
+                        ui.selectable_value(&mut self.view, ViewMode::Package, "Pin map");
                     }
                 } else {
                     // Any arbitrary STM32 gets the generic (descriptor-driven) planner.
                     ui.selectable_value(&mut self.view, ViewMode::Peripherals, "Peripherals");
+                    ui.selectable_value(&mut self.view, ViewMode::Package, "Pin map");
                 }
                 // Descriptor views — available for both planner chips and asset parts.
                 ui.selectable_value(&mut self.view, ViewMode::Inventory, "Inventory");
@@ -1105,11 +1111,19 @@ impl eframe::App for PeriPlannerApp {
             let dropin_query = &mut self.dropin_query;
             let dropin_cache = &mut self.dropin_cache;
             let dropin_focus = &mut self.dropin_focus;
+            let pin_map_pick = &mut self.pin_map_pick;
             let key = Project::asset_key(desc.name);
             let design = self.active.asset_designs.entry(key.clone()).or_default();
             let mut open: Option<String> = None;
             egui::CentralPanel::default().show(ctx, |ui| match view {
                 ViewMode::Peripherals => crate::peripherals_view::show(ui, desc.raw, design),
+                ViewMode::Package => crate::pin_map_view::show(
+                    ui,
+                    desc.raw,
+                    crate::phys_pinout::best_footprint(desc.name, ""),
+                    design,
+                    pin_map_pick,
+                ),
                 ViewMode::AfTable => crate::af_view::show(ui, desc.raw, af_filter, Some(design)),
                 ViewMode::Analog => crate::analog_view::show(
                     ui,
@@ -1183,6 +1197,7 @@ impl eframe::App for PeriPlannerApp {
             let dropin_query = &mut self.dropin_query;
             let dropin_cache = &mut self.dropin_cache;
             let dropin_focus = &mut self.dropin_focus;
+            let pin_map_pick = &mut self.pin_map_pick;
             let mut jump = None;
             let mut conv_action: Option<ConverterAction> = None;
             egui::CentralPanel::default().show(ctx, |ui| {
@@ -1192,6 +1207,15 @@ impl eframe::App for PeriPlannerApp {
                     }
                     ViewMode::Peripherals => {
                         crate::peripherals_view::show(ui, descriptor.raw, h523);
+                    }
+                    ViewMode::Package => {
+                        crate::pin_map_view::show(
+                            ui,
+                            descriptor.raw,
+                            crate::phys_pinout::best_footprint(package.name(), package.package_label()),
+                            h523,
+                            pin_map_pick,
+                        );
                     }
                     ViewMode::Analog => {
                         crate::analog_view::show(

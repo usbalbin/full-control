@@ -26,6 +26,7 @@ pub mod package_view;
 pub mod peripherals_view;
 pub mod phys_pinout;
 pub mod picker;
+pub mod pin_map_view;
 pub mod pin_plan;
 pub mod pinout;
 pub mod requirements;
