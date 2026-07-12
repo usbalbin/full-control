@@ -340,8 +340,11 @@ impl ChipFabric {
 }
 
 pub struct McuDescriptor {
-    pub mcu: Mcu,
-    pub package: Package,
+    /// `None` for an arbitrary any-STM32 part (built via `build_asset_descriptor`
+    /// from the runtime asset) — it has no compiled `Mcu`/`Package`. `Some` only
+    /// for the deeply-compiled families. Readers MUST handle `None`.
+    pub mcu: Option<Mcu>,
+    pub package: Option<Package>,
     pub name: &'static str,
     pub family: &'static str,
     pub timers: Vec<TimerInstance>,
@@ -442,7 +445,7 @@ fn dac_to_comp_edges(fabric: &ChipFabric) -> Vec<PeripheralEdge> {
 fn build_descriptor(pkg: Package) -> McuDescriptor {
     let raw = pkg.raw();
     let mcu = pkg.mcu();
-    let mut d = build_inventory(mcu, pkg, raw);
+    let mut d = build_inventory(Some(mcu), Some(pkg), raw);
 
     match mcu {
         Mcu::G474 => {
@@ -478,13 +481,17 @@ fn build_descriptor(pkg: Package) -> McuDescriptor {
 /// An inventory + DMA descriptor for an arbitrary part's raw data — no analog
 /// fabric. Used by the constraint selector to verify (Tier-2) the whole lineup
 /// from the runtime descriptor asset, where parts have no compiled `Package`.
-/// The `mcu`/`package` fields are placeholders (the selector reads neither —
-/// only `comms`/`timers`/`adcs` instances, `raw` for pins, and `dma_pools`).
+/// `mcu`/`package` are honestly `None` (an arbitrary part isn't one of the
+/// deeply-compiled families) — no placeholder to misread.
 pub fn build_asset_descriptor(raw: &'static RawMcuData) -> McuDescriptor {
-    build_inventory(Mcu::G474, Package::G474R, raw)
+    build_inventory(None, None, raw)
 }
 
-fn build_inventory(mcu: Mcu, package: Package, raw: &'static RawMcuData) -> McuDescriptor {
+fn build_inventory(
+    mcu: Option<Mcu>,
+    package: Option<Package>,
+    raw: &'static RawMcuData,
+) -> McuDescriptor {
     let mut d = McuDescriptor {
         mcu, package,
         name: raw.name, family: raw.family,
@@ -730,9 +737,19 @@ mod c5_support {
     /// build from the extracted data and surface the analog/control + serial
     /// peripherals, with no HRTIM.
     #[test]
+    fn asset_descriptor_carries_no_placeholder_family() {
+        // An arbitrary any-STM32 part honestly reports mcu/package = None (no
+        // fabricated G474 identity that a future reader could misclassify).
+        let d = build_asset_descriptor(&crate::mcu_data::h523r::RAW);
+        assert_eq!(d.mcu, None);
+        assert_eq!(d.package, None);
+        assert_eq!(d.name, "STM32H523RE");
+    }
+
+    #[test]
     fn c5a3_descriptor_inventories_expected_peripherals() {
         let d = Package::C5A3Z.descriptor();
-        assert_eq!(d.mcu, Mcu::C5A3);
+        assert_eq!(d.mcu, Some(Mcu::C5A3));
         assert_eq!(d.name, "STM32C5A3ZGT6");
         assert!(d.comps.iter().any(|c| c.number == 1), "COMP1");
         assert!(d.dacs.iter().any(|x| x.number == 1), "DAC1");
@@ -754,7 +771,7 @@ mod c5_support {
     #[test]
     fn c531_descriptor_inventories_analog() {
         let d = Package::C531R.descriptor();
-        assert_eq!(d.mcu, Mcu::C531);
+        assert_eq!(d.mcu, Some(Mcu::C531));
         assert_eq!(d.name, "STM32C531RCT6");
         assert!(d.opamps.iter().any(|o| o.number == 1), "OPAMP1");
         assert!(d.comps.iter().any(|c| c.number == 1), "COMP1");
