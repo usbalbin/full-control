@@ -208,6 +208,56 @@ pub fn zero_cross_options(
     out
 }
 
+/// Bonded analog pins by role — the pool that capability taps draw from. Unlike
+/// [`PinCap`] this includes pins that are ONLY a COMP INP/INM (not ADC), since a
+/// tap pin need not be a logging channel itself.
+#[derive(Clone, Debug, Default)]
+pub struct TapData {
+    pub comp_inp: BTreeMap<&'static str, Vec<PinId>>,
+    pub comp_inm: BTreeMap<&'static str, Vec<PinId>>,
+    pub opamp_vinp: BTreeMap<&'static str, Vec<PinId>>,
+    /// Direct ADC channels on each bonded pin (for redundant-ADC taps).
+    pub adc_on_pin: BTreeMap<PinId, Vec<Slot>>,
+}
+
+/// Extract the bonded tap pool, restricted to `bonded` when given.
+pub fn tap_data(raw: &'static RawMcuData, bonded: Option<&BTreeSet<PinId>>) -> TapData {
+    let mut d = TapData::default();
+    for r in af_rows(raw) {
+        if r.af.is_some() {
+            continue;
+        }
+        if let Some(b) = bonded
+            && !b.contains(&r.pin)
+        {
+            continue;
+        }
+        let p = r.signal.peripheral;
+        if p.starts_with("ADC") {
+            if let Some(c) = adc_pos_index(r.signal.role) {
+                d.adc_on_pin.entry(r.pin).or_default().push((p, c));
+            }
+        } else if p.starts_with("COMP") {
+            if comp_plus(r.signal.role) {
+                d.comp_inp.entry(p).or_default().push(r.pin);
+            } else if comp_minus(r.signal.role) {
+                d.comp_inm.entry(p).or_default().push(r.pin);
+            }
+        } else if p.starts_with("OPAMP") && opamp_plus(r.signal.role) {
+            d.opamp_vinp.entry(p).or_default().push(r.pin);
+        }
+    }
+    for v in d.comp_inp.values_mut().chain(d.comp_inm.values_mut()).chain(d.opamp_vinp.values_mut()) {
+        v.sort_unstable();
+        v.dedup();
+    }
+    for v in d.adc_on_pin.values_mut() {
+        v.sort_unstable();
+        v.dedup();
+    }
+    d
+}
+
 /// How a channel's sample is digitized.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdcRead {
@@ -236,15 +286,65 @@ impl AdcRead {
     }
 }
 
-/// One planned single-ended channel.
+/// A capability gained by **routing this signal to an extra bonded pin** (the
+/// pins are all high-Z analog inputs, so paralleling them on the PCB is fine —
+/// the cost is the extra pin). Lets a signal use capabilities no single pin has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TapKind {
+    /// Comparator threshold trigger via this INP pin (primary pin had no COMP).
+    Trigger(&'static str),
+    /// The INP end of a *tapped* zero-cross (a comparator straddling the pair).
+    ZeroCrossInp(&'static str),
+    /// The external-INM end of a tapped zero-cross.
+    ZeroCrossInm(&'static str),
+    /// Opamp PGA via this VINP pin — an amplified second read (dual-range).
+    Pga(&'static str),
+    /// A redundant second ADC read on another instance (guaranteed-simultaneous
+    /// sampling / oversample / cross-check).
+    RedundantAdc,
+}
+
+/// One extra pin wired to a channel's signal, and what it buys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tap {
+    pub pin: PinId,
+    pub kind: TapKind,
+    /// The ADC read this tap adds, for `Pga` (opamp output) and `RedundantAdc`.
+    pub read: Option<AdcRead>,
+}
+
+/// One planned single-ended channel. Its signal enters at `pin` (the primary ADC
+/// read) and may also be wired to `taps` for capabilities the primary pin lacks.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelPlan {
     pub pin: PinId,
     pub read: AdcRead,
-    /// Comparator watching this pin (a hardware trigger), if one was assigned.
+    /// Comparator watching the primary pin (a native hardware trigger).
     pub comp: Option<&'static str>,
-    /// PGA opamp on this channel (present iff `read` is `ViaOpamp`).
+    /// PGA opamp on the primary pin (present iff `read` is `ViaOpamp`).
     pub opamp: Option<&'static str>,
+    /// Extra pins the signal is routed to for more options.
+    pub taps: Vec<Tap>,
+}
+
+impl ChannelPlan {
+    /// The PGA opamp on this signal, native (primary pin) or tapped.
+    pub fn pga_opamp(&self) -> Option<&'static str> {
+        self.opamp.or_else(|| {
+            self.taps.iter().find_map(|t| match t.kind {
+                TapKind::Pga(o) => Some(o),
+                _ => None,
+            })
+        })
+    }
+    pub fn has_pga(&self) -> bool {
+        self.pga_opamp().is_some()
+    }
+    /// A per-channel threshold trigger (native COMP on the primary pin, or a
+    /// tapped `Trigger`). Zero-cross ends are NOT counted here.
+    pub fn has_trigger(&self) -> bool {
+        self.comp.is_some() || self.taps.iter().any(|t| matches!(t.kind, TapKind::Trigger(_)))
+    }
 }
 
 /// One planned differential pair (two single-ended ends).
@@ -295,17 +395,24 @@ pub struct FrontEndPlan {
 }
 
 impl FrontEndPlan {
+    fn channels(&self) -> impl Iterator<Item = &ChannelPlan> {
+        self.pairs.iter().flat_map(|p| [&p.pos, &p.neg])
+    }
     pub fn triggers(&self) -> usize {
-        self.pairs.iter().flat_map(|p| [&p.pos, &p.neg]).filter(|c| c.comp.is_some()).count()
+        self.channels().filter(|c| c.has_trigger()).count()
     }
     pub fn pga_channels(&self) -> usize {
-        self.pairs.iter().flat_map(|p| [&p.pos, &p.neg]).filter(|c| c.opamp.is_some()).count()
+        self.channels().filter(|c| c.has_pga()).count()
     }
     pub fn full_pga_pairs(&self) -> usize {
         self.pairs.iter().filter(|p| p.full_pga).count()
     }
     pub fn zero_cross_pairs(&self) -> usize {
         self.pairs.iter().filter(|p| p.zero_cross.is_some()).count()
+    }
+    /// Extra bonded pins spent on capability taps.
+    pub fn tap_pins(&self) -> usize {
+        self.channels().map(|c| c.taps.len()).sum()
     }
 }
 
@@ -323,6 +430,9 @@ pub struct PlanConfig {
     /// detection (0 = none). These pairs are carved out first — they consume a
     /// comparator and force the pair onto a specific INP/INM pin combo.
     pub zero_cross_target: usize,
+    /// Max EXTRA bonded pins the planner may spend on capability taps (routing a
+    /// signal to more pins for capabilities its primary pin lacks). 0 = off.
+    pub tap_budget: usize,
 }
 
 impl Default for PlanConfig {
@@ -338,6 +448,7 @@ impl Default for PlanConfig {
             w_cross_adc: 8,
             w_zero_cross: 40,
             zero_cross_target: 0,
+            tap_budget: 0,
         }
     }
 }
@@ -380,8 +491,9 @@ pub fn plan(raw: &'static RawMcuData, bonded: Option<&BTreeSet<PinId>>, cfg: Pla
     let caps = capabilities(raw, bonded);
     let out_adc = opamp_out_adc(raw);
     let zc = zero_cross_options(raw, bonded);
+    let taps = tap_data(raw, bonded);
     let channels = cfg.channels.max(2) & !1; // even, ≥2
-    plan_from(&caps, &out_adc, &zc, channels, cfg)
+    plan_from(&caps, &out_adc, &zc, &taps, channels, cfg)
 }
 
 /// Core solver over already-extracted capabilities (the unit-test entry point).
@@ -389,6 +501,7 @@ pub fn plan_from(
     caps: &[PinCap],
     out_adc: &OpampOutAdc,
     zc_options: &[ZeroCrossOption],
+    tap_pool: &TapData,
     channels: usize,
     cfg: PlanConfig,
 ) -> FrontEndPlan {
@@ -616,39 +729,212 @@ pub fn plan_from(
         }
     }
 
+    // ---- Stage T: capability taps. Route a signal to up to cfg.tap_budget spare
+    // bonded pins to gain capabilities its primary pin lacks — all high-Z analog
+    // inputs, so paralleling on the PCB is fine; the cost is the extra pin. ----
+    let mut taps_by_idx: BTreeMap<usize, Vec<Tap>> = BTreeMap::new();
+    let mut zc_tapped: BTreeMap<(usize, usize), &'static str> = BTreeMap::new();
+    let mut forced_cross: BTreeSet<(usize, usize)> = BTreeSet::new();
+    if cfg.tap_budget > 0 {
+        let mut budget = cfg.tap_budget;
+        let mut used_pins: BTreeSet<PinId> = chosen.iter().map(|&i| caps[i].pin).collect();
+        // Free peripherals come from the whole fabric (the tap pool), not just
+        // peripherals that happen to reach a channel pin — a comparator/opamp
+        // whose pins are all non-channel taps is still usable.
+        let native_comps: BTreeSet<&'static str> =
+            comp_of_pin.values().copied().chain(used_comp.iter().copied()).collect();
+        let mut free_comps: BTreeSet<&'static str> = tap_pool
+            .comp_inp
+            .keys()
+            .chain(tap_pool.comp_inm.keys())
+            .copied()
+            .filter(|c| !native_comps.contains(c))
+            .collect();
+        let native_opamps: BTreeSet<&'static str> = opamp_of_pin.values().copied().collect();
+        let mut free_opamps: BTreeSet<&'static str> =
+            tap_pool.opamp_vinp.keys().copied().filter(|o| !native_opamps.contains(o)).collect();
+
+        // Candidate taps, valued by the same weights; applied highest-value-first
+        // (stable sort → insertion order breaks ties deterministically).
+        #[derive(Clone, Copy)]
+        enum Cand {
+            Zc(usize, usize),
+            Trig(usize),
+            Pga(usize),
+            Redun(usize, usize),
+        }
+        let mut cands: Vec<(i32, Cand)> = Vec::new();
+        for &(a, b) in &pair_idx {
+            if a != b && !zc_comp_of_pair.contains_key(&(a, b)) {
+                cands.push((cfg.w_zero_cross, Cand::Zc(a, b)));
+            }
+            if a != b && reads[&a].adc() == reads[&b].adc() {
+                cands.push((cfg.w_cross_adc, Cand::Redun(a, b)));
+            }
+        }
+        for &pi in &chosen {
+            if !comp_of_pin.contains_key(&pi) {
+                cands.push((cfg.w_trigger, Cand::Trig(pi)));
+            }
+            if !opamp_of_pin.contains_key(&pi) {
+                cands.push((cfg.w_pga_single, Cand::Pga(pi)));
+            }
+        }
+        cands.sort_by_key(|(v, _)| std::cmp::Reverse(*v));
+
+        // First free pin from a role list, avoiding used pins (and an excluded one).
+        let take = |list: Option<&Vec<PinId>>, used: &BTreeSet<PinId>, not: Option<PinId>| {
+            list.and_then(|v| v.iter().copied().find(|p| !used.contains(p) && Some(*p) != not))
+        };
+
+        for (_, c) in cands {
+            match c {
+                Cand::Zc(a, b) if budget >= 2 => {
+                    // A comparator with a free INP and a free INM pin: prefer a
+                    // truly-free one; else RECLAIM one from a native per-channel
+                    // trigger (that channel loses its trigger) when zero-cross
+                    // outscores a trigger — this is what lets a saturated plan give
+                    // a full-PGA pair a zero-cross too.
+                    let reclaim_ok = cfg.w_zero_cross > cfg.w_trigger;
+                    let reclaimable: Vec<(usize, &'static str)> = if reclaim_ok {
+                        comp_of_pin.iter().map(|(pi, c)| (*pi, *c)).collect()
+                    } else {
+                        Vec::new()
+                    };
+                    let pick = free_comps
+                        .iter()
+                        .copied()
+                        .map(|c| (c, None))
+                        .chain(reclaimable.iter().map(|&(pi, c)| (c, Some(pi))))
+                        .find_map(|(comp, from)| {
+                            let p = take(tap_pool.comp_inp.get(comp), &used_pins, None)?;
+                            let m = take(tap_pool.comp_inm.get(comp), &used_pins, Some(p))?;
+                            Some((comp, p, m, from))
+                        });
+                    if let Some((comp, p, m, from)) = pick {
+                        taps_by_idx.entry(a).or_default().push(Tap {
+                            pin: p,
+                            kind: TapKind::ZeroCrossInp(comp),
+                            read: None,
+                        });
+                        taps_by_idx.entry(b).or_default().push(Tap {
+                            pin: m,
+                            kind: TapKind::ZeroCrossInm(comp),
+                            read: None,
+                        });
+                        used_pins.insert(p);
+                        used_pins.insert(m);
+                        match from {
+                            Some(pi) => {
+                                comp_of_pin.remove(&pi);
+                            }
+                            None => {
+                                free_comps.remove(comp);
+                            }
+                        }
+                        zc_tapped.insert((a, b), comp);
+                        budget -= 2;
+                    }
+                }
+                Cand::Trig(pi) if budget >= 1 => {
+                    let pick = free_comps
+                        .iter()
+                        .copied()
+                        .find_map(|comp| take(tap_pool.comp_inp.get(comp), &used_pins, None).map(|p| (comp, p)));
+                    if let Some((comp, p)) = pick {
+                        taps_by_idx.entry(pi).or_default().push(Tap {
+                            pin: p,
+                            kind: TapKind::Trigger(comp),
+                            read: None,
+                        });
+                        used_pins.insert(p);
+                        free_comps.remove(comp);
+                        budget -= 1;
+                    }
+                }
+                Cand::Pga(pi) if budget >= 1 => {
+                    let pick = free_opamps.iter().copied().find_map(|op| {
+                        let p = take(tap_pool.opamp_vinp.get(op), &used_pins, None)?;
+                        let (adc, ch) = pick_free_slot(out_adc.get(op), &used_slot)?;
+                        Some((op, p, adc, ch))
+                    });
+                    if let Some((op, p, adc, ch)) = pick {
+                        used_slot.insert((adc, ch));
+                        taps_by_idx.entry(pi).or_default().push(Tap {
+                            pin: p,
+                            kind: TapKind::Pga(op),
+                            read: Some(AdcRead::ViaOpamp { opamp: op, adc, ch }),
+                        });
+                        used_pins.insert(p);
+                        free_opamps.remove(op);
+                        budget -= 1;
+                    }
+                }
+                Cand::Redun(a, b) if budget >= 1 => {
+                    let inst = reads[&a].adc();
+                    // A free bonded pin with a free ADC slot on a DIFFERENT instance.
+                    let pick = tap_pool
+                        .adc_on_pin
+                        .iter()
+                        .filter(|(pin, _)| !used_pins.contains(pin))
+                        .find_map(|(pin, slots)| {
+                            slots
+                                .iter()
+                                .copied()
+                                .find(|(ai, ci)| *ai != inst && !used_slot.contains(&(*ai, *ci)))
+                                .map(|(ai, ci)| (*pin, ai, ci))
+                        });
+                    if let Some((pin, ai, ci)) = pick {
+                        used_slot.insert((ai, ci));
+                        taps_by_idx.entry(a).or_default().push(Tap {
+                            pin,
+                            kind: TapKind::RedundantAdc,
+                            read: Some(AdcRead::Direct { adc: ai, ch: ci }),
+                        });
+                        used_pins.insert(pin);
+                        forced_cross.insert((a, b));
+                        budget -= 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     // ---- Build PairPlans + score. ----
     let mk = |pi: usize| ChannelPlan {
         pin: caps[pi].pin,
         read: reads[&pi],
         comp: comp_of_pin.get(&pi).copied(),
         opamp: opamp_of_pin.get(&pi).copied(),
+        taps: taps_by_idx.get(&pi).cloned().unwrap_or_default(),
     };
     let mut pairs = Vec::new();
     let mut score = 0i32;
     for (n, &(a, b)) in pair_idx.iter().enumerate() {
         let pos = mk(a);
         let neg = mk(b);
-        let full_pga = a != b
-            && pos.opamp.is_some()
-            && neg.opamp.is_some()
-            && pos.opamp != neg.opamp;
-        let cross_adc = a != b && pos.read.adc() != neg.read.adc();
-        let zero_cross = zc_comp_of_pair.get(&(a, b)).copied();
+        let full_pga =
+            a != b && pos.has_pga() && neg.has_pga() && pos.pga_opamp() != neg.pga_opamp();
+        let cross_adc =
+            (a != b && pos.read.adc() != neg.read.adc()) || forced_cross.contains(&(a, b));
+        let zero_cross =
+            zc_comp_of_pair.get(&(a, b)).copied().or_else(|| zc_tapped.get(&(a, b)).copied());
         // Scoring.
-        if let Some(_c) = zero_cross {
+        if zero_cross.is_some() {
             score += cfg.w_zero_cross;
         }
         if full_pga {
             score += cfg.w_pga_pair;
         } else {
             for c in [&pos, &neg] {
-                if c.opamp.is_some() {
+                if c.has_pga() {
                     score += cfg.w_pga_single;
                 }
             }
         }
         for c in [&pos, &neg] {
-            if c.comp.is_some() {
+            if c.has_trigger() {
                 score += cfg.w_trigger;
             }
         }
@@ -680,6 +966,13 @@ pub fn plan_from(
     if unplaced_channels > 0 {
         notes.push(format!(
             "Only {placed} analog-capable pins are bonded on this package — {unplaced_channels} requested channel(s) can't be placed. Pick a larger package."
+        ));
+    }
+    let taps_used: usize = pairs.iter().flat_map(|p| [&p.pos, &p.neg]).map(|c| c.taps.len()).sum();
+    if cfg.tap_budget > 0 {
+        notes.push(format!(
+            "Capability taps: {taps_used} of {} budgeted extra pins spent (a signal wired to more pins buys a trigger / zero-cross / PGA / redundant ADC its primary pin lacks).",
+            cfg.tap_budget
         ));
     }
 
@@ -804,7 +1097,7 @@ mod tests {
     fn g474_ceiling_and_hits_it() {
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
-        let p = plan_from(&caps, &out, &[], 16, PlanConfig::default());
+        let p = plan_from(&caps, &out, &[], &TapData::default(), 16, PlanConfig::default());
 
         // Ceiling from the silicon: 6 opamps → 3 PGA pairs; 7 comps → ≤7 triggers.
         assert_eq!(p.ceiling.opamps, 6);
@@ -823,7 +1116,7 @@ mod tests {
     fn every_channel_has_a_distinct_pin_and_adc_slot() {
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
-        let p = plan_from(&caps, &out, &[], 16, PlanConfig::default());
+        let p = plan_from(&caps, &out, &[], &TapData::default(), 16, PlanConfig::default());
         let mut pins = BTreeSet::new();
         let mut slots = BTreeSet::new();
         for pair in &p.pairs {
@@ -840,7 +1133,7 @@ mod tests {
     fn full_pga_pairs_use_distinct_opamps() {
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
-        let p = plan_from(&caps, &out, &[], 16, PlanConfig::default());
+        let p = plan_from(&caps, &out, &[], &TapData::default(), 16, PlanConfig::default());
         for pair in p.pairs.iter().filter(|p| p.full_pga) {
             assert_ne!(pair.pos.opamp, pair.neg.opamp);
             assert!(pair.pos.opamp.is_some() && pair.neg.opamp.is_some());
@@ -851,8 +1144,8 @@ mod tests {
     fn deterministic() {
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
-        let a = plan_from(&caps, &out, &[], 16, PlanConfig::default());
-        let b = plan_from(&caps, &out, &[], 16, PlanConfig::default());
+        let a = plan_from(&caps, &out, &[], &TapData::default(), 16, PlanConfig::default());
+        let b = plan_from(&caps, &out, &[], &TapData::default(), 16, PlanConfig::default());
         assert_eq!(a.pairs, b.pairs);
         assert_eq!(a.score, b.score);
     }
@@ -861,7 +1154,7 @@ mod tests {
     fn smaller_request_places_fewer_pairs() {
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
-        let p = plan_from(&caps, &out, &[], 4, PlanConfig::default());
+        let p = plan_from(&caps, &out, &[], &TapData::default(), 4, PlanConfig::default());
         assert_eq!(p.pairs.len(), 2);
         assert_eq!(p.ceiling.max_pga_pairs, 2, "4 channels → at most 2 pairs regardless of opamps");
     }
@@ -873,7 +1166,7 @@ mod tests {
         let caps = capabilities(&crate::mcu_data::h523r::RAW, None);
         assert!(!caps.is_empty(), "H5 exposes ADC channels");
         let out = opamp_out_adc(&crate::mcu_data::h523r::RAW);
-        let p = plan_from(&caps, &out, &[], 8, PlanConfig::default());
+        let p = plan_from(&caps, &out, &[], &TapData::default(), 8, PlanConfig::default());
         assert_eq!(p.ceiling.opamps, 0);
         assert_eq!(p.ceiling.comps, 0);
         assert_eq!(p.full_pga_pairs(), 0);
@@ -902,7 +1195,7 @@ mod tests {
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
         let zc = zero_cross_options(&crate::mcu_data::g474r::RAW, None);
-        let p = plan_from(&caps, &out, &zc, 16, PlanConfig::default());
+        let p = plan_from(&caps, &out, &zc, &TapData::default(), 16, PlanConfig::default());
         // 6 distinct comparators, distinct-pin-feasible → 6; capped by channels/2=8.
         assert_eq!(p.ceiling.max_zero_cross_pairs, 6);
     }
@@ -913,7 +1206,7 @@ mod tests {
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
         let zc = zero_cross_options(&crate::mcu_data::g474r::RAW, None);
         let cfg = PlanConfig { zero_cross_target: 2, ..Default::default() };
-        let p = plan_from(&caps, &out, &zc, 16, cfg);
+        let p = plan_from(&caps, &out, &zc, &TapData::default(), 16, cfg);
 
         assert_eq!(p.zero_cross_pairs(), 2, "asked for 2 zero-cross pairs");
         assert_eq!(p.pairs.len(), 8);
@@ -946,13 +1239,99 @@ mod tests {
     }
 
     #[test]
+    fn tap_data_g474_has_inm_and_vinp() {
+        let td = tap_data(&crate::mcu_data::g474r::RAW, None);
+        // COMP5's external INM PB10 is a non-ADC pin → present in the tap pool but
+        // NOT a zero_cross_option (which requires ADC on both ends).
+        assert!(td.comp_inm.get("COMP5").unwrap().iter().any(|p| p.name() == "PB10"));
+        assert!(td.opamp_vinp.contains_key("OPAMP1"));
+        assert!(td.comp_inp.contains_key("COMP1"));
+    }
+
+    #[test]
+    fn taps_add_zero_cross_to_a_full_pga_pair() {
+        // The headline: on a comparator-saturated 16ch plan, spending tap pins
+        // gives a FULL-PGA pair a zero-cross too (reclaiming a comp from a trigger).
+        let caps = g474();
+        let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
+        let zc = zero_cross_options(&crate::mcu_data::g474r::RAW, None);
+        let td = tap_data(&crate::mcu_data::g474r::RAW, None);
+        let base = plan_from(&caps, &out, &zc, &TapData::default(), 16, PlanConfig::default());
+        let cfg = PlanConfig { tap_budget: 4, ..Default::default() };
+        let p = plan_from(&caps, &out, &zc, &td, 16, cfg);
+
+        assert!(p.score > base.score, "taps improve the objective: {} > {}", p.score, base.score);
+        let tapped_fpga = p.pairs.iter().find(|pr| pr.full_pga && pr.zero_cross.is_some());
+        let pr = tapped_fpga.expect("a full-PGA pair that also zero-crosses");
+        // Its zero-cross is realized by tapped comparator pins on the two ends.
+        let inp = pr.pos.taps.iter().chain(pr.neg.taps.iter()).any(|t| matches!(t.kind, TapKind::ZeroCrossInp(_)));
+        let inm = pr.pos.taps.iter().chain(pr.neg.taps.iter()).any(|t| matches!(t.kind, TapKind::ZeroCrossInm(_)));
+        assert!(inp && inm, "zero-cross via tapped INP + INM pins");
+    }
+
+    #[test]
+    fn taps_stay_within_budget_and_never_reuse_a_pin_or_slot() {
+        let caps = g474();
+        let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
+        let zc = zero_cross_options(&crate::mcu_data::g474r::RAW, None);
+        let td = tap_data(&crate::mcu_data::g474r::RAW, None);
+        let cfg = PlanConfig { tap_budget: 8, ..Default::default() };
+        let p = plan_from(&caps, &out, &zc, &td, 16, cfg);
+        assert!(p.tap_pins() <= 8, "within budget");
+        let mut pins = BTreeSet::new();
+        let mut slots = BTreeSet::new();
+        for c in p.pairs.iter().flat_map(|pr| [&pr.pos, &pr.neg]) {
+            assert!(pins.insert(c.pin), "primary pin {} reused", c.pin.name());
+            assert!(slots.insert(c.read.slot()), "slot {:?} reused", c.read.slot());
+            for t in &c.taps {
+                assert!(pins.insert(t.pin), "tap pin {} reused", t.pin.name());
+                if let Some(r) = t.read {
+                    assert!(slots.insert(r.slot()), "tap slot {:?} reused", r.slot());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn taps_add_pga_and_redundant_adc() {
+        // Synthetic: two plain channels on the SAME ADC (not cross), a spare opamp
+        // reachable only via a non-channel VINP pin, and a free pin on another ADC.
+        let p = |port, num, adc: &[Slot]| PinCap {
+            pin: PinId { port, num },
+            adc: adc.to_vec(),
+            comp: vec![],
+            opamp: vec![],
+        };
+        let caps = vec![p('A', 0, &[("ADC1", 0)]), p('A', 1, &[("ADC1", 1)])];
+        let out: OpampOutAdc = [("OPAMP1", vec![("ADC2", 5)])].into_iter().collect();
+        let td = TapData {
+            opamp_vinp: [("OPAMP1", vec![PinId { port: 'A', num: 2 }])].into_iter().collect(),
+            adc_on_pin: [(PinId { port: 'A', num: 3 }, vec![("ADC2", 3)])].into_iter().collect(),
+            ..Default::default()
+        };
+        let cfg = PlanConfig { channels: 2, tap_budget: 2, ..Default::default() };
+        let plan = plan_from(&caps, &out, &[], &td, 2, cfg);
+
+        assert_eq!(plan.pairs.len(), 1);
+        let pr = &plan.pairs[0];
+        // A PGA tap on the spare opamp, and a redundant-ADC tap that makes the
+        // same-ADC pair cross-ADC (simultaneous-sampleable).
+        let kinds: Vec<TapKind> =
+            pr.pos.taps.iter().chain(pr.neg.taps.iter()).map(|t| t.kind).collect();
+        assert!(kinds.iter().any(|k| matches!(k, TapKind::Pga("OPAMP1"))), "PGA tap: {kinds:?}");
+        assert!(kinds.iter().any(|k| matches!(k, TapKind::RedundantAdc)), "redundant-ADC tap: {kinds:?}");
+        assert!(pr.cross_adc, "redundant tap makes the pair simultaneous-sampleable");
+        assert!(plan.pga_channels() >= 1, "the PGA tap counts as a PGA channel");
+    }
+
+    #[test]
     fn zero_cross_respects_channel_cap() {
         // 4 channels, ask for 3 zero-cross pairs → capped at 2 pairs total.
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
         let zc = zero_cross_options(&crate::mcu_data::g474r::RAW, None);
         let cfg = PlanConfig { channels: 4, zero_cross_target: 3, ..Default::default() };
-        let p = plan_from(&caps, &out, &zc, 4, cfg);
+        let p = plan_from(&caps, &out, &zc, &TapData::default(), 4, cfg);
         assert_eq!(p.pairs.len(), 2);
         assert_eq!(p.zero_cross_pairs(), 2, "both pairs zero-cross, capped by channels");
     }

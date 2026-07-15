@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 use eframe::egui::{self, Color32, RichText};
 
 use crate::frontend_plan::{
-    bonded_pins, capabilities, plan, AdcRead, ChannelPlan, FrontEndPlan, PlanConfig,
+    bonded_pins, capabilities, plan, AdcRead, ChannelPlan, FrontEndPlan, PlanConfig, Tap, TapKind,
 };
 use crate::mcu_pinout::PinId;
 use crate::mcu_raw::RawMcuData;
@@ -119,6 +119,13 @@ pub fn show(
             .on_hover_text("Pairs to give a comparator straddling both ends (COMP+ / external COMP−) for differential zero-cross detection. Spends a comparator per pair and forces the pair onto a specific pin combo.");
         ui.add(egui::Slider::new(&mut st.cfg.zero_cross_target, 0..=max_zc));
     });
+    // Capability taps: route a signal to extra pins for capabilities its primary
+    // pin lacks (zero-cross on any pair, a trigger/PGA, or a redundant ADC).
+    ui.horizontal(|ui| {
+        ui.label("Extra pins for taps:")
+            .on_hover_text("Route a signal to additional bonded pins (all high-Z analog inputs — paralleling on the PCB is fine) to gain capabilities its primary pin lacks: zero-cross on any pair (incl. full-PGA), a trigger, an opamp PGA (dual-range), or a redundant simultaneous ADC read. Costs one extra pin each.");
+        ui.add(egui::Slider::new(&mut st.cfg.tap_budget, 0..=16));
+    });
 
     // Reserved-pin chips.
     if !st.exclude.is_empty() {
@@ -159,13 +166,14 @@ pub fn show(
         let xadc = p.pairs.iter().filter(|x| x.cross_adc).count();
         let zc = p.zero_cross_pairs();
         ui.label(format!(
-            "{} full-PGA pairs · {} PGA channels · {} triggers · {} zero-cross pairs · {}/{} simultaneous-sample · score {}",
+            "{} full-PGA pairs · {} PGA channels · {} triggers · {} zero-cross pairs · {}/{} simultaneous-sample · {} tap pins · score {}",
             p.full_pga_pairs(),
             p.pga_channels(),
             p.triggers(),
             zc,
             xadc,
             p.pairs.len(),
+            p.tap_pins(),
             p.score,
         ));
     });
@@ -247,6 +255,26 @@ fn channel_cell(ui: &mut egui::Ui, c: &ChannelPlan) -> bool {
         if let Some(cp) = c.comp {
             ui.label(RichText::new(format!("trig {cp}")).color(COMP_COL).small());
         }
+        for t in &c.taps {
+            let (txt, col) = tap_chip(t);
+            ui.label(RichText::new(txt).color(col).small())
+                .on_hover_text("This signal is also wired to this extra pin for the capability shown.");
+        }
     });
     clicked
+}
+
+/// A compact chip for one capability tap (an extra pin the signal is routed to).
+fn tap_chip(t: &Tap) -> (String, Color32) {
+    let p = t.pin.name();
+    match t.kind {
+        TapKind::Trigger(c) => (format!("+{p} trig {c}"), COMP_COL),
+        TapKind::ZeroCrossInp(c) => (format!("+{p} 0×⁺ {c}"), COMP_COL),
+        TapKind::ZeroCrossInm(c) => (format!("+{p} 0×⁻ {c}"), COMP_COL),
+        TapKind::Pga(o) => (format!("+{p} PGA {o}"), OPAMP_COL),
+        TapKind::RedundantAdc => {
+            let r = t.read.map(|r| format!("{}.{}", r.adc(), r.ch())).unwrap_or_default();
+            (format!("+{p} adc {r}"), ADC_COL)
+        }
+    }
 }
