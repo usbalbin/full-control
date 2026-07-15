@@ -50,6 +50,7 @@ enum ViewMode {
     Converter,
     Peripherals,
     Analog,
+    FrontEnd,
 }
 
 /// One named design — the savable unit ("project"). Holds the full design state:
@@ -191,6 +192,9 @@ pub struct PeriPlannerApp {
     /// Per-chip memo of the analog front-end enumeration (avoids a per-frame
     /// full-AF-table rebuild). Ephemeral; keyed on the active chip's raw.
     analog_cache: crate::analog_view::EnumCache,
+    /// Multi-channel front-end planner state (config + pin reservations + memo).
+    /// Ephemeral; re-solves when the chip/package/config/reservations change.
+    frontend_state: crate::frontend_view::FrontEndState,
     /// The (peripheral, role) picked up for placement in the generic pin-map view.
     /// Ephemeral.
     pin_map_pick: Option<(String, String)>,
@@ -238,6 +242,7 @@ impl Default for PeriPlannerApp {
             af_filter: Default::default(),
             analog_filter: Default::default(),
             analog_cache: Default::default(),
+            frontend_state: Default::default(),
             pin_map_pick: None,
             c531_status: None,
             catalog_query: Default::default(),
@@ -941,6 +946,7 @@ impl PeriPlannerApp {
                 ui.selectable_value(&mut self.view, ViewMode::Inventory, "Inventory");
                 ui.selectable_value(&mut self.view, ViewMode::AfTable, "Pin / AF");
                 ui.selectable_value(&mut self.view, ViewMode::Analog, "Analog pairs");
+                ui.selectable_value(&mut self.view, ViewMode::FrontEnd, "Front-end");
                 ui.selectable_value(&mut self.view, ViewMode::Catalog, "Part finder");
                 ui.selectable_value(&mut self.view, ViewMode::Dropin, "Drop-in finder");
                 if !browsing {
@@ -1180,6 +1186,7 @@ impl eframe::App for PeriPlannerApp {
             let af_filter = &mut self.af_filter;
             let analog_filter = &mut self.analog_filter;
             let analog_cache = &mut self.analog_cache;
+            let frontend_state = &mut self.frontend_state;
             let catalog_query = &mut self.catalog_query;
             let catalog_cache = &mut self.catalog_eval_cache;
             let catalog_sort = &mut self.catalog_sort;
@@ -1207,6 +1214,12 @@ impl eframe::App for PeriPlannerApp {
                     analog_filter,
                     crate::phys_pinout::best_footprint(desc.name, ""),
                     analog_cache,
+                ),
+                ViewMode::FrontEnd => crate::frontend_view::show(
+                    ui,
+                    desc.raw,
+                    crate::phys_pinout::best_footprint(desc.name, ""),
+                    frontend_state,
                 ),
                 ViewMode::Catalog => {
                     open = crate::catalog_view::show(
@@ -1262,6 +1275,7 @@ impl eframe::App for PeriPlannerApp {
             let af_filter = &mut self.af_filter;
             let analog_filter = &mut self.analog_filter;
             let analog_cache = &mut self.analog_cache;
+            let frontend_state = &mut self.frontend_state;
             let c531_status = self.c531_status.as_deref();
             // Active H523-family design, created on first touch for this MCU.
             // (`render_top_bar` above may have switched MCU this frame; this binds
@@ -1303,6 +1317,14 @@ impl eframe::App for PeriPlannerApp {
                             analog_filter,
                             crate::phys_pinout::best_footprint(package.name(), package.package_label()),
                             analog_cache,
+                        );
+                    }
+                    ViewMode::FrontEnd => {
+                        crate::frontend_view::show(
+                            ui,
+                            descriptor.raw,
+                            crate::phys_pinout::best_footprint(package.name(), package.package_label()),
+                            frontend_state,
                         );
                     }
                     ViewMode::Catalog => {
@@ -2082,6 +2104,17 @@ impl eframe::App for PeriPlannerApp {
                             self.active.package.package_label(),
                         ),
                         &mut self.analog_cache,
+                    );
+                }
+                ViewMode::FrontEnd => {
+                    crate::frontend_view::show(
+                        ui,
+                        self.active.package.descriptor().raw,
+                        crate::phys_pinout::best_footprint(
+                            self.active.package.name(),
+                            self.active.package.package_label(),
+                        ),
+                        &mut self.frontend_state,
                     );
                 }
                 // Non-G474 views; never selectable while the G474 planner is active.

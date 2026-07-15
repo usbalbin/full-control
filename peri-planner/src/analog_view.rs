@@ -118,7 +118,7 @@ pub struct DiffFrontEnd {
 /// `INP<n>`; try `INP` first because H5 pins carry BOTH an analog `INP1`
 /// (`af:None`) and a timer `IN1` (`af:Some`) — the caller already gates on
 /// `af.is_none()`, this just resolves the prefix.
-fn adc_pos_index(role: &str) -> Option<u8> {
+pub(crate) fn adc_pos_index(role: &str) -> Option<u8> {
     let tail = role.strip_prefix("INP").or_else(|| role.strip_prefix("IN"))?;
     if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -138,7 +138,7 @@ fn adc_neg_index(role: &str) -> Option<u8> {
 /// COMP non-inverting input role (`INP`, `INP0`, `INP1`, `INP2`, `INP3`, …).
 /// Accepts any digit tail so both the G4 base (`INP0/INP1`) and the C5 base
 /// (`INP1/INP2/INP3`) match without per-family code.
-fn comp_plus(role: &str) -> bool {
+pub(crate) fn comp_plus(role: &str) -> bool {
     role == "INP" || (role.strip_prefix("INP").is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())))
 }
 
@@ -149,7 +149,7 @@ fn comp_minus(role: &str) -> bool {
 
 /// OPAMP non-inverting input pins (`VINP`, `VINP0/1/2`). Skips the `_SEC`
 /// secondary-mux rows (they duplicate the same pins) so each pin appears once.
-fn opamp_plus(role: &str) -> bool {
+pub(crate) fn opamp_plus(role: &str) -> bool {
     !role.ends_with("_SEC") && (role == "VINP" || role.starts_with("VINP"))
 }
 

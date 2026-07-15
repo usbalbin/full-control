@@ -14,6 +14,8 @@ pub mod dropin_view;
 pub mod fabric_data;
 pub mod fabric_data_c5;
 pub mod fabric_view;
+pub mod frontend_plan;
+pub mod frontend_view;
 pub mod g474;
 pub mod h523_design;
 pub mod hrtim_view;
