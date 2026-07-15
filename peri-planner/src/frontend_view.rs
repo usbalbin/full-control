@@ -108,6 +108,17 @@ pub fn show(
             set_weights(&mut st.cfg, FAVOR_PGA);
         }
     });
+    // Zero-cross detection: carve N pairs with a straddling comparator (COMP+ on
+    // one end, external COMP− on the other → fires on the differential crossing).
+    ui.horizontal(|ui| {
+        let max_zc = st.cfg.channels / 2;
+        if st.cfg.zero_cross_target > max_zc {
+            st.cfg.zero_cross_target = max_zc;
+        }
+        ui.label("Zero-cross pairs:")
+            .on_hover_text("Pairs to give a comparator straddling both ends (COMP+ / external COMP−) for differential zero-cross detection. Spends a comparator per pair and forces the pair onto a specific pin combo.");
+        ui.add(egui::Slider::new(&mut st.cfg.zero_cross_target, 0..=max_zc));
+    });
 
     // Reserved-pin chips.
     if !st.exclude.is_empty() {
@@ -146,11 +157,13 @@ pub fn show(
     ui.horizontal_wrapped(|ui| {
         ui.label(RichText::new("Achieved:").strong().color(OPAMP_COL));
         let xadc = p.pairs.iter().filter(|x| x.cross_adc).count();
+        let zc = p.zero_cross_pairs();
         ui.label(format!(
-            "{} full-PGA pairs · {} PGA channels · {} triggers · {}/{} pairs simultaneous-sample · score {}",
+            "{} full-PGA pairs · {} PGA channels · {} triggers · {} zero-cross pairs · {}/{} simultaneous-sample · score {}",
             p.full_pga_pairs(),
             p.pga_channels(),
             p.triggers(),
+            zc,
             xadc,
             p.pairs.len(),
             p.score,
@@ -191,6 +204,10 @@ pub fn show(
                 ui.horizontal(|ui| {
                     if pair.full_pga {
                         ui.label(RichText::new("FULL-PGA").color(OPAMP_COL).small());
+                    }
+                    if let Some(zc) = pair.zero_cross {
+                        ui.label(RichText::new(format!("↕ 0-cross {zc}")).color(COMP_COL).small())
+                            .on_hover_text("A comparator straddles the pair (COMP+ on one end, external COMP− on the other) → fires on the differential zero-crossing.");
                     }
                     if pair.cross_adc {
                         ui.label(RichText::new("⇉ sim").color(ADC_COL).small())

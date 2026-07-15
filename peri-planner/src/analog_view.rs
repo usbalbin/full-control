@@ -143,7 +143,7 @@ pub(crate) fn comp_plus(role: &str) -> bool {
 }
 
 /// COMP inverting input role (`INM`, `INM0`, `INM1`, …) — external pins only.
-fn comp_minus(role: &str) -> bool {
+pub(crate) fn comp_minus(role: &str) -> bool {
     role == "INM" || (role.strip_prefix("INM").is_some_and(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit())))
 }
 
