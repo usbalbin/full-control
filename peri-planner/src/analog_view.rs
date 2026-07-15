@@ -158,9 +158,62 @@ fn opamp_minus(role: &str) -> bool {
     !role.ends_with("_SEC") && (role == "VINM" || role.starts_with("VINM"))
 }
 
+/// ADC single-ended positive channel index from an `IN<n>` role (G4/C5 style).
+/// Excludes `INN<n>` (differential negative) and H5's `INP<n>`.
+fn adc_in_ch(role: &str) -> Option<u8> {
+    let t = role.strip_prefix("IN")?;
+    if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    t.parse().ok()
+}
+
+/// OPAMP output → ADC channel routing, derived purely from pin co-location: each
+/// `OPAMPx_VOUT` pin also carries the ADC `IN<n>` role of the channel the ADC
+/// reads the opamp output on (the internal `OPAINTOEN` path — same channel
+/// number, pinless). Returns (opamp instance → a "`VOUT <pin> → ADCy_IN<n>`"
+/// note fragment, VOUT pin → opamp instance for the reverse ADC-row lookup).
+/// No hardcoded RM table; the category-dependent internal-ONLY extra channels
+/// (which have no pin) aren't represented — the pin-bearing ones are.
+fn opamp_adc_routing(
+    raw: &'static RawMcuData,
+) -> (HashMap<&'static str, String>, HashMap<PinId, &'static str>) {
+    // ADC single-ended IN<n> channels present on each pin.
+    let mut adc_on_pin: HashMap<PinId, Vec<(&'static str, u8)>> = HashMap::new();
+    for r in af_rows(raw) {
+        if r.af.is_none()
+            && r.signal.peripheral.starts_with("ADC")
+            && let Some(ch) = adc_in_ch(r.signal.role)
+        {
+            adc_on_pin.entry(r.pin).or_default().push((r.signal.peripheral, ch));
+        }
+    }
+    let mut notes: HashMap<&'static str, String> = HashMap::new();
+    let mut vout_opamp: HashMap<PinId, &'static str> = HashMap::new();
+    for r in af_rows(raw) {
+        if r.af.is_none() && r.signal.peripheral.starts_with("OPAMP") && r.signal.role == "VOUT" {
+            vout_opamp.insert(r.pin, r.signal.peripheral);
+            if let Some(chans) = adc_on_pin.get(&r.pin) {
+                let mut cs = chans.clone();
+                cs.sort_unstable();
+                cs.dedup();
+                let list = cs.iter().map(|(a, c)| format!("{a}_IN{c}")).collect::<Vec<_>>().join(", ");
+                notes.insert(
+                    r.signal.peripheral,
+                    format!("VOUT {} → {list} (internal via OPAINTOEN)", r.pin.name()),
+                );
+            }
+        }
+    }
+    (notes, vout_opamp)
+}
+
 /// Enumerate every differential-capable analog front-end on this chip. Family-
 /// agnostic; kinds absent from the data simply yield no rows.
 pub fn enumerate(raw: &'static RawMcuData) -> Vec<DiffFrontEnd> {
+    // OPAMP output → ADC channel routing (VOUT pin co-locates with an ADC IN).
+    let (opamp_adc_notes, vout_opamp) = opamp_adc_routing(raw);
+
     // Bucket analog (af:None) rows per peripheral instance.
     let mut by_inst: std::collections::BTreeMap<&'static str, Vec<AfRow>> = Default::default();
     for r in af_rows(raw) {
@@ -195,13 +248,18 @@ pub fn enumerate(raw: &'static RawMcuData) -> Vec<DiffFrontEnd> {
                 // Hedge the channel number when the negative pin's own single-
                 // ended index isn't m+1 (the ADC1 shared/private boundary quirk).
                 let hedge = pos_of_pin.get(&npin) != Some(&(m + 1));
-                let note = if hedge {
+                let mut note = if hedge {
                     format!(
                         "DIFSEL[{m}]=1; VINP[{m}]-VINN[{m}]. Channel # is data-derived at a shared-pin boundary — verify against RM0440."
                     )
                 } else {
                     format!("DIFSEL[{m}]=1; VINP[{m}]-VINN[{m}]. Using ch{m} consumes ch{}'s pin.", m + 1)
                 };
+                // The +input pad is also an OPAMP output → this channel can read
+                // the opamp internally (OPAINTOEN), freeing the pad.
+                if let Some(op) = vout_opamp.get(&ppin) {
+                    note.push_str(&format!("  ← {op} output (internal)"));
+                }
                 out.push(DiffFrontEnd {
                     kind: Kind::AdcDiff,
                     instance: inst,
@@ -296,7 +354,10 @@ pub fn enumerate(raw: &'static RawMcuData) -> Vec<DiffFrontEnd> {
                     channel: None,
                     channel_hedge: false,
                     external_minus: false,
-                    note: "PGA x2..64; - on-chip; VOUT -> ADC via OPAINTOEN".into(),
+                    note: match opamp_adc_notes.get(inst) {
+                        Some(route) => format!("PGA x2..64; - on-chip; {route}"),
+                        None => "PGA x2..64; - on-chip; VOUT -> ADC (OPAINTOEN)".into(),
+                    },
                 });
                 for (mp, mr) in &minus {
                     if mp != pp {
@@ -670,6 +731,29 @@ mod tests {
         let h_pairs = c.frontends(h523).len();
         assert_eq!(c.key, Some(h523 as *const RawMcuData as usize));
         assert_ne!(g_pairs, h_pairs, "different chips enumerate differently");
+    }
+
+    #[test]
+    fn opamp_output_adc_channel_is_surfaced_both_ways() {
+        let fes = enumerate(&crate::mcu_data::g474r::RAW);
+
+        // OP+ row for OPAMP1 names the concrete ADC channel its VOUT feeds
+        // (PA2 → ADC1_IN3), derived from pin co-location — no hardcoded table.
+        let op1 = fes
+            .iter()
+            .find(|f| f.kind == Kind::OpampPlus && f.instance == "OPAMP1" && f.minus.is_none())
+            .expect("OPAMP1 OP+ row");
+        assert!(op1.note.contains("ADC1_IN3"), "OPAMP1 names its ADC channel: {}", op1.note);
+        assert!(op1.note.contains("PA2"), "names the VOUT pad: {}", op1.note);
+
+        // And the ADC1 ch3 diff row (its + pad PA2 == OPAMP1 VOUT) is flagged
+        // opamp-fed, so ADC planning sees the internal path.
+        let adc3 = fes
+            .iter()
+            .find(|f| f.kind == Kind::AdcDiff && f.instance == "ADC1" && f.channel == Some(3))
+            .expect("ADC1 ch3 diff row");
+        assert_eq!(adc3.plus_pin.name(), "PA2");
+        assert!(adc3.note.contains("OPAMP1 output"), "ch3 marked opamp-fed: {}", adc3.note);
     }
 
     fn adc_channels(fes: &[DiffFrontEnd], adc: &str) -> BTreeSet<u8> {
