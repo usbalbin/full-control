@@ -452,6 +452,75 @@ pub fn show(
     None
 }
 
+/// Overlay a dev board's header / reservation info onto a package paint map, so a
+/// package drawing "shows the pin headers" for a Nucleo. For each board pin: fold
+/// its Arduino label + reserved function into an existing paint's tooltip, or
+/// paint an otherwise-blank header pin (Arduino label as sublabel, reserved pins
+/// outlined by severity). Informational — never changes placement colours.
+pub fn overlay_board_headers(paints: &mut HashMap<Pin, PinPaint>, chip_name: &str) {
+    let Some(b) = crate::board::boards_for(chip_name).first().copied() else {
+        return;
+    };
+    for bp in b.pins {
+        let note = board_note(bp);
+        let key = Pin::new(bp.pin.port, bp.pin.num);
+        let border = bp.reserved.map(|r| {
+            let c = match r.severity {
+                crate::board::Severity::Block => Color32::from_rgb(210, 110, 90),
+                crate::board::Severity::Warn => Color32::from_rgb(210, 170, 70),
+            };
+            Stroke::new(1.5, c)
+        });
+        let label = bp.arduino.map(String::from).or(bp.reserved.map(|_| "⚠".to_string()));
+        match paints.get_mut(&key) {
+            // An existing paint (from placement): fold the header info into the
+            // tooltip, and fill in a label / reserved outline only if the pin is
+            // otherwise blank (don't clobber a placement label/border).
+            Some(pp) => {
+                pp.tooltip = Some(match &pp.tooltip {
+                    Some(t) => format!("{t}\n— {note}"),
+                    None => note,
+                });
+                if pp.sublabel.is_none() {
+                    pp.sublabel = label;
+                }
+                if pp.border.is_none() {
+                    pp.border = border;
+                }
+            }
+            None => {
+                paints.insert(
+                    key,
+                    PinPaint {
+                        fill: Color32::from_rgb(58, 62, 72),
+                        border,
+                        sublabel: label,
+                        tooltip: Some(note),
+                        interactive: false,
+                    },
+                );
+            }
+        }
+    }
+}
+
+fn board_note(bp: &crate::board::BoardPin) -> String {
+    let mut s = String::new();
+    if let Some(a) = bp.arduino {
+        s.push_str(&format!("Arduino {a}"));
+    }
+    if let Some(r) = bp.reserved {
+        if !s.is_empty() {
+            s.push_str(" · ");
+        }
+        s.push_str(&format!("{}: {}", r.function, r.caveat));
+    }
+    if s.is_empty() {
+        s.push_str("Nucleo header pin");
+    }
+    s
+}
+
 struct DrawResult {
     hit: Option<Pin>,
     hover_tooltip: Option<(Pos2, String)>,

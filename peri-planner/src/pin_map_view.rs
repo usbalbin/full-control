@@ -105,6 +105,15 @@ pub fn show(
                     .on_hover_text(detail);
             }
         }
+        if let Some(b) = crate::board::boards_for(raw.name).first() {
+            ui.separator();
+            ui.label(
+                egui::RichText::new(format!("{} headers overlaid", b.name))
+                    .color(YELLOW)
+                    .small(),
+            )
+            .on_hover_text("Arduino pins are labelled; board-reserved pins (LED, button, VCP, SWD…) are outlined — hover any pin for its board function.");
+        }
     });
     ui.separator();
 
@@ -226,6 +235,10 @@ pub fn show(
             },
         );
     }
+
+    // Nucleo header overlay: label each board pin with its Arduino name and flag
+    // the board-reserved ones (informational — see package_view).
+    crate::package_view::overlay_board_headers(&mut paints, raw.name);
 
     if edit.is_none() {
         match crate::package_view::show_record(ui, record, &paints, &[]) {

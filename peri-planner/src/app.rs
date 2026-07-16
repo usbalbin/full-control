@@ -2060,9 +2060,18 @@ impl eframe::App for PeriPlannerApp {
                             ).weak(),
                         );
                     }
-                    let paints = crate::picker::build_pin_paints(
+                    let mut paints = crate::picker::build_pin_paints(
                         &self.active.design, self.active.variant, self.picked,
                     );
+                    let chip = self.active.package.descriptor().raw.name;
+                    crate::package_view::overlay_board_headers(&mut paints, chip);
+                    if let Some(b) = crate::board::boards_for(chip).first() {
+                        ui.label(
+                            egui::RichText::new(format!("{} headers overlaid — hover a pin for its board function", b.name))
+                                .color(egui::Color32::from_rgb(210, 180, 80))
+                                .small(),
+                        );
+                    }
                     let action = crate::package_view::show(ui, self.active.variant, &paints);
                     self.handle_package_action(action);
                 }
