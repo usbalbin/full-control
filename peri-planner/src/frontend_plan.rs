@@ -1406,6 +1406,28 @@ mod tests {
     }
 
     #[test]
+    fn opamp_only_pin_is_usable_via_its_output() {
+        // A pin that is an OPAMP VINP but NOT a direct ADC channel is still a valid
+        // logging channel — the opamp output reaches an ADC (OPAINTOEN). (No such
+        // pin exists on G474, so this is a synthetic chip.)
+        let caps = vec![
+            PinCap { pin: PinId { port: 'A', num: 0 }, adc: vec![], comp: vec![], opamp: vec!["OPAMP1"] },
+            PinCap { pin: PinId { port: 'A', num: 1 }, adc: vec![("ADC1", 2)], comp: vec![], opamp: vec![] },
+        ];
+        let out: OpampOutAdc = [("OPAMP1", vec![("ADC2", 5)])].into_iter().collect();
+        let p = plan_from(&caps, &out, &[], &[], &TapData::default(), 2, PlanConfig::default());
+        assert_eq!(p.unplaced_channels, 0, "the opamp-only pin places via its opamp");
+        let pa0 = p
+            .pairs
+            .iter()
+            .flat_map(|pr| [&pr.pos, &pr.neg])
+            .find(|c| c.pin.name() == "PA0")
+            .expect("PA0 is placed");
+        assert!(matches!(pa0.read, AdcRead::ViaOpamp { opamp: "OPAMP1", .. }), "read via the opamp");
+        assert_eq!(pa0.opamp, Some("OPAMP1"));
+    }
+
+    #[test]
     fn adc_diff_options_g474() {
         let d = adc_diff_options(&crate::mcu_data::g474r::RAW, None);
         let has = |adc: &str, ch: u8, p: &str, m: &str| {

@@ -1,0 +1,274 @@
+//! **Board profiles** — dev-board overlays for the front-end planner, so you can
+//! plan a *shield* against what the board actually exposes and leaves free rather
+//! than the bare chip. A profile is board-level data (from the board's user
+//! manual), not derivable from the MCU descriptor: which MCU pins reach which
+//! header, and which pins the board already consumes (LEDs, buttons, the ST-LINK
+//! virtual COM port, SWD, the clock).
+//!
+//! It plugs straight into the planner's existing pin machinery: selecting a board
+//! sets the *usable* pin set (`bonded ∩ connector pins`) and pre-populates the
+//! *reserved* set — both of which the solver already honours. Reservations are
+//! overridable (freed with the same reserve chips); "soft" ones (LED, button,
+//! VCP) can be used with a surfaced electrical caveat.
+//!
+//! First board: NUCLEO-G474RE (MB1367), from ST **UM2505** and the mbed pin map.
+
+use std::collections::BTreeSet;
+
+use crate::mcu_pinout::PinId;
+
+/// How badly a board-reserved pin conflicts with reuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Severity {
+    /// Really shouldn't be repurposed (SWD debug, the running clock).
+    Block,
+    /// Usable, but with an electrical caveat (an LED load, a button network, a
+    /// solder-bridge to open) — surfaced as a warning.
+    Warn,
+}
+
+/// What a board does with a pin by default, and the caveat for reusing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Reservation {
+    pub function: &'static str,
+    pub severity: Severity,
+    pub caveat: &'static str,
+}
+
+/// One board pin of interest: its Arduino header label (if broken out there) and
+/// what the board reserves it for (if anything). Pins with neither are ordinary
+/// Morpho GPIO and don't need an entry.
+#[derive(Clone, Copy, Debug)]
+pub struct BoardPin {
+    pub pin: PinId,
+    pub arduino: Option<&'static str>,
+    pub reserved: Option<Reservation>,
+}
+
+/// Which connector a shield mounts on — sets the usable pin budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum Connector {
+    /// The 2×19 ST Morpho headers (CN7/CN10) — essentially every MCU pin.
+    #[default]
+    Morpho,
+    /// The Arduino Uno V3 headers — only the labelled A0–A5 / D0–D15 subset.
+    Arduino,
+}
+
+impl Connector {
+    pub const ALL: [Connector; 2] = [Connector::Morpho, Connector::Arduino];
+    pub fn label(self) -> &'static str {
+        match self {
+            Connector::Morpho => "ST Morpho (CN7/CN10)",
+            Connector::Arduino => "Arduino Uno",
+        }
+    }
+}
+
+/// A named dev board over a specific MCU/package.
+#[derive(Clone, Copy, Debug)]
+pub struct BoardProfile {
+    pub name: &'static str,
+    /// Descriptor-name prefix the board's chip matches (e.g. `"STM32G474R"`).
+    pub chip_prefix: &'static str,
+    pub pins: &'static [BoardPin],
+}
+
+impl BoardProfile {
+    pub fn find(&self, pin: PinId) -> Option<&BoardPin> {
+        self.pins.iter().find(|p| p.pin == pin)
+    }
+    /// Pins broken out on the Arduino header.
+    pub fn arduino_pins(&self) -> BTreeSet<PinId> {
+        self.pins.iter().filter(|p| p.arduino.is_some()).map(|p| p.pin).collect()
+    }
+    /// All board-reserved pins (any severity) — the reserve-by-default set.
+    pub fn reserved_pins(&self) -> BTreeSet<PinId> {
+        self.pins.iter().filter(|p| p.reserved.is_some()).map(|p| p.pin).collect()
+    }
+    /// The usable-pin set for a connector, intersected with what's actually bonded
+    /// on the active footprint. Morpho brings out everything, so it's just the
+    /// footprint set; Arduino restricts to the labelled subset.
+    pub fn usable_pins(&self, connector: Connector, bonded: &BTreeSet<PinId>) -> BTreeSet<PinId> {
+        match connector {
+            Connector::Morpho => bonded.clone(),
+            Connector::Arduino => bonded.intersection(&self.arduino_pins()).copied().collect(),
+        }
+    }
+}
+
+/// Boards whose chip matches this descriptor name (e.g. `"STM32G474RET6"`).
+pub fn boards_for(chip_name: &str) -> Vec<&'static BoardProfile> {
+    ALL_BOARDS.iter().filter(|b| chip_name.starts_with(b.chip_prefix)).copied().collect()
+}
+
+const fn p(port: char, num: u8, arduino: Option<&'static str>, reserved: Option<Reservation>) -> BoardPin {
+    BoardPin { pin: PinId { port, num }, arduino, reserved }
+}
+const fn res(function: &'static str, severity: Severity, caveat: &'static str) -> Reservation {
+    Reservation { function, severity, caveat }
+}
+
+/// NUCLEO-G474RE (STM32G474RET6, LQFP64, MB1367). Arduino map + reservations from
+/// ST UM2505 and the mbed `TARGET_NUCLEO_G474RE` pin names. The clock is the
+/// internal HSI16 by default, so PF0/PF1 stay free.
+pub static NUCLEO_G474RE: BoardProfile = BoardProfile {
+    name: "NUCLEO-G474RE",
+    chip_prefix: "STM32G474R",
+    pins: &[
+        // Arduino analog header A0–A5.
+        p('A', 0, Some("A0"), None),
+        p('A', 1, Some("A1"), None),
+        p('A', 4, Some("A2"), None),
+        p('B', 0, Some("A3"), None),
+        p('C', 1, Some("A4"), None),
+        p('C', 0, Some("A5"), None),
+        // Arduino digital header D0–D15.
+        p('C', 5, Some("D0"), None),
+        p('C', 4, Some("D1"), None),
+        p('A', 10, Some("D2"), None),
+        p('B', 3, Some("D3"), None),
+        p('B', 5, Some("D4"), None),
+        p('B', 4, Some("D5"), None),
+        p('B', 10, Some("D6"), None),
+        p('A', 8, Some("D7"), None),
+        p('A', 9, Some("D8"), None),
+        p('C', 7, Some("D9"), None),
+        p('B', 6, Some("D10"), None),
+        p('A', 7, Some("D11"), None),
+        p('A', 6, Some("D12"), None),
+        p(
+            'A',
+            5,
+            Some("D13"),
+            Some(res(
+                "LD2 user LED / Arduino SCK",
+                Severity::Warn,
+                "drives the on-board green LED (~330 Ω) and is the Arduino SPI SCK — as an analog input it carries that load",
+            )),
+        ),
+        p('B', 9, Some("D14"), None), // I2C SDA
+        p('B', 8, Some("D15"), None), // I2C SCL
+        // Board-reserved pins not on the Arduino header.
+        p(
+            'C',
+            13,
+            None,
+            Some(res(
+                "B1 user button",
+                Severity::Warn,
+                "tied to the blue user button (switch to GND); not a clean analog node",
+            )),
+        ),
+        p(
+            'A',
+            2,
+            None,
+            Some(res(
+                "ST-LINK VCP TX (LPUART1)",
+                Severity::Warn,
+                "on-board ST-LINK virtual COM port — open solder bridge SB to reuse",
+            )),
+        ),
+        p(
+            'A',
+            3,
+            None,
+            Some(res(
+                "ST-LINK VCP RX (LPUART1)",
+                Severity::Warn,
+                "on-board ST-LINK virtual COM port — open solder bridge SB to reuse",
+            )),
+        ),
+        p(
+            'A',
+            13,
+            None,
+            Some(res("SWDIO (debug)", Severity::Block, "SWD debug — reusing it disables the on-board debugger")),
+        ),
+        p(
+            'A',
+            14,
+            None,
+            Some(res("SWCLK (debug)", Severity::Block, "SWD debug — reusing it disables the on-board debugger")),
+        ),
+        p(
+            'C',
+            14,
+            None,
+            Some(res(
+                "LSE OSC32_IN",
+                Severity::Warn,
+                "32 kHz RTC crystal footprint (X2) — usable only if the crystal isn't populated",
+            )),
+        ),
+        p(
+            'C',
+            15,
+            None,
+            Some(res(
+                "LSE OSC32_OUT",
+                Severity::Warn,
+                "32 kHz RTC crystal footprint (X2) — usable only if the crystal isn't populated",
+            )),
+        ),
+    ],
+};
+
+static ALL_BOARDS: &[&BoardProfile] = &[&NUCLEO_G474RE];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nucleo_g474re_matches_g474r_parts_only() {
+        assert!(!boards_for("STM32G474RET6").is_empty());
+        assert!(!boards_for("STM32G474RB").is_empty());
+        assert!(boards_for("STM32G474VET6").is_empty(), "V (LQFP100) is a different board");
+        assert!(boards_for("STM32H523RE").is_empty());
+    }
+
+    #[test]
+    fn arduino_analog_pins_are_the_um2505_map() {
+        let b = &NUCLEO_G474RE;
+        let a0 = b.pins.iter().find(|p| p.arduino == Some("A0")).unwrap();
+        assert_eq!(a0.pin, PinId { port: 'A', num: 0 });
+        let a4 = b.pins.iter().find(|p| p.arduino == Some("A4")).unwrap();
+        assert_eq!(a4.pin, PinId { port: 'C', num: 1 });
+        // D13 is the LED pin AND an Arduino pin.
+        let d13 = b.find(PinId { port: 'A', num: 5 }).unwrap();
+        assert_eq!(d13.arduino, Some("D13"));
+        assert!(d13.reserved.is_some(), "PA5 is LD2");
+    }
+
+    #[test]
+    fn reserved_set_and_severities() {
+        let b = &NUCLEO_G474RE;
+        let r = b.reserved_pins();
+        for name in ["PA2", "PA3", "PA5", "PC13", "PA13", "PA14"] {
+            let pin = PinId::from_metapac(name).unwrap();
+            assert!(r.contains(&pin), "{name} should be board-reserved");
+        }
+        // SWD is a hard block; the LED is a soft warning.
+        assert_eq!(b.find(PinId { port: 'A', num: 13 }).unwrap().reserved.unwrap().severity, Severity::Block);
+        assert_eq!(b.find(PinId { port: 'A', num: 5 }).unwrap().reserved.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn arduino_connector_restricts_usable_pins() {
+        let b = &NUCLEO_G474RE;
+        // A generous "bonded" set (pretend the whole footprint).
+        let bonded: BTreeSet<PinId> = ["PA0", "PA1", "PA4", "PB1", "PC10", "PF0"]
+            .iter()
+            .map(|n| PinId::from_metapac(n).unwrap())
+            .collect();
+        let morpho = b.usable_pins(Connector::Morpho, &bonded);
+        assert_eq!(morpho, bonded, "Morpho brings out everything");
+        let arduino = b.usable_pins(Connector::Arduino, &bonded);
+        // PA0/PA1/PA4 are Arduino pins; PB1/PC10/PF0 are Morpho-only.
+        assert!(arduino.contains(&PinId::from_metapac("PA0").unwrap()));
+        assert!(!arduino.contains(&PinId::from_metapac("PB1").unwrap()));
+        assert!(!arduino.contains(&PinId::from_metapac("PF0").unwrap()));
+    }
+}

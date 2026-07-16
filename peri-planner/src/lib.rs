@@ -1,6 +1,7 @@
 pub mod af_view;
 pub mod analog_view;
 pub mod app;
+pub mod board;
 pub mod c531_design;
 pub mod c531_view;
 pub mod catalog;

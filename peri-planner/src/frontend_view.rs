@@ -12,12 +12,16 @@ use std::collections::BTreeSet;
 
 use eframe::egui::{self, Color32, RichText};
 
+use crate::board::{BoardProfile, Connector, Severity};
 use crate::frontend_plan::{
     bonded_pins, capabilities, plan, AdcRead, ChannelPlan, FrontEndPlan, PlanConfig, Tap, TapKind,
 };
 use crate::mcu_pinout::PinId;
 use crate::mcu_raw::RawMcuData;
 use crate::phys_pinout::PinoutRecord;
+
+const WARN_COL: Color32 = Color32::from_rgb(220, 170, 70);
+const BLOCK_COL: Color32 = Color32::from_rgb(220, 110, 90);
 
 const PIN_COL: Color32 = Color32::from_rgb(220, 220, 230);
 const ADC_COL: Color32 = Color32::from_rgb(90, 180, 220);
@@ -39,7 +43,7 @@ fn set_weights(cfg: &mut PlanConfig, w: (i32, i32, i32, i32)) {
     (cfg.w_pga_pair, cfg.w_pga_single, cfg.w_trigger, cfg.w_cross_adc) = w;
 }
 
-type MemoKey = (usize, usize, PlanConfig, BTreeSet<PinId>);
+type MemoKey = (usize, usize, PlanConfig, BTreeSet<PinId>, usize, Connector);
 
 /// Ephemeral view state: the solver config, the user's pin reservations, and a
 /// per-input memo of the solved plan (re-solves only when an input changes).
@@ -48,22 +52,37 @@ pub struct FrontEndState {
     pub cfg: PlanConfig,
     /// Pins reserved for the rest of the system — removed before solving.
     pub exclude: BTreeSet<PinId>,
+    /// Active dev-board overlay (restricts pins + seeds reservations), if any.
+    pub board: Option<&'static BoardProfile>,
+    pub connector: Connector,
     key: Option<MemoKey>,
     plan: FrontEndPlan,
 }
 
 impl FrontEndState {
-    /// Re-solve iff any input (chip, footprint, config, reservations) changed.
+    /// Re-solve iff any input (chip, footprint, config, reservations, board)
+    /// changed. When a board is active the usable set is its connector's pins.
     fn ensure(&mut self, raw: &'static RawMcuData, footprint: Option<&'static PinoutRecord>) {
         let fp = footprint.map(|r| r as *const PinoutRecord as usize).unwrap_or(0);
-        let key: MemoKey =
-            (raw as *const RawMcuData as usize, fp, self.cfg, self.exclude.clone());
+        let board_ptr = self.board.map_or(0, |b| b as *const BoardProfile as usize);
+        let key: MemoKey = (
+            raw as *const RawMcuData as usize,
+            fp,
+            self.cfg,
+            self.exclude.clone(),
+            board_ptr,
+            self.connector,
+        );
         if self.key.as_ref() == Some(&key) {
             return;
         }
-        let base: BTreeSet<PinId> = match footprint {
+        let bonded: BTreeSet<PinId> = match footprint {
             Some(r) => bonded_pins(r),
             None => capabilities(raw, None).into_iter().map(|c| c.pin).collect(),
+        };
+        let base = match self.board {
+            Some(b) => b.usable_pins(self.connector, &bonded),
+            None => bonded,
         };
         let eff: BTreeSet<PinId> = base.difference(&self.exclude).copied().collect();
         self.plan = plan(raw, Some(&eff), self.cfg);
@@ -88,6 +107,42 @@ pub fn show(
         .weak()
         .small(),
     );
+
+    // ---- Board overlay: plan a shield against a dev board's exposed/free pins. --
+    let boards = crate::board::boards_for(raw.name);
+    if !boards.is_empty() {
+        ui.horizontal(|ui| {
+            ui.label("Board:");
+            let cur = st.board.map_or("(bare chip)", |b| b.name);
+            egui::ComboBox::from_id_salt("fe_board").selected_text(cur).show_ui(ui, |ui| {
+                if ui.selectable_label(st.board.is_none(), "(bare chip)").clicked() && st.board.is_some() {
+                    st.board = None;
+                    st.exclude.clear();
+                }
+                for b in &boards {
+                    let sel = st.board.map(|x| x.name) == Some(b.name);
+                    if ui.selectable_label(sel, b.name).clicked() && !sel {
+                        st.board = Some(b);
+                        st.exclude = b.reserved_pins(); // reserve board-used pins by default
+                    }
+                }
+            });
+            if st.board.is_some() {
+                ui.separator();
+                ui.label("Connector:");
+                for c in Connector::ALL {
+                    ui.selectable_value(&mut st.connector, c, c.label());
+                }
+            }
+        });
+        if st.board.is_some() {
+            ui.label(
+                RichText::new("Shield mode: only board-exposed pins are used; board-used pins (LED, button, VCP, SWD…) start reserved — free any below to reuse it (with the noted caveat).")
+                    .weak()
+                    .small(),
+            );
+        }
+    }
     ui.separator();
 
     // ---- Controls: channel count + objective emphasis. ----
@@ -134,13 +189,26 @@ pub fn show(
         ui.add(egui::Slider::new(&mut st.cfg.tap_budget, 0..=16));
     });
 
-    // Reserved-pin chips.
+    // Reserved-pin chips. When a board is active, a reserved pin carries its
+    // board function + electrical caveat (and is colour-coded by severity).
     if !st.exclude.is_empty() {
+        let board = st.board;
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("Reserved (click to free):").weak().small());
             let mut free: Option<PinId> = None;
             for p in &st.exclude {
-                if ui.small_button(RichText::new(p.name()).color(DIM)).clicked() {
+                let (col, hover) = board
+                    .and_then(|b| b.find(*p))
+                    .and_then(|bp| bp.reserved)
+                    .map(|r| {
+                        let c = match r.severity {
+                            Severity::Block => BLOCK_COL,
+                            Severity::Warn => WARN_COL,
+                        };
+                        (c, format!("{}: {}", r.function, r.caveat))
+                    })
+                    .unwrap_or((DIM, "reserved for the rest of the system".into()));
+                if ui.small_button(RichText::new(p.name()).color(col)).on_hover_text(hover).clicked() {
                     free = Some(*p);
                 }
             }
@@ -198,6 +266,7 @@ pub fn show(
     ui.label(RichText::new("Click any pin to reserve it (removed from the plan, then re-solved).").weak().small());
 
     // ---- Pair table. Collect a click into a local, apply after the loop. ----
+    let board = st.board;
     let mut reserve: Option<PinId> = None;
     egui::ScrollArea::vertical().show(ui, |ui| {
         egui::Grid::new("frontend_pairs").striped(true).num_columns(4).show(ui, |ui| {
@@ -209,12 +278,12 @@ pub fn show(
 
             for pair in &p.pairs {
                 ui.label(format!("{}", pair.index));
-                if channel_cell(ui, &pair.pos) {
+                if channel_cell(ui, &pair.pos, board) {
                     reserve = Some(pair.pos.pin);
                 }
                 if pair.pos.pin == pair.neg.pin {
                     ui.label(RichText::new("(unpaired)").color(DIM).italics());
-                } else if channel_cell(ui, &pair.neg) {
+                } else if channel_cell(ui, &pair.neg, board) {
                     reserve = Some(pair.neg.pin);
                 }
                 ui.horizontal(|ui| {
@@ -244,8 +313,9 @@ pub fn show(
 }
 
 /// Render one channel as a row of chips; returns true if its pin was clicked
-/// (to be reserved).
-fn channel_cell(ui: &mut egui::Ui, c: &ChannelPlan) -> bool {
+/// (to be reserved). `board`, when set, adds the pin's Arduino label and a caveat
+/// warning if the pin is one the board normally uses.
+fn channel_cell(ui: &mut egui::Ui, c: &ChannelPlan, board: Option<&'static BoardProfile>) -> bool {
     let mut clicked = false;
     ui.horizontal(|ui| {
         if ui
@@ -254,6 +324,19 @@ fn channel_cell(ui: &mut egui::Ui, c: &ChannelPlan) -> bool {
             .clicked()
         {
             clicked = true;
+        }
+        if let Some(bp) = board.and_then(|b| b.find(c.pin)) {
+            if let Some(lbl) = bp.arduino {
+                ui.label(RichText::new(lbl).color(DIM).small());
+            }
+            if let Some(r) = bp.reserved {
+                let col = match r.severity {
+                    Severity::Block => BLOCK_COL,
+                    Severity::Warn => WARN_COL,
+                };
+                ui.label(RichText::new("⚠").color(col).small())
+                    .on_hover_text(format!("{}: {}", r.function, r.caveat));
+            }
         }
         let (adc, ch) = (c.read.adc(), c.read.ch());
         let read = match c.read {
