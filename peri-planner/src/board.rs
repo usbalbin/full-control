@@ -215,7 +215,60 @@ pub static NUCLEO_G474RE: BoardProfile = BoardProfile {
     ],
 };
 
-static ALL_BOARDS: &[&BoardProfile] = &[&NUCLEO_G474RE];
+/// NUCLEO-H533RE (STM32H533RET6, LQFP64, Nucleo-64). Reserved pins from the STM32
+/// H5 Nucleo-64 UM / Zephyr (VCP = USART2 PA2/PA3, LD2 = PA5, B1 = PC13). The
+/// Arduino A0–A5 / D0–D15 map is board-specific and not yet transcribed, so only
+/// the ST Morpho connector (all pins) is offered.
+pub static NUCLEO_H533RE: BoardProfile = BoardProfile {
+    name: "NUCLEO-H533RE",
+    chip_prefix: "STM32H533R",
+    pins: &[
+        p(
+            'A',
+            5,
+            None,
+            Some(res(
+                "LD2 user LED / Arduino D13",
+                Severity::Warn,
+                "drives the on-board green LED (~330 Ω) / Arduino SCK — carries that load as an input",
+            )),
+        ),
+        p('C', 13, None, Some(res("B1 user button", Severity::Warn, "tied to the user button (switch to GND); not a clean analog node"))),
+        p('A', 2, None, Some(res("ST-LINK VCP TX (USART2)", Severity::Warn, "on-board ST-LINK virtual COM port — open the SB to reuse"))),
+        p('A', 3, None, Some(res("ST-LINK VCP RX (USART2)", Severity::Warn, "on-board ST-LINK virtual COM port — open the SB to reuse"))),
+        p('A', 13, None, Some(res("SWDIO (debug)", Severity::Block, "SWD debug — reusing it disables the debugger"))),
+        p('A', 14, None, Some(res("SWCLK (debug)", Severity::Block, "SWD debug — reusing it disables the debugger"))),
+        p('C', 14, None, Some(res("LSE OSC32_IN", Severity::Warn, "32 kHz RTC crystal footprint — usable only if not populated"))),
+        p('C', 15, None, Some(res("LSE OSC32_OUT", Severity::Warn, "32 kHz RTC crystal footprint — usable only if not populated"))),
+    ],
+};
+
+/// NUCLEO-C5A3ZG (STM32C5A3ZGT6, LQFP144, Nucleo-144, MB2310 / UM3616). Only the
+/// pins confirmed from ST/Zephyr docs are reserved (LD1 green = PA5, B1 = PC13,
+/// SWD = PA13/PA14). The remaining Nucleo-144 LEDs (LD2/LD3) and the VCP UART pins
+/// aren't in the public docs and are deliberately NOT guessed — verify against
+/// UM3616 and add them. Morpho only (Arduino map not yet transcribed).
+pub static NUCLEO_C5A3ZG: BoardProfile = BoardProfile {
+    name: "NUCLEO-C5A3ZG",
+    chip_prefix: "STM32C5A3",
+    pins: &[
+        p(
+            'A',
+            5,
+            None,
+            Some(res(
+                "LD1 green LED / SPI1 SCK",
+                Severity::Warn,
+                "drives the on-board green LED / is SPI1 SCK — carries that load as an input",
+            )),
+        ),
+        p('C', 13, None, Some(res("B1 user button", Severity::Warn, "tied to the user button (switch to GND); not a clean analog node"))),
+        p('A', 13, None, Some(res("SWDIO (debug)", Severity::Block, "SWD debug — reusing it disables the debugger"))),
+        p('A', 14, None, Some(res("SWCLK (debug)", Severity::Block, "SWD debug — reusing it disables the debugger"))),
+    ],
+};
+
+static ALL_BOARDS: &[&BoardProfile] = &[&NUCLEO_G474RE, &NUCLEO_H533RE, &NUCLEO_C5A3ZG];
 
 #[cfg(test)]
 mod tests {
@@ -253,6 +306,22 @@ mod tests {
         // SWD is a hard block; the LED is a soft warning.
         assert_eq!(b.find(PinId { port: 'A', num: 13 }).unwrap().reserved.unwrap().severity, Severity::Block);
         assert_eq!(b.find(PinId { port: 'A', num: 5 }).unwrap().reserved.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn all_boards_match_their_parts() {
+        assert_eq!(boards_for("STM32H533RET6").len(), 1);
+        assert_eq!(boards_for("STM32C5A3ZGT6").len(), 1);
+        // H523 (compiled part) is NOT H533 — different board.
+        assert!(boards_for("STM32H523RET6").is_empty());
+        // Every board reserves SWD.
+        for b in [&NUCLEO_G474RE, &NUCLEO_H533RE, &NUCLEO_C5A3ZG] {
+            assert!(b.find(PinId { port: 'A', num: 13 }).is_some(), "{} reserves SWDIO", b.name);
+        }
+        // The new boards are Morpho-only for now (no Arduino map transcribed).
+        assert!(NUCLEO_H533RE.arduino_pins().is_empty());
+        assert!(NUCLEO_C5A3ZG.arduino_pins().is_empty());
+        assert!(!NUCLEO_G474RE.arduino_pins().is_empty());
     }
 
     #[test]

@@ -127,11 +127,19 @@ pub fn show(
                     }
                 }
             });
-            if st.board.is_some() {
+            if let Some(b) = st.board {
                 ui.separator();
                 ui.label("Connector:");
-                for c in Connector::ALL {
-                    ui.selectable_value(&mut st.connector, c, c.label());
+                // Offer the Arduino scope only when the board's Arduino map is known.
+                let has_arduino = !b.arduino_pins().is_empty();
+                if !has_arduino && st.connector == Connector::Arduino {
+                    st.connector = Connector::Morpho;
+                }
+                ui.selectable_value(&mut st.connector, Connector::Morpho, Connector::Morpho.label());
+                if has_arduino {
+                    ui.selectable_value(&mut st.connector, Connector::Arduino, Connector::Arduino.label());
+                } else {
+                    ui.label(RichText::new("(Arduino map not yet added)").weak().small());
                 }
             }
         });
