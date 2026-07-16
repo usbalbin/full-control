@@ -215,56 +215,93 @@ pub static NUCLEO_G474RE: BoardProfile = BoardProfile {
     ],
 };
 
-/// NUCLEO-H533RE (STM32H533RET6, LQFP64, Nucleo-64). Reserved pins from the STM32
-/// H5 Nucleo-64 UM / Zephyr (VCP = USART2 PA2/PA3, LD2 = PA5, B1 = PC13). The
-/// Arduino A0–A5 / D0–D15 map is board-specific and not yet transcribed, so only
-/// the ST Morpho connector (all pins) is offered.
+const LED_CAVEAT: &str = "drives an on-board LED / Arduino SCK — carries that load as an input";
+const BTN_CAVEAT: &str = "tied to the user button (switch to GND); not a clean analog node";
+const VCP_CAVEAT: &str = "on-board ST-LINK virtual COM port — open the SB to reuse";
+const SWD_CAVEAT: &str = "SWD debug — reusing it disables the debugger";
+const LSE_CAVEAT: &str = "32 kHz RTC crystal footprint — usable only if not populated";
+
+/// NUCLEO-H533RE (STM32H533RET6, LQFP64, Nucleo-64, MB1814). Arduino map +
+/// reserved pins from ST **UM3121** Table 16 (the NUH533RE column: A2 = PB1,
+/// D0/D1 = PB15/PB14, D2 = PC8, D14/D15 = PB7/PB6 — note these differ from the
+/// G474RE Nucleo-64). Reserved: LD2 = PA5, B1 = PC13, VCP = USART2 PA2/PA3, SWD =
+/// PA13/PA14, LSE = PC14/PC15.
 pub static NUCLEO_H533RE: BoardProfile = BoardProfile {
     name: "NUCLEO-H533RE",
     chip_prefix: "STM32H533R",
     pins: &[
-        p(
-            'A',
-            5,
-            None,
-            Some(res(
-                "LD2 user LED / Arduino D13",
-                Severity::Warn,
-                "drives the on-board green LED (~330 Ω) / Arduino SCK — carries that load as an input",
-            )),
-        ),
-        p('C', 13, None, Some(res("B1 user button", Severity::Warn, "tied to the user button (switch to GND); not a clean analog node"))),
-        p('A', 2, None, Some(res("ST-LINK VCP TX (USART2)", Severity::Warn, "on-board ST-LINK virtual COM port — open the SB to reuse"))),
-        p('A', 3, None, Some(res("ST-LINK VCP RX (USART2)", Severity::Warn, "on-board ST-LINK virtual COM port — open the SB to reuse"))),
-        p('A', 13, None, Some(res("SWDIO (debug)", Severity::Block, "SWD debug — reusing it disables the debugger"))),
-        p('A', 14, None, Some(res("SWCLK (debug)", Severity::Block, "SWD debug — reusing it disables the debugger"))),
-        p('C', 14, None, Some(res("LSE OSC32_IN", Severity::Warn, "32 kHz RTC crystal footprint — usable only if not populated"))),
-        p('C', 15, None, Some(res("LSE OSC32_OUT", Severity::Warn, "32 kHz RTC crystal footprint — usable only if not populated"))),
+        p('A', 0, Some("A0"), None),
+        p('A', 1, Some("A1"), None),
+        p('B', 1, Some("A2"), None),
+        p('B', 0, Some("A3"), None),
+        p('C', 1, Some("A4"), None),
+        p('C', 0, Some("A5"), None),
+        p('B', 15, Some("D0"), None),
+        p('B', 14, Some("D1"), None),
+        p('C', 8, Some("D2"), None),
+        p('B', 3, Some("D3"), None),
+        p('B', 5, Some("D4"), None),
+        p('B', 4, Some("D5"), None),
+        p('B', 10, Some("D6"), None),
+        p('A', 8, Some("D7"), None),
+        p('C', 7, Some("D8"), None),
+        p('C', 6, Some("D9"), None),
+        p('C', 9, Some("D10"), None),
+        p('A', 7, Some("D11"), None),
+        p('A', 6, Some("D12"), None),
+        p('A', 5, Some("D13"), Some(res("LD2 user LED / Arduino D13", Severity::Warn, LED_CAVEAT))),
+        p('B', 7, Some("D14"), None),
+        p('B', 6, Some("D15"), None),
+        p('C', 13, None, Some(res("B1 user button", Severity::Warn, BTN_CAVEAT))),
+        p('A', 2, None, Some(res("ST-LINK VCP TX (USART2)", Severity::Warn, VCP_CAVEAT))),
+        p('A', 3, None, Some(res("ST-LINK VCP RX (USART2)", Severity::Warn, VCP_CAVEAT))),
+        p('A', 13, None, Some(res("SWDIO (debug)", Severity::Block, SWD_CAVEAT))),
+        p('A', 14, None, Some(res("SWCLK (debug)", Severity::Block, SWD_CAVEAT))),
+        p('C', 14, None, Some(res("LSE OSC32_IN", Severity::Warn, LSE_CAVEAT))),
+        p('C', 15, None, Some(res("LSE OSC32_OUT", Severity::Warn, LSE_CAVEAT))),
     ],
 };
 
-/// NUCLEO-C5A3ZG (STM32C5A3ZGT6, LQFP144, Nucleo-144, MB2310 / UM3616). Only the
-/// pins confirmed from ST/Zephyr docs are reserved (LD1 green = PA5, B1 = PC13,
-/// SWD = PA13/PA14). The remaining Nucleo-144 LEDs (LD2/LD3) and the VCP UART pins
-/// aren't in the public docs and are deliberately NOT guessed — verify against
-/// UM3616 and add them. Morpho only (Arduino map not yet transcribed).
+/// NUCLEO-C5A3ZG (STM32C5A3ZGT6, LQFP144, Nucleo-144, MB2310). Arduino map +
+/// reserved pins from ST **UM3616** (Table 12/13/14, §7.8 LEDs, §7.9 buttons,
+/// §7.12 VCP). LQFP144, so the Arduino analog pins reach ports H/E (A0 = PH4,
+/// A1 = PH5, A4 = PE13). LEDs: LD1 green = PA5, LD2 red = PG1, LD3 blue = PG2.
+/// B1 = PC13; VCP = UART2 PA2/PA3 (muxed, exclusive with the Arduino UART).
 pub static NUCLEO_C5A3ZG: BoardProfile = BoardProfile {
     name: "NUCLEO-C5A3ZG",
     chip_prefix: "STM32C5A3",
     pins: &[
-        p(
-            'A',
-            5,
-            None,
-            Some(res(
-                "LD1 green LED / SPI1 SCK",
-                Severity::Warn,
-                "drives the on-board green LED / is SPI1 SCK — carries that load as an input",
-            )),
-        ),
-        p('C', 13, None, Some(res("B1 user button", Severity::Warn, "tied to the user button (switch to GND); not a clean analog node"))),
-        p('A', 13, None, Some(res("SWDIO (debug)", Severity::Block, "SWD debug — reusing it disables the debugger"))),
-        p('A', 14, None, Some(res("SWCLK (debug)", Severity::Block, "SWD debug — reusing it disables the debugger"))),
+        p('H', 4, Some("A0"), None),
+        p('H', 5, Some("A1"), None),
+        p('A', 4, Some("A2"), None),
+        p('B', 0, Some("A3"), None),
+        p('E', 13, Some("A4"), None),
+        p('C', 0, Some("A5"), None),
+        p('D', 6, Some("D0"), None),
+        p('D', 5, Some("D1"), None),
+        p('A', 10, Some("D2"), None),
+        p('B', 3, Some("D3"), None),
+        p('A', 0, Some("D4"), None),
+        p('B', 4, Some("D5"), None),
+        p('B', 10, Some("D6"), None),
+        p('A', 8, Some("D7"), None),
+        p('A', 9, Some("D8"), None),
+        p('C', 6, Some("D9"), None),
+        p('B', 5, Some("D10"), None),
+        p('A', 7, Some("D11"), None),
+        p('A', 6, Some("D12"), None),
+        p('A', 5, Some("D13"), Some(res("LD1 green LED / Arduino D13", Severity::Warn, LED_CAVEAT))),
+        p('B', 7, Some("D14"), None),
+        p('B', 6, Some("D15"), None),
+        p('G', 1, None, Some(res("LD2 red user LED", Severity::Warn, "drives the on-board red LED"))),
+        p('G', 2, None, Some(res("LD3 blue user LED", Severity::Warn, "drives the on-board blue LED"))),
+        p('C', 13, None, Some(res("B1 user button", Severity::Warn, BTN_CAVEAT))),
+        p('A', 2, None, Some(res("ST-LINK VCP TX (UART2)", Severity::Warn, VCP_CAVEAT))),
+        p('A', 3, None, Some(res("ST-LINK VCP RX (UART2)", Severity::Warn, VCP_CAVEAT))),
+        p('A', 13, None, Some(res("SWDIO (debug)", Severity::Block, SWD_CAVEAT))),
+        p('A', 14, None, Some(res("SWCLK (debug)", Severity::Block, SWD_CAVEAT))),
+        p('C', 14, None, Some(res("LSE OSC32_IN", Severity::Warn, LSE_CAVEAT))),
+        p('C', 15, None, Some(res("LSE OSC32_OUT", Severity::Warn, LSE_CAVEAT))),
     ],
 };
 
@@ -318,10 +355,20 @@ mod tests {
         for b in [&NUCLEO_G474RE, &NUCLEO_H533RE, &NUCLEO_C5A3ZG] {
             assert!(b.find(PinId { port: 'A', num: 13 }).is_some(), "{} reserves SWDIO", b.name);
         }
-        // The new boards are Morpho-only for now (no Arduino map transcribed).
-        assert!(NUCLEO_H533RE.arduino_pins().is_empty());
-        assert!(NUCLEO_C5A3ZG.arduino_pins().is_empty());
-        assert!(!NUCLEO_G474RE.arduino_pins().is_empty());
+        // All three now have full Arduino maps (from their UMs).
+        for b in [&NUCLEO_G474RE, &NUCLEO_H533RE, &NUCLEO_C5A3ZG] {
+            assert_eq!(b.arduino_pins().len(), 22, "{} has A0-A5 + D0-D15", b.name);
+        }
+        // Board-specific analog headers verified against the UMs (they differ):
+        let a2 = |b: &BoardProfile| b.pins.iter().find(|p| p.arduino == Some("A2")).unwrap().pin;
+        assert_eq!(a2(&NUCLEO_G474RE), PinId { port: 'A', num: 4 }); // UM2505: A2=PA4
+        assert_eq!(a2(&NUCLEO_H533RE), PinId { port: 'B', num: 1 }); // UM3121: A2=PB1
+        assert_eq!(a2(&NUCLEO_C5A3ZG), PinId { port: 'A', num: 4 }); // UM3616: A2=PA4
+        // C5A3ZG (LQFP144) reaches ports H/E on the Arduino header.
+        let a0 = NUCLEO_C5A3ZG.pins.iter().find(|p| p.arduino == Some("A0")).unwrap().pin;
+        assert_eq!(a0, PinId { port: 'H', num: 4 });
+        // C5A3ZG's extra LEDs are on port G.
+        assert!(NUCLEO_C5A3ZG.find(PinId { port: 'G', num: 1 }).is_some(), "LD2 red = PG1");
     }
 
     #[test]
