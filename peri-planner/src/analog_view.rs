@@ -127,7 +127,7 @@ pub(crate) fn adc_pos_index(role: &str) -> Option<u8> {
 }
 
 /// ADC differential negative channel index (`INN<m>`).
-fn adc_neg_index(role: &str) -> Option<u8> {
+pub(crate) fn adc_neg_index(role: &str) -> Option<u8> {
     let tail = role.strip_prefix("INN")?;
     if tail.is_empty() || !tail.bytes().all(|b| b.is_ascii_digit()) {
         return None;

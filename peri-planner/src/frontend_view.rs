@@ -118,6 +118,13 @@ pub fn show(
         ui.label("Zero-cross pairs:")
             .on_hover_text("Pairs to give a comparator straddling both ends (COMP+ / external COMP−) for differential zero-cross detection. Spends a comparator per pair and forces the pair onto a specific pin combo.");
         ui.add(egui::Slider::new(&mut st.cfg.zero_cross_target, 0..=max_zc));
+        ui.separator();
+        if st.cfg.adc_diff_target > max_zc {
+            st.cfg.adc_diff_target = max_zc;
+        }
+        ui.label("ADC hw-diff pairs:")
+            .on_hover_text("Pairs placed on an ADC IN/INN combo so DIFSEL differential mode is available: one zero-skew conversion reading (+ − −), toggleable with single-ended at runtime. Same ADC, so mutually exclusive with cross-ADC simultaneous sampling on that pair.");
+        ui.add(egui::Slider::new(&mut st.cfg.adc_diff_target, 0..=max_zc));
     });
     // Capability taps: route a signal to extra pins for capabilities its primary
     // pin lacks (zero-cross on any pair, a trigger/PGA, or a redundant ADC).
@@ -166,11 +173,12 @@ pub fn show(
         let xadc = p.pairs.iter().filter(|x| x.cross_adc).count();
         let zc = p.zero_cross_pairs();
         ui.label(format!(
-            "{} full-PGA pairs · {} PGA channels · {} triggers · {} zero-cross pairs · {}/{} simultaneous-sample · {} tap pins · score {}",
+            "{} full-PGA pairs · {} PGA channels · {} triggers · {} zero-cross · {} ADC-diff · {}/{} simultaneous-sample · {} tap pins · score {}",
             p.full_pga_pairs(),
             p.pga_channels(),
             p.triggers(),
             zc,
+            p.adc_diff_pairs(),
             xadc,
             p.pairs.len(),
             p.tap_pins(),
@@ -216,6 +224,10 @@ pub fn show(
                     if let Some(zc) = pair.zero_cross {
                         ui.label(RichText::new(format!("↕ 0-cross {zc}")).color(COMP_COL).small())
                             .on_hover_text("A comparator straddles the pair (COMP+ on one end, external COMP− on the other) → fires on the differential zero-crossing.");
+                    }
+                    if let Some((adc, ch)) = pair.adc_diff {
+                        ui.label(RichText::new(format!("⧉ hw-diff {adc}.{ch}")).color(ADC_COL).small())
+                            .on_hover_text("The two ends are an IN/INN combo on one ADC → DIFSEL=1 reads (+ − −) in one zero-skew conversion; toggle to single-ended at runtime.");
                     }
                     if pair.cross_adc {
                         ui.label(RichText::new("⇉ sim").color(ADC_COL).small())

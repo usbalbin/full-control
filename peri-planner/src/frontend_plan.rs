@@ -30,7 +30,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::analog_view::{adc_pos_index, comp_minus, comp_plus, opamp_plus};
+use crate::analog_view::{adc_neg_index, adc_pos_index, comp_minus, comp_plus, opamp_plus};
 use crate::mcu_pinout::{af_rows, PinId};
 use crate::mcu_raw::RawMcuData;
 
@@ -208,6 +208,57 @@ pub fn zero_cross_options(
     out
 }
 
+/// A pair that can run in the ADC's **hardware differential mode** (`DIFSEL=1`):
+/// the two ends are the ADC-hardwired `IN<m>` (`plus`) and `INN<m>` (`minus`)
+/// pins on the SAME ADC instance, so channel `m` reads `plus − minus` in one
+/// zero-skew conversion. Same wiring as two single-ended front-ends; a runtime
+/// `DIFSEL` toggle chooses SE-vs-diff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdcDiffOption {
+    pub adc: &'static str,
+    pub channel: u8,
+    pub plus: PinId,
+    pub minus: PinId,
+}
+
+/// Enumerate the ADC hardware-differential-capable pin pairs: channel `m` on an
+/// ADC where BOTH `IN<m>` (positive) and `INN<m>` (negative) pins are bonded.
+/// Mirrors the "Analog pairs" ADC-diff enumeration, data-driven off `INN<m>`.
+pub fn adc_diff_options(
+    raw: &'static RawMcuData,
+    bonded: Option<&BTreeSet<PinId>>,
+) -> Vec<AdcDiffOption> {
+    // Positive / negative pin keyed by (ADC instance, channel).
+    let mut pos: BTreeMap<(&'static str, u8), PinId> = BTreeMap::new();
+    let mut neg: BTreeMap<(&'static str, u8), PinId> = BTreeMap::new();
+    for r in af_rows(raw) {
+        if r.af.is_some() || !r.signal.peripheral.starts_with("ADC") {
+            continue;
+        }
+        if let Some(b) = bonded
+            && !b.contains(&r.pin)
+        {
+            continue;
+        }
+        let adc = r.signal.peripheral;
+        if let Some(m) = adc_pos_index(r.signal.role) {
+            pos.entry((adc, m)).or_insert(r.pin);
+        }
+        if let Some(m) = adc_neg_index(r.signal.role) {
+            neg.entry((adc, m)).or_insert(r.pin);
+        }
+    }
+    let mut out = Vec::new();
+    for (&(adc, m), &npin) in &neg {
+        if let Some(&ppin) = pos.get(&(adc, m))
+            && ppin != npin
+        {
+            out.push(AdcDiffOption { adc, channel: m, plus: ppin, minus: npin });
+        }
+    }
+    out
+}
+
 /// Bonded analog pins by role — the pool that capability taps draw from. Unlike
 /// [`PinCap`] this includes pins that are ONLY a COMP INP/INM (not ADC), since a
 /// tap pin need not be a logging channel itself.
@@ -360,6 +411,10 @@ pub struct PairPlan {
     /// A comparator straddles the pair (INP on `pos`, external INM on `neg`) for
     /// differential zero-cross detection. `Some(comp)` names the instance.
     pub zero_cross: Option<&'static str>,
+    /// The pair sits on an ADC hardware-differential combo (`IN<m>/INN<m>` on one
+    /// ADC): `Some((adc, m))` means channel `m` can read `plus − minus` in one
+    /// zero-skew conversion (`DIFSEL=1`), toggleable with single-ended at runtime.
+    pub adc_diff: Option<(&'static str, u8)>,
 }
 
 /// The hardware ceiling for this chip/package — why not every channel can be rich.
@@ -380,6 +435,10 @@ pub struct Ceiling {
     /// distinct comps with a both-ADC INP/INM combo and `channels/2`. Shares the
     /// comparator pool with `max_triggers`.
     pub max_zero_cross_pairs: usize,
+    /// Pairs placeable on an ADC hardware-differential combo (`IN<m>/INN<m>`),
+    /// limited by distinct pins (adjacent diff channels share a pin) and
+    /// `channels/2`. Mutually exclusive with cross-ADC on the same pair.
+    pub max_adc_diff_pairs: usize,
 }
 
 /// The solved plan plus its diagnostics.
@@ -410,6 +469,9 @@ impl FrontEndPlan {
     pub fn zero_cross_pairs(&self) -> usize {
         self.pairs.iter().filter(|p| p.zero_cross.is_some()).count()
     }
+    pub fn adc_diff_pairs(&self) -> usize {
+        self.pairs.iter().filter(|p| p.adc_diff.is_some()).count()
+    }
     /// Extra bonded pins spent on capability taps.
     pub fn tap_pins(&self) -> usize {
         self.channels().map(|c| c.taps.len()).sum()
@@ -426,10 +488,15 @@ pub struct PlanConfig {
     pub w_trigger: i32,
     pub w_cross_adc: i32,
     pub w_zero_cross: i32,
+    pub w_adc_diff: i32,
     /// How many pairs to allocate a straddling comparator for zero-cross
     /// detection (0 = none). These pairs are carved out first — they consume a
     /// comparator and force the pair onto a specific INP/INM pin combo.
     pub zero_cross_target: usize,
+    /// How many pairs to place on an ADC hardware-differential combo (`IN<m>/
+    /// INN<m>` on one ADC) so `DIFSEL` diff mode is available. Carved first, onto
+    /// specific pins; same-ADC, so mutually exclusive with cross-ADC per pair.
+    pub adc_diff_target: usize,
     /// Max EXTRA bonded pins the planner may spend on capability taps (routing a
     /// signal to more pins for capabilities its primary pin lacks). 0 = off.
     pub tap_budget: usize,
@@ -447,7 +514,9 @@ impl Default for PlanConfig {
             w_trigger: 30,
             w_cross_adc: 8,
             w_zero_cross: 40,
+            w_adc_diff: 35,
             zero_cross_target: 0,
+            adc_diff_target: 0,
             tap_budget: 0,
         }
     }
@@ -491,16 +560,19 @@ pub fn plan(raw: &'static RawMcuData, bonded: Option<&BTreeSet<PinId>>, cfg: Pla
     let caps = capabilities(raw, bonded);
     let out_adc = opamp_out_adc(raw);
     let zc = zero_cross_options(raw, bonded);
+    let diff = adc_diff_options(raw, bonded);
     let taps = tap_data(raw, bonded);
     let channels = cfg.channels.max(2) & !1; // even, ≥2
-    plan_from(&caps, &out_adc, &zc, &taps, channels, cfg)
+    plan_from(&caps, &out_adc, &zc, &diff, &taps, channels, cfg)
 }
 
 /// Core solver over already-extracted capabilities (the unit-test entry point).
+#[allow(clippy::too_many_arguments)]
 pub fn plan_from(
     caps: &[PinCap],
     out_adc: &OpampOutAdc,
     zc_options: &[ZeroCrossOption],
+    diff_options: &[AdcDiffOption],
     tap_pool: &TapData,
     channels: usize,
     cfg: PlanConfig,
@@ -520,6 +592,11 @@ pub fn plan_from(
         .copied()
         .filter(|o| idx_of.contains_key(&o.plus) && idx_of.contains_key(&o.minus))
         .collect();
+    let diff_opts: Vec<AdcDiffOption> = diff_options
+        .iter()
+        .copied()
+        .filter(|o| idx_of.contains_key(&o.plus) && idx_of.contains_key(&o.minus))
+        .collect();
     let ceiling = Ceiling {
         requested_channels: channels,
         adc_pins: caps.len(),
@@ -528,15 +605,18 @@ pub fn plan_from(
         max_pga_pairs: (all_opamps.len() / 2).min(channels / 2),
         max_triggers: all_comps.len().min(channels),
         max_zero_cross_pairs: max_zero_cross(&zc_opts, channels / 2),
+        max_adc_diff_pairs: max_adc_diff(&diff_opts, channels / 2),
     };
 
-    // Shared allocation state (Stage Z runs first and seeds it).
+    // Shared allocation state (the carve stages run first and seed it).
     let mut used_slot: BTreeSet<Slot> = BTreeSet::new();
     let mut reads: BTreeMap<usize, AdcRead> = BTreeMap::new();
     let mut used_comp: BTreeSet<&'static str> = BTreeSet::new();
     let mut zc_pins: BTreeSet<usize> = BTreeSet::new();
     // (pos_idx, neg_idx, comp) for each carved zero-cross pair.
     let mut zc_pairs: Vec<(usize, usize, &'static str)> = Vec::new();
+    // (pos_idx, neg_idx, adc, channel) for each carved ADC-diff pair.
+    let mut diff_pairs: Vec<(usize, usize, &'static str, u8)> = Vec::new();
 
     // ---- Stage Z: carve zero-cross pairs (a comparator straddling the pair:
     // INP on one end, external INM on the other). Runs FIRST because it forces
@@ -573,8 +653,54 @@ pub fn plan_from(
             }
         }
     }
+
+    // ---- Stage Xd: carve ADC hardware-differential pairs onto `IN<m>/INN<m>`
+    // combos (same ADC → one zero-skew conversion, `DIFSEL` toggleable with SE).
+    // Carved onto specific pins; same-ADC, so these are NOT cross-ADC. ----
+    if cfg.adc_diff_target > 0 {
+        let want = cfg.adc_diff_target.min(channels / 2 - zc_pairs.len());
+        // Prefer combos whose pins are plain ADC (no COMP/OPAMP role), so ADC-diff
+        // doesn't needlessly cannibalize trigger / PGA options.
+        let rich = |p: PinId| {
+            idx_of.get(&p).map_or(0u8, |i| {
+                (!caps[*i].opamp.is_empty()) as u8 + (!caps[*i].comp.is_empty()) as u8
+            })
+        };
+        let mut opts = diff_opts.clone();
+        opts.sort_by_key(|o| (rich(o.plus) + rich(o.minus), o.adc, o.channel, o.plus, o.minus));
+        for o in &opts {
+            if diff_pairs.len() >= want {
+                break;
+            }
+            let (pa, pb) = (idx_of[&o.plus], idx_of[&o.minus]);
+            if reads.contains_key(&pa) || reads.contains_key(&pb) {
+                continue;
+            }
+            // Both ends read on the SAME ADC: `plus` on channel m, `minus` on its
+            // own single-ended channel on that instance.
+            let sa = (o.adc, o.channel);
+            let Some(sb) = caps[pb].adc.iter().copied().find(|(inst, _)| *inst == o.adc) else {
+                continue;
+            };
+            if used_slot.contains(&sa) || used_slot.contains(&sb) || sa == sb {
+                continue;
+            }
+            used_slot.insert(sa);
+            used_slot.insert(sb);
+            reads.insert(pa, AdcRead::Direct { adc: sa.0, ch: sa.1 });
+            reads.insert(pb, AdcRead::Direct { adc: sb.0, ch: sb.1 });
+            diff_pairs.push((pa, pb, o.adc, o.channel));
+        }
+    }
+
+    // Pins locked by the carve stages — off-limits to opamps/comparators/fill.
+    let carved: BTreeSet<usize> = zc_pins
+        .iter()
+        .copied()
+        .chain(diff_pairs.iter().flat_map(|&(a, b, _, _)| [a, b]))
+        .collect();
     // Channel budget remaining for the opamp/comp/fill stages.
-    let budget_left = channels.saturating_sub(zc_pins.len());
+    let budget_left = channels.saturating_sub(carved.len());
 
     // ---- Stage A: place opamps on distinct pins (max matching). ----
     let opamps: Vec<&'static str> = all_opamps.iter().copied().collect();
@@ -584,7 +710,7 @@ pub fn plan_from(
             let mut v: Vec<usize> = caps
                 .iter()
                 .enumerate()
-                .filter(|(i, c)| c.opamp.contains(op) && !zc_pins.contains(i))
+                .filter(|(i, c)| c.opamp.contains(op) && !carved.contains(i))
                 .map(|(i, _)| i)
                 .collect();
             v.sort_unstable();
@@ -643,7 +769,7 @@ pub fn plan_from(
             let mut v: Vec<usize> = caps
                 .iter()
                 .enumerate()
-                .filter(|(i, c)| c.comp.contains(cp) && !zc_pins.contains(i))
+                .filter(|(i, c)| c.comp.contains(cp) && !carved.contains(i))
                 .map(|(i, _)| i)
                 .collect();
             // Already-selected pins first → Kuhn biases triggers onto them.
@@ -692,14 +818,22 @@ pub fn plan_from(
         }
     }
 
-    // ---- Stage D: pair up the chosen pins. Zero-cross and PGA pairs are already
-    // formed and stay together; the rest are greedily paired to maximize cross-ADC.
+    // ---- Stage D: pair up the chosen pins. The carved (zero-cross, ADC-diff) and
+    // PGA pairs are already formed and stay together; the rest are greedily paired
+    // to maximize cross-ADC.
     let mut paired: BTreeSet<usize> = BTreeSet::new();
     let mut pair_idx: Vec<(usize, usize)> = Vec::new();
     let mut zc_comp_of_pair: BTreeMap<(usize, usize), &'static str> = BTreeMap::new();
+    let mut diff_of_pair: BTreeMap<(usize, usize), (&'static str, u8)> = BTreeMap::new();
     for &(a, b, comp) in &zc_pairs {
         pair_idx.push((a, b));
         zc_comp_of_pair.insert((a, b), comp);
+        paired.insert(a);
+        paired.insert(b);
+    }
+    for &(a, b, adc, ch) in &diff_pairs {
+        pair_idx.push((a, b));
+        diff_of_pair.insert((a, b), (adc, ch));
         paired.insert(a);
         paired.insert(b);
     }
@@ -768,7 +902,9 @@ pub fn plan_from(
             if a != b && !zc_comp_of_pair.contains_key(&(a, b)) {
                 cands.push((cfg.w_zero_cross, Cand::Zc(a, b)));
             }
-            if a != b && reads[&a].adc() == reads[&b].adc() {
+            // Redundant cross-ADC read — but not for an ADC-diff pair, whose
+            // same-ADC placement is intentional (the HW diff IS its differential).
+            if a != b && reads[&a].adc() == reads[&b].adc() && !diff_of_pair.contains_key(&(a, b)) {
                 cands.push((cfg.w_cross_adc, Cand::Redun(a, b)));
             }
         }
@@ -920,9 +1056,13 @@ pub fn plan_from(
             (a != b && pos.read.adc() != neg.read.adc()) || forced_cross.contains(&(a, b));
         let zero_cross =
             zc_comp_of_pair.get(&(a, b)).copied().or_else(|| zc_tapped.get(&(a, b)).copied());
+        let adc_diff = diff_of_pair.get(&(a, b)).copied();
         // Scoring.
         if zero_cross.is_some() {
             score += cfg.w_zero_cross;
+        }
+        if adc_diff.is_some() {
+            score += cfg.w_adc_diff;
         }
         if full_pga {
             score += cfg.w_pga_pair;
@@ -941,7 +1081,7 @@ pub fn plan_from(
         if cross_adc {
             score += cfg.w_cross_adc;
         }
-        pairs.push(PairPlan { index: n, pos, neg, full_pga, cross_adc, zero_cross });
+        pairs.push(PairPlan { index: n, pos, neg, full_pga, cross_adc, zero_cross, adc_diff });
     }
 
     let placed = chosen.len();
@@ -963,6 +1103,12 @@ pub fn plan_from(
             ceiling.max_zero_cross_pairs
         ));
     }
+    if cfg.adc_diff_target > 0 || ceiling.max_adc_diff_pairs > 0 {
+        notes.push(format!(
+            "ADC hardware-diff: up to {} pairs sit on an IN/INN combo (same ADC → one zero-skew conversion, DIFSEL-toggleable with single-ended). Mutually exclusive with cross-ADC simultaneous sampling on the same pair.",
+            ceiling.max_adc_diff_pairs
+        ));
+    }
     if unplaced_channels > 0 {
         notes.push(format!(
             "Only {placed} analog-capable pins are bonded on this package — {unplaced_channels} requested channel(s) can't be placed. Pick a larger package."
@@ -977,6 +1123,27 @@ pub fn plan_from(
     }
 
     FrontEndPlan { pairs, ceiling, unplaced_channels, score, notes }
+}
+
+/// Achievable ADC hardware-diff pairs: a greedy vertex-disjoint matching over the
+/// `(plus, minus)` pin pairs (adjacent diff channels share a pin), capped at
+/// `cap`. Greedy is a valid *achievable* count — the number reported as "up to N".
+fn max_adc_diff(options: &[AdcDiffOption], cap: usize) -> usize {
+    let mut opts: Vec<&AdcDiffOption> = options.iter().collect();
+    opts.sort_by_key(|o| (o.adc, o.channel, o.plus, o.minus));
+    let mut used: BTreeSet<PinId> = BTreeSet::new();
+    let mut n = 0;
+    for o in opts {
+        if n >= cap {
+            break;
+        }
+        if !used.contains(&o.plus) && !used.contains(&o.minus) {
+            used.insert(o.plus);
+            used.insert(o.minus);
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Max zero-cross pairs achievable in isolation: pick options with DISTINCT
@@ -1097,7 +1264,7 @@ mod tests {
     fn g474_ceiling_and_hits_it() {
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
-        let p = plan_from(&caps, &out, &[], &TapData::default(), 16, PlanConfig::default());
+        let p = plan_from(&caps, &out, &[], &[], &TapData::default(), 16, PlanConfig::default());
 
         // Ceiling from the silicon: 6 opamps → 3 PGA pairs; 7 comps → ≤7 triggers.
         assert_eq!(p.ceiling.opamps, 6);
@@ -1116,7 +1283,7 @@ mod tests {
     fn every_channel_has_a_distinct_pin_and_adc_slot() {
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
-        let p = plan_from(&caps, &out, &[], &TapData::default(), 16, PlanConfig::default());
+        let p = plan_from(&caps, &out, &[], &[], &TapData::default(), 16, PlanConfig::default());
         let mut pins = BTreeSet::new();
         let mut slots = BTreeSet::new();
         for pair in &p.pairs {
@@ -1133,7 +1300,7 @@ mod tests {
     fn full_pga_pairs_use_distinct_opamps() {
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
-        let p = plan_from(&caps, &out, &[], &TapData::default(), 16, PlanConfig::default());
+        let p = plan_from(&caps, &out, &[], &[], &TapData::default(), 16, PlanConfig::default());
         for pair in p.pairs.iter().filter(|p| p.full_pga) {
             assert_ne!(pair.pos.opamp, pair.neg.opamp);
             assert!(pair.pos.opamp.is_some() && pair.neg.opamp.is_some());
@@ -1144,8 +1311,8 @@ mod tests {
     fn deterministic() {
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
-        let a = plan_from(&caps, &out, &[], &TapData::default(), 16, PlanConfig::default());
-        let b = plan_from(&caps, &out, &[], &TapData::default(), 16, PlanConfig::default());
+        let a = plan_from(&caps, &out, &[], &[], &TapData::default(), 16, PlanConfig::default());
+        let b = plan_from(&caps, &out, &[], &[], &TapData::default(), 16, PlanConfig::default());
         assert_eq!(a.pairs, b.pairs);
         assert_eq!(a.score, b.score);
     }
@@ -1154,7 +1321,7 @@ mod tests {
     fn smaller_request_places_fewer_pairs() {
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
-        let p = plan_from(&caps, &out, &[], &TapData::default(), 4, PlanConfig::default());
+        let p = plan_from(&caps, &out, &[], &[], &TapData::default(), 4, PlanConfig::default());
         assert_eq!(p.pairs.len(), 2);
         assert_eq!(p.ceiling.max_pga_pairs, 2, "4 channels → at most 2 pairs regardless of opamps");
     }
@@ -1166,7 +1333,7 @@ mod tests {
         let caps = capabilities(&crate::mcu_data::h523r::RAW, None);
         assert!(!caps.is_empty(), "H5 exposes ADC channels");
         let out = opamp_out_adc(&crate::mcu_data::h523r::RAW);
-        let p = plan_from(&caps, &out, &[], &TapData::default(), 8, PlanConfig::default());
+        let p = plan_from(&caps, &out, &[], &[], &TapData::default(), 8, PlanConfig::default());
         assert_eq!(p.ceiling.opamps, 0);
         assert_eq!(p.ceiling.comps, 0);
         assert_eq!(p.full_pga_pairs(), 0);
@@ -1195,7 +1362,7 @@ mod tests {
         let caps = g474();
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
         let zc = zero_cross_options(&crate::mcu_data::g474r::RAW, None);
-        let p = plan_from(&caps, &out, &zc, &TapData::default(), 16, PlanConfig::default());
+        let p = plan_from(&caps, &out, &zc, &[], &TapData::default(), 16, PlanConfig::default());
         // 6 distinct comparators, distinct-pin-feasible → 6; capped by channels/2=8.
         assert_eq!(p.ceiling.max_zero_cross_pairs, 6);
     }
@@ -1206,7 +1373,7 @@ mod tests {
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
         let zc = zero_cross_options(&crate::mcu_data::g474r::RAW, None);
         let cfg = PlanConfig { zero_cross_target: 2, ..Default::default() };
-        let p = plan_from(&caps, &out, &zc, &TapData::default(), 16, cfg);
+        let p = plan_from(&caps, &out, &zc, &[], &TapData::default(), 16, cfg);
 
         assert_eq!(p.zero_cross_pairs(), 2, "asked for 2 zero-cross pairs");
         assert_eq!(p.pairs.len(), 8);
@@ -1239,6 +1406,51 @@ mod tests {
     }
 
     #[test]
+    fn adc_diff_options_g474() {
+        let d = adc_diff_options(&crate::mcu_data::g474r::RAW, None);
+        let has = |adc: &str, ch: u8, p: &str, m: &str| {
+            d.iter().any(|o| {
+                o.adc == adc && o.channel == ch && o.plus.name() == p && o.minus.name() == m
+            })
+        };
+        // Verified against the Analog-pairs view / RM0440.
+        assert!(has("ADC1", 1, "PA0", "PA1"));
+        assert!(has("ADC5", 1, "PA8", "PA9"));
+        assert!(d.len() > 20, "many diff-capable combos: {}", d.len());
+    }
+
+    #[test]
+    fn adc_diff_target_places_same_adc_pairs_without_cannibalizing() {
+        let caps = g474();
+        let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
+        let diff = adc_diff_options(&crate::mcu_data::g474r::RAW, None);
+        let cfg = PlanConfig { adc_diff_target: 2, ..Default::default() };
+        let p = plan_from(&caps, &out, &[], &diff, &TapData::default(), 16, cfg);
+
+        assert_eq!(p.adc_diff_pairs(), 2);
+        assert_eq!(p.ceiling.max_adc_diff_pairs, 8);
+        // Prefer-plain carve keeps all PGA pairs and triggers.
+        assert_eq!(p.full_pga_pairs(), 3, "plain-pin diff carve doesn't cost a PGA pair");
+        for pr in p.pairs.iter().filter(|pr| pr.adc_diff.is_some()) {
+            let (adc, ch) = pr.adc_diff.unwrap();
+            // Both ends read on the SAME ADC (that's what HW diff needs), so the
+            // pair is NOT cross-ADC — the two are mutually exclusive.
+            assert_eq!(pr.pos.read.adc(), adc);
+            assert_eq!(pr.neg.read.adc(), adc);
+            assert!(!pr.cross_adc, "an ADC-diff pair is same-ADC, not cross-ADC");
+            // The declared diff channel is the positive end's channel.
+            assert_eq!(pr.pos.read.ch(), ch);
+            // The two ends are a real IN/INN combo on that ADC.
+            let ok = diff.iter().any(|o| {
+                o.adc == adc
+                    && ((o.plus == pr.pos.pin && o.minus == pr.neg.pin)
+                        || (o.plus == pr.neg.pin && o.minus == pr.pos.pin))
+            });
+            assert!(ok, "{}/{} is an IN/INN combo on {adc}", pr.pos.pin.name(), pr.neg.pin.name());
+        }
+    }
+
+    #[test]
     fn tap_data_g474_has_inm_and_vinp() {
         let td = tap_data(&crate::mcu_data::g474r::RAW, None);
         // COMP5's external INM PB10 is a non-ADC pin → present in the tap pool but
@@ -1256,9 +1468,9 @@ mod tests {
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
         let zc = zero_cross_options(&crate::mcu_data::g474r::RAW, None);
         let td = tap_data(&crate::mcu_data::g474r::RAW, None);
-        let base = plan_from(&caps, &out, &zc, &TapData::default(), 16, PlanConfig::default());
+        let base = plan_from(&caps, &out, &zc, &[], &TapData::default(), 16, PlanConfig::default());
         let cfg = PlanConfig { tap_budget: 4, ..Default::default() };
-        let p = plan_from(&caps, &out, &zc, &td, 16, cfg);
+        let p = plan_from(&caps, &out, &zc, &[], &td, 16, cfg);
 
         assert!(p.score > base.score, "taps improve the objective: {} > {}", p.score, base.score);
         let tapped_fpga = p.pairs.iter().find(|pr| pr.full_pga && pr.zero_cross.is_some());
@@ -1276,7 +1488,7 @@ mod tests {
         let zc = zero_cross_options(&crate::mcu_data::g474r::RAW, None);
         let td = tap_data(&crate::mcu_data::g474r::RAW, None);
         let cfg = PlanConfig { tap_budget: 8, ..Default::default() };
-        let p = plan_from(&caps, &out, &zc, &td, 16, cfg);
+        let p = plan_from(&caps, &out, &zc, &[], &td, 16, cfg);
         assert!(p.tap_pins() <= 8, "within budget");
         let mut pins = BTreeSet::new();
         let mut slots = BTreeSet::new();
@@ -1310,7 +1522,7 @@ mod tests {
             ..Default::default()
         };
         let cfg = PlanConfig { channels: 2, tap_budget: 2, ..Default::default() };
-        let plan = plan_from(&caps, &out, &[], &td, 2, cfg);
+        let plan = plan_from(&caps, &out, &[], &[], &td, 2, cfg);
 
         assert_eq!(plan.pairs.len(), 1);
         let pr = &plan.pairs[0];
@@ -1331,7 +1543,7 @@ mod tests {
         let out = opamp_out_adc(&crate::mcu_data::g474r::RAW);
         let zc = zero_cross_options(&crate::mcu_data::g474r::RAW, None);
         let cfg = PlanConfig { channels: 4, zero_cross_target: 3, ..Default::default() };
-        let p = plan_from(&caps, &out, &zc, &TapData::default(), 4, cfg);
+        let p = plan_from(&caps, &out, &zc, &[], &TapData::default(), 4, cfg);
         assert_eq!(p.pairs.len(), 2);
         assert_eq!(p.zero_cross_pairs(), 2, "both pairs zero-cross, capped by channels");
     }
